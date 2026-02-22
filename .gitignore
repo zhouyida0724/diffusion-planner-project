@@ -1,1 +1,14 @@
+# Data files
 data/
+
+# CARLA (can be re-downloaded from GitHub)
+CARLA/
+*.tar.gz
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
