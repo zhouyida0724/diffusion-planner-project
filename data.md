@@ -157,3 +157,47 @@ CARLA/
 - [ ] nuplan-v1.1_train (暂不需要)
 - [x] Bench2Drive-Mini (已下载)
 - [x] CARLA 0.9.15 (已安装)
+
+---
+
+## 自动化脚本
+
+项目提供了两个自动化下载脚本，位于 `scripts/` 目录：
+
+### 1. 下载 CARLA
+
+```bash
+./scripts/download_carla.sh
+```
+
+**功能：**
+- 下载 CARLA 0.9.15 压缩包 (~20GB)
+- 自动解压到 `data/CARLA/`
+- 自动配置路径
+
+**手动启动 CARLA：**
+```bash
+cd data/CARLA
+./CarlaUE4.sh -prefernvidia -nosound -carla-port=2000
+```
+
+### 2. 下载 Bench2Drive
+
+```bash
+./scripts/download_bench2drive.sh
+```
+
+**功能：**
+- 使用 HuggingFace CLI 下载 Bench2Drive-Mini (~20GB)
+- 自动移动到 `data/bench2drive/Bench2Drive-Mini/`
+
+**前提条件：**
+```bash
+pip install huggingface_hub
+```
+
+### 注意事项
+
+- 所有数据文件都在 `data/` 目录下，不纳入 Git 版本控制
+- CARLA 仿真器在 `data/CARLA/` 目录下，不纳入 Git 版本控制
+- 下载脚本会自动创建必要的目录结构
