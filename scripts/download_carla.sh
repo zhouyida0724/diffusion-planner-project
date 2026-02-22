@@ -10,11 +10,7 @@ echo "=========================================="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-DATA_DIR="$PROJECT_DIR/data"
-CARLA_DIR="$DATA_DIR/CARLA"
-
-# 创建目录
-mkdir -p "$DATA_DIR"
+CARLA_DIR="$PROJECT_DIR/CARLA"
 
 # 检查是否已存在
 if [ -d "$CARLA_DIR/CarlaUE4" ]; then
@@ -22,14 +18,16 @@ if [ -d "$CARLA_DIR/CarlaUE4" ]; then
     exit 0
 fi
 
-# 检查压缩包是否存在
+# 检查压缩包是否存在 (可能在 data/ 目录)
+DATA_DIR="$PROJECT_DIR/data"
 CARLA_TAR="$DATA_DIR/CARLA_0.9.15.tar.gz"
-if [ -f "$CARLA_TAR" ]; then
-    echo "找到已下载的 CARLA 压缩包"
-else
+
+if [ ! -f "$CARLA_TAR" ]; then
     # 下载 CARLA
     echo "下载 CARLA 0.9.15 (~20GB)..."
     echo "请等待下载完成..."
+    
+    mkdir -p "$DATA_DIR"
     
     # 使用代理下载
     PROXY=""
@@ -43,15 +41,12 @@ fi
 
 # 解压
 echo "解压 CARLA..."
-tar -xvf "$CARLA_TAR" -C "$DATA_DIR/"
+tar -xvf "$CARLA_TAR" -C "$PROJECT_DIR/"
 
 # 移动到正确位置
-if [ -d "$DATA_DIR/CARLA_0.9.15" ]; then
-    mv "$DATA_DIR/CARLA_0.9.15" "$CARLA_DIR"
+if [ -d "$PROJECT_DIR/CARLA_0.9.15" ]; then
+    mv "$PROJECT_DIR/CARLA_0.9.15" "$CARLA_DIR"
 fi
-
-# 清理压缩包（可选）
-# rm -f "$CARLA_TAR"
 
 echo ""
 echo "✅ CARLA 下载并配置完成!"
