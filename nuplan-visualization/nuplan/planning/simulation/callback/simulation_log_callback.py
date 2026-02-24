@@ -26,7 +26,7 @@ def _save_log_to_file(
     :param planner: to store in the log.
     :param history: to store in the log.
     """
-    simulation_log = SimulationLog(file_path=file_name, scenario=scenario, planner=planner, simulation_history=history)
+    simulation_log = SimulationLog(file_path=file_name, scenario=scenario, planner=None, simulation_history=history)
     simulation_log.save_to_file()
 
 

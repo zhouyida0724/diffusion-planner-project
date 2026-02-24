@@ -47,6 +47,7 @@ install_deps() {
                 coloredlogs \
                 pytorch-lightning==2.0.0 \
                 bokeh==2.4.2 \
+                mmengine \ \
                 nest-asyncio \
                 selenium \
                 aioboto3 \
@@ -73,7 +74,7 @@ case "${1:-run}" in
             -p 5006:5006 \
             -p 2000:2000 \
             -v $HOST_DATA_DIR:/workspace/data \
-            -v $HOST_WORKSPACE/carla:/workspace/carla \
+            -v $HOST_WORKSPACE/diffusion-planner-project:/workspace \
             -w /workspace \
             $IMAGE_NAME \
             tail -f /dev/null
