@@ -6,8 +6,6 @@ Usage:
     python run_diffusion_simulation.py --scenarios_file=data/scenarios_200_valid.csv
     python run_diffusion_simulation.py --scenario=TOKEN
     python run_diffusion_simulation.py --num=200
-    python run_diffusion_simulation.py --planner idm --num=1
-    python run_diffusion_simulation.py --planner diffusion --checkpoint /workspace/checkpoints/model.pth --num=1
 """
 
 import argparse
@@ -22,22 +20,9 @@ def main():
                         help='CSV file with scenario tokens')
     parser.add_argument('--scenario', type=str, default=None, help='Specific scenario token')
     parser.add_argument('--num', type=int, default=None, help='Number of random scenarios')
-    parser.add_argument('--planner', type=str, default='diffusion', choices=['diffusion', 'idm'],
-                        help='Planner type: diffusion or idm (default: diffusion)')
-    parser.add_argument('--checkpoint', type=str, default='/workspace/checkpoints/model.pth',
-                        help='Diffusion model checkpoint path (default: /workspace/checkpoints/model.pth)')
     args = parser.parse_args()
     
     os.environ['PYTHONPATH'] = '/workspace/nuplan-visualization:/workspace/diffusion_planner'
-    
-    # Determine planner based on args
-    if args.planner == 'idm':
-        planner_name = 'idm_planner'
-        planner_config = ['planner=idm_planner']
-    else:
-        planner_name = 'diffusion_planner'
-        # Use quoted form to prevent shell interpretation of '+'
-        planner_config = ['planner=diffusion_planner', f'+diffusion_planner.ckpt_path={args.checkpoint}']
     
     if args.scenarios_file:
         # Read tokens from file
@@ -72,7 +57,7 @@ shuffle: false
         cmd = [
             'python3', '-m', 'nuplan.planning.script.run_simulation',
             '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
+            'planner=diffusion_planner',
             'scenario_builder=nuplan',
             'scenario_filter=one_hand_picked_scenario',
             'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
@@ -100,7 +85,7 @@ shuffle: false
         cmd = [
             'python3', '-m', 'nuplan.planning.script.run_simulation',
             '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
+            'planner=diffusion_planner',
             'scenario_builder=nuplan',
             'scenario_filter=one_hand_picked_scenario',
             'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
@@ -112,11 +97,11 @@ shuffle: false
         cmd = [
             'python3', '-m', 'nuplan.planning.script.run_simulation',
             '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
+            'planner=diffusion_planner',
             'scenario_builder=nuplan',
             'scenario_filter=simulation_test_split',
             'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-            f'scenario_filter.limit_total_scenarios={args.num}',
+            f'+num_scenarios={args.num}',
             'worker=sequential',
             'verbose=true'
         ]
@@ -125,11 +110,11 @@ shuffle: false
         cmd = [
             'python3', '-m', 'nuplan.planning.script.run_simulation',
             '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
+            'planner=diffusion_planner',
             'scenario_builder=nuplan',
             'scenario_filter=simulation_test_split',
             'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-            'scenario_filter.limit_total_scenarios=1',
+            '+num_scenarios=1',
             'worker=sequential',
             'verbose=true'
         ]

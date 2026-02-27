@@ -1,7 +1,7 @@
 _target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
 scenario_types: null
 scenario_tokens:
-  - '310cdc079b215731'
+  - 'cb8033fda75c5ad7'
 log_names: null
 map_names: null
 num_scenarios_per_type: 1
