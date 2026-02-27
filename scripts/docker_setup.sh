@@ -72,7 +72,6 @@ case "${1:-run}" in
         docker run -d \
             --name $CONTAINER_NAME \
             -p 5006:5006 \
-            -p 2000:2000 \
             -v $HOST_DATA_DIR:/workspace/data \
             -v $HOST_WORKSPACE/diffusion-planner-project:/workspace \
             -w /workspace \
