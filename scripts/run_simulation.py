@@ -21,6 +21,10 @@ def main():
     parser.add_argument('--num', type=int, default=None, help='Number of random scenarios')
     args = parser.parse_args()
     
+    # Require explicit specification
+    if not args.scenarios_file and not args.scenario and not args.num:
+        parser.error("必须指定 --scenarios_file, --scenario 或 --num")
+    
     os.environ['PYTHONPATH'] = '/workspace/nuplan-visualization'
     
     # If YAML file provided, copy it to config location
