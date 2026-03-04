@@ -13,3 +13,10 @@ __pycache__/
 .vscode/
 .idea/
 checkpoints/
+
+# Training outputs
+training_outputs/
+
+# Data processing outputs
+data_process/__pycache__/
+data_process/scenarios_distribution.json
