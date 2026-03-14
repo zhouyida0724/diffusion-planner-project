@@ -32,7 +32,7 @@ MAP_NAME = 'us-ma-boston'
 # Feature dimensions
 EGO_FUTURE_LEN = 80
 NEIGHBOR_HISTORY_LEN = 21
-NEIGHBOR_FUTURE_LEN = 80
+NEIGHBOR_FUTURE_LEN = 81  # 8秒 = 81点 @ 0.1s间隔
 MAX_NEIGHBORS = 32
 MAX_STATIC_OBJECTS = 5
 MAX_LANES = 70
@@ -197,8 +197,9 @@ def extract_ego_data(conn, center_token, center_timestamp):
     ], dtype=np.float32)
     
     ego_future = np.zeros((EGO_FUTURE_LEN, 3), dtype=np.float32)
+    # ego_pose is 100Hz, sample every 10 frames for 0.1s interval (10Hz)
     for i in range(EGO_FUTURE_LEN):
-        idx = center_idx + i + 1
+        idx = center_idx + (i + 1) * 10  # Every 10 frames = 0.1s at 100Hz
         if idx < len(all_poses):
             future_row = all_poses[idx]
             dx, dy = transform_to_ego_frame(future_row['x'], future_row['y'], ego_x, ego_y, ego_heading)
