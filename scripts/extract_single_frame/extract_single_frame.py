@@ -230,7 +230,7 @@ def extract_ego_data(conn, center_token, center_timestamp):
 
 
 def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
-    """Extract neighbor agent data"""
+    """Extract neighbor agent data with proper time interpolation"""
     cursor = conn.cursor()
     
     cursor.execute('SELECT token, timestamp FROM lidar_pc WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1', (center_timestamp,))
@@ -267,6 +267,10 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
         if len(boxes) == 0:
             continue
         
+        # 从 20Hz 采样到 10Hz (lidar_box 是 20Hz，需要降采样)
+        boxes = boxes[::2]
+        
+        # Find center box index
         center_box_idx = 0
         min_diff = float('inf')
         for i, box in enumerate(boxes):
@@ -278,31 +282,93 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
         if min_diff > 100000000:
             continue
         
-        for i in range(NEIGHBOR_HISTORY_LEN):
-            idx = center_box_idx - (NEIGHBOR_HISTORY_LEN - 1 - i)
-            if idx >= 0:
-                box = boxes[idx]
-                dx, dy = transform_to_ego_frame(box['x'], box['y'], ego_x, ego_y, ego_heading)
-                heading = box['yaw']
-                v_local = R @ np.array([box['vx'], box['vy']])
+        # Extract box data with timestamps for interpolation
+        box_timestamps = [box['timestamp'] for box in boxes]
+        box_data = [(box['x'], box['y'], box['yaw'], box['vx'], box['vy'], box['width'], box['length']) for box in boxes]
+        
+        # Calculate target timestamps for past (21 points, 0.1s interval, 2s total)
+        # Past: from center_timestamp - 2.0s to center_timestamp
+        target_past_timestamps = [center_timestamp - (NEIGHBOR_HISTORY_LEN - 1 - i) * 100000 for i in range(NEIGHBOR_HISTORY_LEN)]
+        
+        # Calculate target timestamps for future (81 points, 0.1s interval, 8s total)
+        # Future: from center_timestamp + 0.1s to center_timestamp + 8.1s
+        target_future_timestamps = [center_timestamp + (i + 1) * 100000 for i in range(NEIGHBOR_FUTURE_LEN)]
+        
+        # Interpolate past data
+        for i, target_ts in enumerate(target_past_timestamps):
+            interpolated = _interpolate_agent_state(box_timestamps, box_data, target_ts)
+            if interpolated is not None:
+                dx, dy = transform_to_ego_frame(interpolated[0], interpolated[1], ego_x, ego_y, ego_heading)
+                heading = interpolated[2]
+                v_local = R @ np.array([interpolated[3], interpolated[4]])
                 neighbor_past[agent_idx + 1, i] = [
                     dx, dy, np.cos(heading), np.sin(heading),
                     v_local[0], v_local[1], 0.0, 0.0,
-                    box['width'], box['length'], 1.0
+                    interpolated[5], interpolated[6], 1.0
                 ]
         
-        for i in range(NEIGHBOR_FUTURE_LEN):
-            idx = center_box_idx + i + 1
-            if idx < len(boxes):
-                box = boxes[idx]
-                dx, dy = transform_to_ego_frame(box['x'], box['y'], ego_x, ego_y, ego_heading)
-                heading = box['yaw']
+        # Interpolate future data
+        for i, target_ts in enumerate(target_future_timestamps):
+            interpolated = _interpolate_agent_state(box_timestamps, box_data, target_ts)
+            if interpolated is not None:
+                dx, dy = transform_to_ego_frame(interpolated[0], interpolated[1], ego_x, ego_y, ego_heading)
+                heading = interpolated[2]
                 dheading = heading - ego_heading
                 while dheading > np.pi: dheading -= 2 * np.pi
                 while dheading < -np.pi: dheading += 2 * np.pi
                 neighbor_future[agent_idx + 1, i] = [dx, dy, dheading]
     
     return neighbor_past, neighbor_future
+
+
+def _interpolate_agent_state(timestamps, box_data, target_timestamp):
+    """
+    Interpolate agent state at target timestamp.
+    timestamps: list of timestamps in microseconds
+    box_data: list of (x, y, yaw, vx, vy, width, length)
+    target_timestamp: target timestamp in microseconds
+    Returns: interpolated (x, y, yaw, vx, vy, width, length) or None if unavailable
+    """
+    if len(timestamps) == 0:
+        return None
+    
+    # If target is before first observation
+    if target_timestamp <= timestamps[0]:
+        return box_data[0]
+    
+    # If target is after last observation
+    if target_timestamp >= timestamps[-1]:
+        return box_data[-1]
+    
+    # Find surrounding indices
+    for i in range(len(timestamps) - 1):
+        if timestamps[i] <= target_timestamp <= timestamps[i + 1]:
+            t0, t1 = timestamps[i], timestamps[i + 1]
+            alpha = (target_timestamp - t0) / (t1 - t0) if t1 > t0 else 0.0
+            
+            x0, y0, yaw0, vx0, vy0, w0, l0 = box_data[i]
+            x1, y1, yaw1, vx1, vy1, w1, l1 = box_data[i + 1]
+            
+            # Linear interpolation for position and velocity
+            x = x0 + alpha * (x1 - x0)
+            y = y0 + alpha * (y1 - y0)
+            vx = vx0 + alpha * (vx1 - vx0)
+            vy = vy0 + alpha * (vy1 - vy0)
+            w = w0 + alpha * (w1 - w0)
+            l = l0 + alpha * (l1 - l0)
+            
+            # Angular interpolation (handle wraparound)
+            yaw = yaw0
+            dyaw = yaw1 - yaw0
+            if dyaw > np.pi:
+                dyaw -= 2 * np.pi
+            elif dyaw < -np.pi:
+                dyaw += 2 * np.pi
+            yaw = yaw0 + alpha * dyaw
+            
+            return (x, y, yaw, vx, vy, w, l)
+    
+    return None
 
 
 def extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading):
