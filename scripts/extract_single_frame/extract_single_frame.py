@@ -24,10 +24,10 @@ from nuplan.common.maps.maps_datatypes import SemanticMapLayer, TrafficLightStat
 from nuplan.common.actor_state.state_representation import Point2D
 
 # Constants
-DB_PATH = '/workspace/data/nuplan/data/cache/mini/2021.10.01.19.16.42_veh-28_03307_03808.db'
+DB_PATH = '/workspace/data/nuplan/data/cache/mini/2021.06.14.17.26.26_veh-38_04544_04920.db'
 MAP_ROOT = '/workspace/data/nuplan/maps'
 MAP_VERSION = '9.12.1817'
-MAP_NAME = 'us-ma-boston'
+MAP_NAME = 'us-nv-las-vegas-strip'
 
 # Feature dimensions
 EGO_FUTURE_LEN = 80
@@ -41,11 +41,11 @@ POLYLINE_LEN = 20
 LANE_DIM = 12
 
 # Target scenario
-SCENARIO_TOKEN = '1d0f55ef7b4b5412'
-CENTER_FRAME_INDEX = 199  # 第200帧
+SCENARIO_TOKEN = '037db12ac9125b9a'
+CENTER_FRAME_INDEX = 17486  # 第200帧
 
-OUTPUT_PATH = '/workspace/diffusion-planner-project/data_process/npz_scenes/test_complete_with_avails.npz'
-CSV_OUTPUT_PATH = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data_process/npz_scenes/test_complete_with_avails.csv'
+OUTPUT_PATH = '/workspace/diffusion-planner-project/data_process/npz_scenes/037db12ac9125b9a_900.npz'
+CSV_OUTPUT_PATH = '/workspace/diffusion-planner-project/data_process/npz_scenes/las_vegas_hs_17486.csv'
 
 
 def quaternion_to_heading(qw, qx, qy, qz):
@@ -89,14 +89,17 @@ def get_target_frame(conn, scenario_token, frame_index):
         
         if scenario:
             print(f"Found scenario: {scenario_token}")
+            # First get log_token from scene (matching extract_ego_data approach)
+            cursor.execute('SELECT log_token FROM scene WHERE token = ?', (scenario_token_bytes,))
+            log_token = cursor.fetchone()[0]
+            
+            # Then query ego_pose filtered by log_token
             cursor.execute('''
                 SELECT ep.token, ep.timestamp 
                 FROM ego_pose ep
-                JOIN scene s ON s.log_token = (
-                    SELECT log_token FROM scene WHERE token = ?
-                )
+                WHERE ep.log_token = ?
                 ORDER BY ep.timestamp
-            ''', (scenario_token_bytes,))
+            ''', (log_token,))
             frames = cursor.fetchall()
             
             if frame_index < len(frames):
@@ -147,16 +150,36 @@ def get_traffic_lights_at_timestamp(conn, timestamp, map_name):
         return {}
 
 
-def extract_ego_data(conn, center_token, center_timestamp):
+def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
     """Extract ego pose data around center frame"""
     cursor = conn.cursor()
     
-    cursor.execute('''
-        SELECT token, timestamp, x, y, z, qw, qx, qy, qz, 
-               vx, vy, vz, acceleration_x, acceleration_y
-        FROM ego_pose 
-        ORDER BY timestamp
-    ''')
+    # Get log_token from scene to filter ego_pose
+    scenario_token_bytes = bytes.fromhex(scenario_token)
+    cursor.execute('SELECT log_token FROM scene WHERE token = ?', (scenario_token_bytes,))
+    result = cursor.fetchone()
+    if result is None:
+        print("Warning: scene not found, querying all ego_pose")
+        log_token = None
+    else:
+        log_token = result[0]
+    
+    # Query ego_pose filtered by log_token
+    if log_token:
+        cursor.execute('''
+            SELECT token, timestamp, x, y, z, qw, qx, qy, qz, 
+                   vx, vy, vz, acceleration_x, acceleration_y
+            FROM ego_pose 
+            WHERE log_token = ?
+            ORDER BY timestamp
+        ''', (log_token,))
+    else:
+        cursor.execute('''
+            SELECT token, timestamp, x, y, z, qw, qx, qy, qz, 
+                   vx, vy, vz, acceleration_x, acceleration_y
+            FROM ego_pose 
+            ORDER BY timestamp
+        ''')
     all_poses = cursor.fetchall()
     
     center_idx = None
@@ -291,8 +314,14 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
                     box['width'], box['length'], 1.0
                 ]
         
+        # 提取未来轨迹：20Hz -> 10Hz采样，每2帧取1
+        last_valid_idx = None
+        last_valid_dx = None
+        last_valid_dy = None
+        last_valid_heading = None
+        
         for i in range(NEIGHBOR_FUTURE_LEN):
-            idx = center_box_idx + i + 1
+            idx = center_box_idx + (i + 1) * 2  # 每2帧取1 = 10Hz
             if idx < len(boxes):
                 box = boxes[idx]
                 dx, dy = transform_to_ego_frame(box['x'], box['y'], ego_x, ego_y, ego_heading)
@@ -301,6 +330,29 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
                 while dheading > np.pi: dheading -= 2 * np.pi
                 while dheading < -np.pi: dheading += 2 * np.pi
                 neighbor_future[agent_idx + 1, i] = [dx, dy, dheading]
+                last_valid_idx = i
+                last_valid_dx = dx
+                last_valid_dy = dy
+                last_valid_heading = dheading
+        
+        # 末尾填充：用最后2个有效点计算速度，按匀速模型填充剩余帧
+        if last_valid_idx is not None and last_valid_idx < NEIGHBOR_FUTURE_LEN - 1:
+            if last_valid_idx >= 1:
+                # 获取最后两个有效点的位置
+                prev_dx = neighbor_future[agent_idx + 1, last_valid_idx - 1, 0]
+                prev_dy = neighbor_future[agent_idx + 1, last_valid_idx - 1, 1]
+                velocity_x = last_valid_dx - prev_dx  # 每0.1s的位移
+                velocity_y = last_valid_dy - prev_dy
+            else:
+                # 只有一个有效点，速度为0
+                velocity_x = 0
+                velocity_y = 0
+            
+            # 匀速填充
+            for i in range(last_valid_idx + 1, NEIGHBOR_FUTURE_LEN):
+                neighbor_future[agent_idx + 1, i, 0] = last_valid_dx + velocity_x * (i - last_valid_idx)
+                neighbor_future[agent_idx + 1, i, 1] = last_valid_dy + velocity_y * (i - last_valid_idx)
+                neighbor_future[agent_idx + 1, i, 2] = last_valid_heading  # 方向保持不变
     
     return neighbor_past, neighbor_future
 
@@ -633,7 +685,7 @@ def main():
     
     print("\n[1/7] Extracting ego data...")
     ego_current_state, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses = \
-        extract_ego_data(conn, center_token, center_timestamp)
+        extract_ego_data(conn, center_token, center_timestamp, SCENARIO_TOKEN)
     print(f"  ego_current_state: {ego_current_state.shape}")
     print(f"  ego_agent_future: {ego_future.shape}")
     
