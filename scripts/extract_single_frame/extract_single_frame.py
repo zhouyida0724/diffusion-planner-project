@@ -17,20 +17,21 @@ from shapely import LineString
 
 # Add nuplan-visualization to path
 import sys
-sys.path.insert(0, '/workspace/nuplan-visualization')
+sys.path.insert(0, '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/nuplan-visualization')
 
 from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer, TrafficLightStatusData
 from nuplan.common.actor_state.state_representation import Point2D
 
 # Constants
-DB_PATH = '/workspace/data/nuplan/data/cache/mini/2021.06.14.17.26.26_veh-38_04544_04920.db'
-MAP_ROOT = '/workspace/data/nuplan/maps'
+DB_PATH = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data/nuplan/data/cache/mini/2021.06.28.16.29.11_veh-38_01415_01821.db'
+MAP_ROOT = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data/nuplan/maps'
 MAP_VERSION = '9.12.1817'
 MAP_NAME = 'us-nv-las-vegas-strip'
 
 # Feature dimensions
 EGO_FUTURE_LEN = 80
+EGO_HISTORY_LEN = 21  # 21帧历史，10Hz采样
 NEIGHBOR_HISTORY_LEN = 21
 NEIGHBOR_FUTURE_LEN = 81  # 8秒 = 81点 @ 0.1s间隔
 MAX_NEIGHBORS = 32
@@ -40,12 +41,15 @@ MAX_ROUTE_LANES = 25
 POLYLINE_LEN = 20
 LANE_DIM = 12
 
-# Target scenario
-SCENARIO_TOKEN = '037db12ac9125b9a'
-CENTER_FRAME_INDEX = 17486  # 第200帧
+# Target scenario 4: Singapore 18701 (2021.10.06.07.26.10_veh-52_00006_00398.db)
+DB_PATH = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data/nuplan/data/cache/mini/2021.10.06.07.26.10_veh-52_00006_00398.db'
+MAP_NAME = 'sg-one-north'
 
-OUTPUT_PATH = '/workspace/diffusion-planner-project/data_process/npz_scenes/037db12ac9125b9a_900.npz'
-CSV_OUTPUT_PATH = '/workspace/diffusion-planner-project/data_process/npz_scenes/las_vegas_hs_17486.csv'
+SCENARIO_TOKEN = '6a066b79aedd5ad3'
+CENTER_FRAME_INDEX = 18701
+
+OUTPUT_PATH = '/workspace/data_process/npz_scenes/singapore_18701_with_past.npz'
+CSV_OUTPUT_PATH = '/workspace/data_process/npz_scenes/singapore_18701.csv'
 
 
 def quaternion_to_heading(qw, qx, qy, qz):
@@ -232,6 +236,19 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
             while dheading < -np.pi: dheading += 2 * np.pi
             ego_future[i] = [dx, dy, dheading]
     
+    # Extract ego_past: 21帧历史，10Hz采样
+    ego_past = np.zeros((EGO_HISTORY_LEN, 3), dtype=np.float32)  # x, y, heading
+    for i in range(EGO_HISTORY_LEN):
+        idx = center_idx - (EGO_HISTORY_LEN - 1 - i) * 10
+        if idx >= 0:
+            past_row = all_poses[idx]
+            dx, dy = transform_to_ego_frame(past_row['x'], past_row['y'], ego_x, ego_y, ego_heading)
+            heading = quaternion_to_heading(past_row['qw'], past_row['qx'], past_row['qy'], past_row['qz'])
+            dheading = heading - ego_heading
+            while dheading > np.pi: dheading -= 2 * np.pi
+            while dheading < -np.pi: dheading += 2 * np.pi
+            ego_past[i] = [dx, dy, dheading]
+    
     neighbor_past = np.zeros((MAX_NEIGHBORS, NEIGHBOR_HISTORY_LEN, 11), dtype=np.float32)
     
     for i in range(NEIGHBOR_HISTORY_LEN):
@@ -249,7 +266,7 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
         else:
             neighbor_past[0, i, -1] = 0.0
     
-    return ego_current_state, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses
+    return ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses
 
 
 def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
@@ -684,9 +701,10 @@ def main():
     print(f"Center timestamp: {center_timestamp}")
     
     print("\n[1/7] Extracting ego data...")
-    ego_current_state, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses = \
+    ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses = \
         extract_ego_data(conn, center_token, center_timestamp, SCENARIO_TOKEN)
     print(f"  ego_current_state: {ego_current_state.shape}")
+    print(f"  ego_past: {ego_past.shape}")
     print(f"  ego_agent_future: {ego_future.shape}")
     
     print("\n[2/7] Extracting traffic light data...")
@@ -738,6 +756,7 @@ def main():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     np.savez(OUTPUT_PATH,
         ego_current_state=ego_current_state,
+        ego_past=ego_past,
         ego_agent_future=ego_future,
         neighbor_agents_past=neighbor_past,
         neighbor_agents_future=neighbor_future,
@@ -757,6 +776,7 @@ def main():
     
     features = {
         'ego_current_state': ego_current_state,
+        'ego_past': ego_past,
         'ego_agent_future': ego_future,
         'neighbor_agents_past': neighbor_past,
         'neighbor_agents_future': neighbor_future,

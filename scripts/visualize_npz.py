@@ -108,6 +108,16 @@ def visualize_npz(npz_path, output_path=None):
         # # End marker: star (★)
         # ax.plot(end_x, end_y, '*', markersize=12, color='green', markeredgecolor='darkgreen', markeredgewidth=1)
     
+    # ========== 2.1 Ego past trajectory ==========
+    # ========== 2.1 Ego past trajectory ==========
+    if 'ego_past' in data.files:
+        ego_past = data['ego_past']
+        # 绘制连续的历史轨迹
+        valid_mask = (ego_past[:, 0] != 0) | (ego_past[:, 1] != 0)
+        if np.any(valid_mask):
+            ax.plot(ego_past[valid_mask, 0], ego_past[valid_mask, 1], 
+                    'g--', linewidth=3, alpha=0.8, label='Ego Past')
+    
     # Load neighbor agents data
     neighbor_past = data['neighbor_agents_past']
     neighbor_future = data.get('neighbor_agents_future')
