@@ -72,6 +72,58 @@ def visualize_npz(npz_path, output_path=None):
         valid_right = (right_x != 0) | (right_y != 0)
         ax.plot(right_x[valid_right], right_y[valid_right], 'r--', linewidth=1, alpha=0.5)
     
+    # ============================================================
+    # NEW: Add route lanes visualization (light yellow solid lines with gold arrows)
+    # ============================================================
+    if route_lanes is not None:
+        route_lanes_avails = data.get('route_lanes_avails')
+        for rlane_idx in range(route_lanes.shape[0]):
+            lane_x = route_lanes[rlane_idx, :, 0]
+            lane_y = route_lanes[rlane_idx, :, 1]
+            
+            # Skip if all zeros
+            if np.all(lane_x == 0) and np.all(lane_y == 0):
+                continue
+            
+            # Skip if too far
+            dist = np.sqrt(lane_x**2 + lane_y**2)
+            if np.min(dist[dist > 0]) > 50:
+                continue
+            
+            # Get availability mask if available
+            if route_lanes_avails is not None:
+                avail = route_lanes_avails[rlane_idx]
+                valid_mask = avail > 0
+                if not np.any(valid_mask):
+                    continue
+                x_coords = lane_x[valid_mask]
+                y_coords = lane_y[valid_mask]
+            else:
+                valid_mask = (lane_x != 0) | (lane_y != 0)
+                x_coords = lane_x[valid_mask]
+                y_coords = lane_y[valid_mask]
+            
+            if len(x_coords) == 0:
+                continue
+            
+            # Plot light yellow solid line for route lanes
+            ax.plot(x_coords, y_coords, '-', color='#FFFF99', alpha=0.9, linewidth=2)
+            
+            # Plot gold direction arrows every few points
+            arrow_interval = max(1, len(x_coords) // 5)  # Show about 5 arrows per lane
+            for i in range(0, len(x_coords) - 1, arrow_interval):
+                if i + 1 < len(x_coords):
+                    # Calculate direction vector
+                    dx = x_coords[i + 1] - x_coords[i]
+                    dy = y_coords[i + 1] - y_coords[i]
+                    # Normalize and scale arrow
+                    dist = np.sqrt(dx**2 + dy**2)
+                    if dist > 0.01:  # Avoid division by zero
+                        dx, dy = dx / dist * 1.5, dy / dist * 1.5
+                        ax.annotate('', xy=(x_coords[i + 1], y_coords[i + 1]), 
+                                    xytext=(x_coords[i], y_coords[i]),
+                                    arrowprops=dict(arrowstyle='->', color='#FFD700', lw=1.5))
+    
     # ========== 2. Ego (arrow at origin) ==========
     ego_state = data['ego_current_state']
     cos_h, sin_h = ego_state[2], ego_state[3]
