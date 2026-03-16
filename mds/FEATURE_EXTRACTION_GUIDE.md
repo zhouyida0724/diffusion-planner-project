@@ -1,0 +1,156 @@
+# 特征提取指南
+
+## 概述
+
+本指南说明如何从 nuPlan 场景中提取训练特征。
+
+---
+
+## 环境要求
+
+**重要：所有脚本执行必须在 Docker 容器内进行！**
+
+- 特征提取 → nuplan-simulation 容器
+- 训练 → training 容器
+
+### 进入容器
+```bash
+docker exec -it nuplan-simulation bash
+```
+
+### 路径映射
+- 容器内 `/workspace/` → 宿主机 `/home/zhouyida/.openclaw/workspace/diffusion-planner-project/`
+
+---
+
+## 数据频率
+
+| 数据类型 | 频率 | 说明 |
+|----------|------|------|
+| ego_pose | 100Hz | 自车姿态数据 |
+| lidar_pc | 20Hz | LiDAR 点云帧 |
+| lidar_box | 20Hz | 障碍物检测框 |
+
+---
+
+## 特征列表
+
+| 特征 | Shape | 说明 |
+|------|-------|------|
+| ego_current_state | (10,) | 自车当前状态 |
+| ego_past | (21, 3) | 自车历史轨迹 (2秒 @ 10Hz) |
+| ego_agent_future | (80, 3) | 自车未来轨迹 (8秒 @ 10Hz) |
+| neighbor_agents_past | (32, 21, 11) | 邻居历史轨迹 |
+| neighbor_agents_future | (32, 81, 3) | 邻居未来轨迹 |
+| lanes | (70, 20, 12) | 车道特征 |
+| route_lanes | (25, 20, 12) | 路线车道特征 |
+
+---
+
+## 提取命令
+
+### 1. 单场景提取
+```bash
+python3 /workspace/scripts/extract_single_frame/extract_single_frame.py
+```
+
+脚本会自动处理以下数据库：
+- 2021.06.28.16.29.11_veh-38_01415_01821.db
+- 2021.10.06.07.26.10_veh-52_00006_00398.db
+- ...
+
+### 2. 可视化
+```bash
+python3 /workspace/scripts/visualize_npz.py <npz_path> <png_path>
+
+# 示例
+python3 /workspace/scripts/visualize_npz.py \
+    /workspace/data_process/npz_scenes/scene_123.npz \
+    /workspace/validation_output/scene_123.png
+```
+
+---
+
+## 采样策略
+
+### ego_future (未来轨迹)
+- 80 点，10Hz，8秒
+- 从 ego_pose (100Hz) 每 10 帧取 1 帧
+
+### ego_past (历史轨迹)
+- 21 点，10Hz，2秒
+- 从 ego_pose (100Hz) 每 10 帧取 1 帧
+
+### neighbor_future (未来轨迹)
+- 81 点，10Hz，8秒
+- 从 lidar_box (20Hz) 每 2 帧取 1 帧
+
+### neighbor_past (历史轨迹)
+- 21 点，10Hz，2秒
+- 从 lidar_box (20Hz) 每 2 帧取 1 帧
+
+---
+
+## 末尾填充
+
+当 agent 数据不足时，使用匀速模型填充：
+
+```python
+# 用最后两个有效点计算速度
+velocity_x = last_valid_dx - prev_dx
+velocity_y = last_valid_dy - prev_dy
+
+# 按匀速模型填充
+for i in range(last_valid_idx + 1, target_len):
+    neighbor_future[agent_idx, i] = [
+        last_valid_dx + velocity_x * (i - last_valid_idx),
+        last_valid_dy + velocity_y * (i - last_valid_idx),
+        last_valid_heading
+    ]
+```
+
+---
+
+## 常用数据库和帧索引
+
+### Las Vegas
+| 数据库 | 帧索引 |
+|--------|--------|
+| 2021.06.28.16.29.11_veh-38_01415_01821.db | 29424 |
+| 2021.05.12.22.28.35_veh-35_00620_01164.db | 53853 |
+
+### Boston
+| 数据库 | 帧索引 |
+|--------|--------|
+| 2021.08.09.17.55.59_veh-28_00021_00307.db | 17626 |
+
+### Singapore
+| 数据库 | 帧索引 |
+|--------|--------|
+| 2021.10.06.07.26.10_veh-52_00006_00398.db | 18701 |
+
+---
+
+## 输出文件
+
+### NPZ 格式
+```python
+{
+    'ego_current_state': (10,),
+    'ego_past': (21, 3),
+    'ego_agent_future': (80, 3),
+    'neighbor_agents_past': (32, 21, 11),
+    'neighbor_agents_future': (32, 81, 3),
+    'lanes': (70, 20, 12),
+    'route_lanes': (25, 20, 12),
+    ...
+}
+```
+
+### 可视化
+- 蓝/红色虚线：车道边界
+- 浅黄色实线：route lane 中心线
+- 金色箭头：route lane 方向
+- 绿色虚线：ego 历史轨迹
+- 蓝色实线：ego 未来轨迹
+- 绿色实线：邻居未来轨迹
