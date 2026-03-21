@@ -33,6 +33,7 @@ def visualize_npz(npz_path, output_path=None):
     # Set range [-50, 50] for both axes
     ax.set_xlim(-50, 50)
     ax.set_ylim(-50, 50)
+    ax.set_facecolor('white')
     ax.set_aspect('equal')
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
