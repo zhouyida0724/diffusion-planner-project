@@ -55,6 +55,7 @@ case "${1:-run}" in
             -p 2000:2000 \
             -v $HOST_DATA_DIR:/workspace/data \
             -v $HOST_WORKSPACE/diffusion-planner-project:/workspace \
+            -v /media:/media:ro \
             -w /workspace \
             $IMAGE_NAME \
             tail -f /dev/null
