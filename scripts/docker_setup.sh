@@ -16,6 +16,8 @@ IMAGE_NAME="zhouyida/nuplan-simulation"
 CONTAINER_NAME="nuplan-simulation"
 HOST_DATA_DIR="/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data"
 HOST_WORKSPACE="/home/zhouyida/.openclaw/workspace"
+# nuPlan DB cache root on host (mounted read-only into container)
+HOST_NUPLAN_CACHE_DIR="/media/zhouyida/新加卷/nuplan_datasets/data/cache"
 
 # Install dependencies inside container
 install_deps() {
@@ -74,6 +76,7 @@ case "${1:-run}" in
             -p 5007:5007 \
             -v $HOST_DATA_DIR:/workspace/data \
             -v $HOST_WORKSPACE/diffusion-planner-project:/workspace \
+            -v "$HOST_NUPLAN_CACHE_DIR":"$HOST_NUPLAN_CACHE_DIR":ro \
             -w /workspace \
             $IMAGE_NAME \
             tail -f /dev/null
