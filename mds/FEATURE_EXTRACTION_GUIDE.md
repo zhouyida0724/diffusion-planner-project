@@ -93,8 +93,29 @@ python3 /workspace/scripts/visualize_npz.py \
 
 ## 末尾填充
 
-当 agent 数据不足时，使用匀速模型填充：
+当 agent 数据不足时，分三种情况处理：
 
+### 情况1：完全没有有效 future 点
+用当前帧位置填充：
+```python
+# 从 center_box 获取当前位置
+fill_dx, fill_dy = transform_to_ego_frame(center_box['x'], center_box['y'], ego_x, ego_y, ego_heading)
+fill_heading = center_box['yaw'] - ego_heading
+
+# 所有未来帧都用当前位置填充
+for i in range(NEIGHBOR_FUTURE_LEN):
+    neighbor_future[agent_idx, i] = [fill_dx, fill_dy, fill_heading]
+```
+
+### 情况2：只有 1 个有效点
+用该点常值填充（不估计速度）：
+```python
+for i in range(1, NEIGHBOR_FUTURE_LEN):
+    neighbor_future[agent_idx, i] = [last_valid_dx, last_valid_dy, last_valid_heading]
+```
+
+### 情况3：>=2 个有效点
+用匀速模型填充：
 ```python
 # 用最后两个有效点计算速度
 velocity_x = last_valid_dx - prev_dx
@@ -108,6 +129,21 @@ for i in range(last_valid_idx + 1, target_len):
         last_valid_heading
     ]
 ```
+
+---
+
+## 地图选择逻辑
+
+地图根据数据库的 `log.location` 字段自动选择：
+
+| location | 地图名称 |
+|----------|----------|
+| las_vegas | us-nv-las-vegas-strip |
+| boston | us-ma-boston |
+| pittsburgh | us-pa-pittsburgh-hazelwood |
+| singapore | sg-one-north |
+
+如果 location 本身就是地图名称（如 us-pa-pittsburgh-hazelwood），则直接使用。
 
 ---
 

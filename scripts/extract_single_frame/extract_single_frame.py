@@ -13,19 +13,25 @@ Based on GitHub source code (map_process.py):
 import sqlite3
 import numpy as np
 import os
+import logging
+from datetime import datetime
 from shapely import LineString
 
 # Add nuplan-visualization to path
 import sys
-sys.path.insert(0, '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/nuplan-visualization')
+sys.path.insert(0, '/workspace/nuplan-visualization')
+# Fallback for environments where /workspace is not mounted/writable
+_local_nuplan_vis = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'nuplan-visualization'))
+if os.path.isdir(_local_nuplan_vis):
+    sys.path.insert(0, _local_nuplan_vis)
 
 from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer, TrafficLightStatusData
 from nuplan.common.actor_state.state_representation import Point2D
 
 # Constants
-DB_PATH = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data/nuplan/data/cache/mini/2021.06.28.16.29.11_veh-38_01415_01821.db'
-MAP_ROOT = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data/nuplan/maps'
+DB_PATH = '/workspace/data/nuplan/data/cache/mini/2021.06.14.17.26.26_veh-38_04544_04920.db'
+MAP_ROOT = '/workspace/data/nuplan/maps'
 MAP_VERSION = '9.12.1817'
 MAP_NAME = 'us-nv-las-vegas-strip'
 
@@ -41,15 +47,65 @@ MAX_ROUTE_LANES = 25
 POLYLINE_LEN = 20
 LANE_DIM = 12
 
-# Target scenario 4: Singapore 18701 (2021.10.06.07.26.10_veh-52_00006_00398.db)
-DB_PATH = '/home/zhouyida/.openclaw/workspace/diffusion-planner-project/data/nuplan/data/cache/mini/2021.10.06.07.26.10_veh-52_00006_00398.db'
-MAP_NAME = 'sg-one-north'
+# Target scenario
+SCENARIO_TOKEN = '037db12ac9125b9a'
+CENTER_FRAME_INDEX = 17486  # 第200帧
 
-SCENARIO_TOKEN = '6a066b79aedd5ad3'
-CENTER_FRAME_INDEX = 18701
+OUTPUT_PATH = '/workspace/data_process/npz_scenes/test_ego_past.npz'
+CSV_OUTPUT_PATH = '/workspace/diffusion-planner-project/data_process/npz_scenes/las_vegas_hs_17486.csv'
 
-OUTPUT_PATH = '/workspace/data_process/npz_scenes/singapore_18701_with_past.npz'
-CSV_OUTPUT_PATH = '/workspace/data_process/npz_scenes/singapore_18701.csv'
+
+# ------------------------
+# Debug logging (no logic changes)
+# ------------------------
+_DEBUG_LOG_DIR_DEFAULT = '/workspace/data_process/debug_log'
+_DEBUG_LOG_DIR_FALLBACK = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data_process', 'debug_log')
+
+def _init_debug_logger():
+    """Initialize a per-run debug logger writing to debug_log dir."""
+    logger = logging.getLogger('extract_single_frame_debug')
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+
+    # Prefer default path; if not writable, fall back to repo-local data_process/debug_log
+    debug_dir = _DEBUG_LOG_DIR_DEFAULT
+    try:
+        os.makedirs(debug_dir, exist_ok=True)
+        test_path = os.path.join(debug_dir, '.write_test')
+        with open(test_path, 'w') as f:
+            f.write('ok')
+        os.remove(test_path)
+    except Exception:
+        debug_dir = os.path.abspath(_DEBUG_LOG_DIR_FALLBACK)
+        os.makedirs(debug_dir, exist_ok=True)
+
+    base = os.path.splitext(os.path.basename(OUTPUT_PATH))[0] if 'OUTPUT_PATH' in globals() else 'extract_single_frame'
+    log_path = os.path.join(debug_dir, f'{base}.log')
+
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    logger.propagate = False
+    logger.info('=== extract_single_frame debug start ===')
+    logger.info(f'OUTPUT_PATH={OUTPUT_PATH}')
+    logger.info(f'DB_PATH={DB_PATH}')
+    logger.info(f'MAP_NAME={MAP_NAME}')
+    logger.info(f'SCENARIO_TOKEN={SCENARIO_TOKEN} CENTER_FRAME_INDEX={CENTER_FRAME_INDEX}')
+    logger.info(f'log_path={log_path}')
+    return logger
+
+
+DEBUG_LOGGER = _init_debug_logger()
 
 
 def quaternion_to_heading(qw, qx, qy, qz):
@@ -75,11 +131,58 @@ def transform_to_ego_frame(x, y, ego_x, ego_y, ego_heading):
     return local_x, local_y
 
 
-def load_db():
-    """Load database connection"""
-    conn = sqlite3.connect(DB_PATH)
+def load_db(db_path: str | None = None):
+    """Load database connection."""
+    conn = sqlite3.connect(db_path or DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def get_location_from_log(conn: sqlite3.Connection) -> str | None:
+    """Read the actual scenario location from the DB log table (authoritative source)."""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT location FROM log LIMIT 1")
+        row = cursor.fetchone()
+        if not row:
+            return None
+        # sqlite3.Row supports both index and key access
+        loc = row[0]
+        if loc is None:
+            return None
+        return str(loc)
+    except Exception:
+        return None
+
+
+def map_name_from_location(location: str | None) -> str:
+    """Map DB `log.location` value to a nuPlan map name.
+
+    Notes:
+      - Some DBs store a *city* string (e.g. 'boston', 'las_vegas').
+      - Some DBs store the *map name itself* (e.g. 'us-pa-pittsburgh-hazelwood').
+    """
+
+    if not location:
+        return 'us-ma-boston'
+
+    # If DB already stores the map name, accept it directly.
+    known_map_names = {
+        'us-nv-las-vegas-strip',
+        'us-ma-boston',
+        'us-pa-pittsburgh-hazelwood',
+        'sg-one-north',
+    }
+    if location in known_map_names:
+        return location
+
+    location_to_map = {
+        'las_vegas': 'us-nv-las-vegas-strip',
+        'boston': 'us-ma-boston',
+        'pittsburgh': 'us-pa-pittsburgh-hazelwood',
+        'singapore': 'sg-one-north',
+    }
+    return location_to_map.get(location, 'us-ma-boston')
 
 
 def get_target_frame(conn, scenario_token, frame_index):
@@ -352,24 +455,68 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
                 last_valid_dy = dy
                 last_valid_heading = dheading
         
-        # 末尾填充：用最后2个有效点计算速度，按匀速模型填充剩余帧
-        if last_valid_idx is not None and last_valid_idx < NEIGHBOR_FUTURE_LEN - 1:
-            if last_valid_idx >= 1:
-                # 获取最后两个有效点的位置
-                prev_dx = neighbor_future[agent_idx + 1, last_valid_idx - 1, 0]
-                prev_dy = neighbor_future[agent_idx + 1, last_valid_idx - 1, 1]
-                velocity_x = last_valid_dx - prev_dx  # 每0.1s的位移
-                velocity_y = last_valid_dy - prev_dy
-            else:
-                # 只有一个有效点，速度为0
-                velocity_x = 0
-                velocity_y = 0
-            
-            # 匀速填充
+        # 末尾填充：
+        # - 若完全没有有效future点：用当前帧位置(从past/center_box获取)填充
+        # - 若只有1个有效点：直接用该点常值填充
+        # - 若>=2个有效点：用最后2个有效点估计速度，按匀速模型填充
+        did_padding = False
+        padding_mode = "none"
+
+        def _normalize_angle(a: float) -> float:
+            while a > np.pi:
+                a -= 2 * np.pi
+            while a < -np.pi:
+                a += 2 * np.pi
+            return a
+
+        if last_valid_idx is None:
+            # case 1: no valid future points -> fill with current(frame) position
+            did_padding = True
+            padding_mode = "fill_current"
+            center_box = boxes[center_box_idx]
+            fill_dx, fill_dy = transform_to_ego_frame(center_box['x'], center_box['y'], ego_x, ego_y, ego_heading)
+            fill_heading = _normalize_angle(center_box['yaw'] - ego_heading)
+            for i in range(NEIGHBOR_FUTURE_LEN):
+                neighbor_future[agent_idx + 1, i] = [fill_dx, fill_dy, fill_heading]
+
+        elif last_valid_idx == 0 and last_valid_idx < NEIGHBOR_FUTURE_LEN - 1:
+            # case 2: only one valid point -> constant fill (no velocity estimation)
+            did_padding = True
+            padding_mode = "fill_constant_last"
+            for i in range(1, NEIGHBOR_FUTURE_LEN):
+                neighbor_future[agent_idx + 1, i] = [last_valid_dx, last_valid_dy, last_valid_heading]
+
+        elif last_valid_idx < NEIGHBOR_FUTURE_LEN - 1:
+            # case 3: >=2 valid points -> constant velocity fill
+            did_padding = True
+            padding_mode = "fill_const_vel"
+            prev_dx = neighbor_future[agent_idx + 1, last_valid_idx - 1, 0]
+            prev_dy = neighbor_future[agent_idx + 1, last_valid_idx - 1, 1]
+            velocity_x = last_valid_dx - prev_dx  # 每0.1s的位移
+            velocity_y = last_valid_dy - prev_dy
             for i in range(last_valid_idx + 1, NEIGHBOR_FUTURE_LEN):
                 neighbor_future[agent_idx + 1, i, 0] = last_valid_dx + velocity_x * (i - last_valid_idx)
                 neighbor_future[agent_idx + 1, i, 1] = last_valid_dy + velocity_y * (i - last_valid_idx)
                 neighbor_future[agent_idx + 1, i, 2] = last_valid_heading  # 方向保持不变
+
+        # Debug: record valid points, padding behavior, and filled data for each agent
+        try:
+            valid_count = (last_valid_idx + 1) if last_valid_idx is not None else 0
+            padded_count = (NEIGHBOR_FUTURE_LEN - valid_count) if did_padding else 0
+            fut_str = np.array2string(
+                neighbor_future[agent_idx + 1],
+                precision=3,
+                suppress_small=True,
+                separator=", ",
+            )
+            DEBUG_LOGGER.info(
+                f"neighbor_future agent={agent_idx+1} track_token={track_token.hex() if isinstance(track_token, (bytes, bytearray)) else track_token} "
+                f"boxes_total={len(boxes)} center_box_idx={center_box_idx} min_diff={min_diff} "
+                f"valid_count={valid_count}/{NEIGHBOR_FUTURE_LEN} padded={did_padding} padded_count={padded_count} mode={padding_mode} "
+                f"after_padding={fut_str}"
+            )
+        except Exception as e:
+            DEBUG_LOGGER.warning(f"neighbor_future debug log failed for agent={agent_idx+1}: {e}")
     
     return neighbor_past, neighbor_future
 
@@ -567,6 +714,14 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
         
         lane_idx += 1
     
+    # Debug: record nonzero counts
+    try:
+        DEBUG_LOGGER.info(
+            f"lanes nonzero={int(np.count_nonzero(lanes))} avails_true={int(np.count_nonzero(lanes_avails))} filled_lanes={lane_idx}/{max_lanes}"
+        )
+    except Exception as e:
+        DEBUG_LOGGER.warning(f"lanes debug log failed: {e}")
+
     return lanes, lanes_avails, speed_limits, has_speed_limits
 
 
@@ -664,6 +819,14 @@ def extract_route_lanes(point, map_api, radius=150, max_route_lanes=25, ego_head
         
         route_idx += 1
     
+    # Debug: record nonzero counts
+    try:
+        DEBUG_LOGGER.info(
+            f"route_lanes nonzero={int(np.count_nonzero(route_lanes))} avails_true={int(np.count_nonzero(route_lanes_avails))} filled_route_lanes={route_idx}/{max_route_lanes}"
+        )
+    except Exception as e:
+        DEBUG_LOGGER.warning(f"route_lanes debug log failed: {e}")
+
     return route_lanes, route_lanes_avails, route_speed_limits, route_has_speed_limits
 
 
@@ -695,7 +858,17 @@ def main():
     
     conn = load_db()
     cursor = conn.cursor()
-    
+
+    # Determine the correct map from DB metadata (do NOT infer from filename).
+    global MAP_NAME
+    location = get_location_from_log(conn)
+    MAP_NAME = map_name_from_location(location)
+    print(f"DB location: {location} -> MAP_NAME: {MAP_NAME}")
+    try:
+        DEBUG_LOGGER.info(f"DB location={location} -> MAP_NAME={MAP_NAME}")
+    except Exception:
+        pass
+
     center_token, center_timestamp, ego_pose_token = get_target_frame(conn, SCENARIO_TOKEN, CENTER_FRAME_INDEX)
     print(f"Center token: {center_token}")
     print(f"Center timestamp: {center_timestamp}")
