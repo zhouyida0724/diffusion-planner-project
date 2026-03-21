@@ -28,6 +28,9 @@ if os.path.isdir(_local_nuplan_vis):
 from nuplan.common.maps.nuplan_map.map_factory import get_maps_api
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer, TrafficLightStatusData
 from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
+from nuplan.diffusion_planner.data_process.roadblock_utils import route_roadblock_correction, BreadthFirstSearchRoadBlock
 
 # Constants
 DB_PATH = '/workspace/data/nuplan/data/cache/mini/2021.06.14.17.26.26_veh-38_04544_04920.db'
@@ -183,6 +186,178 @@ def map_name_from_location(location: str | None) -> str:
         'singapore': 'sg-one-north',
     }
     return location_to_map.get(location, 'us-ma-boston')
+
+
+def build_nuplan_scenario_from_db(conn: sqlite3.Connection, db_path: str, scene_token_hex: str, map_name: str) -> NuPlanScenario:
+    """Build a minimal NuPlanScenario so we can call scenario.get_route_roadblock_ids()."""
+    cursor = conn.cursor()
+    scene_token_bytes = bytes.fromhex(scene_token_hex)
+
+    cursor.execute('SELECT name FROM scene WHERE token = ? LIMIT 1', (scene_token_bytes,))
+    row = cursor.fetchone()
+    scenario_type = str(row[0]) if row and row[0] is not None else 'unknown'
+
+    # Find the initial lidar_pc token for this *scene* (earliest timestamp within the scene).
+    # NOTE: `lidar_pc.prev_token` links the whole log, not the scene segment, so do NOT use prev_token IS NULL here.
+    cursor.execute(
+        'SELECT token, timestamp FROM lidar_pc WHERE scene_token = ? ORDER BY timestamp ASC LIMIT 1',
+        (scene_token_bytes,),
+    )
+    lidar_row = cursor.fetchone()
+    assert lidar_row is not None, f'Unable to find lidar_pc row for scene_token={scene_token_hex}'
+
+    initial_lidar_token_hex = lidar_row[0].hex() if isinstance(lidar_row[0], (bytes, bytearray)) else str(lidar_row[0])
+    initial_lidar_timestamp = int(lidar_row[1])
+
+    # Note: data_root is only used for remote download; with a local absolute db_path it's fine.
+    data_root = os.path.dirname(db_path)
+
+    return NuPlanScenario(
+        data_root=data_root,
+        log_file_load_path=db_path,
+        initial_lidar_token=initial_lidar_token_hex,
+        initial_lidar_timestamp=initial_lidar_timestamp,
+        scenario_type=scenario_type,
+        map_root=MAP_ROOT,
+        map_version=MAP_VERSION,
+        map_name=map_name,
+        scenario_extraction_info=None,
+        ego_vehicle_parameters=get_pacifica_parameters(),
+        sensor_root=None,
+    )
+
+
+def get_pruned_route_roadblock_ids(
+    conn: sqlite3.Connection,
+    db_path: str,
+    scene_token_hex: str,
+    map_api,
+    map_name: str,
+) -> list[str]:
+    """Get scenario route roadblock ids and (optionally) correct/prune them."""
+    scenario = build_nuplan_scenario_from_db(conn, db_path, scene_token_hex, map_name)
+    route_roadblock_ids = list(scenario.get_route_roadblock_ids())
+
+    # Apply correction to handle off-route start / disconnected route segments.
+    try:
+        ego_state_0 = scenario.get_ego_state_at_iteration(0)
+        route_roadblock_ids = list(route_roadblock_correction(ego_state_0, map_api, route_roadblock_ids))
+    except Exception as e:
+        try:
+            DEBUG_LOGGER.warning(f'route_roadblock_correction failed, using raw route ids: {e}')
+        except Exception:
+            pass
+
+    # De-dup while preserving order
+    deduped: list[str] = []
+    seen = set()
+    for rb_id in route_roadblock_ids:
+        if rb_id in seen:
+            continue
+        seen.add(rb_id)
+        deduped.append(rb_id)
+    return deduped
+
+
+def _dedup_keep_order(seq: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in seq:
+        if x is None:
+            continue
+        sx = str(x)
+        if sx in seen:
+            continue
+        seen.add(sx)
+        out.append(sx)
+    return out
+
+
+def bfs_bridge_route_if_needed(
+    map_api,
+    ego_point: Point2D,
+    pruned_route_ids: list[str],
+    *,
+    intersection_pruned: int,
+    radius: float = 150.0,
+    k_targets: int = 10,
+    max_depth: int = 80,
+):
+    """Minimal BFS bridge experiment for a single case.
+
+    Logic:
+      - Find nearest Lane/LaneConnector to ego, use its roadblock_id as ego_rb.
+      - If intersection_pruned == 0 and ego_rb not in pruned_route_ids:
+            BFS from ego_rb to one of pruned_route_ids[:k_targets]
+        then prepend bridge_ids to pruned_route_ids.
+
+    Returns:
+      new_route_ids: list[str]
+      bridge_len: int
+      found: bool
+      ego_rb: str | None
+      reason: str
+    """
+
+    pruned_route_ids = [str(x) for x in (pruned_route_ids or [])]
+    if not pruned_route_ids:
+        return pruned_route_ids, 0, False, None, 'empty_pruned_route'
+
+    # Find nearest lane / lane_connector
+    try:
+        layers = map_api.get_proximal_map_objects(
+            ego_point,
+            radius,
+            [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
+        )
+    except Exception:
+        layers = {}
+
+    nearest = None
+    nearest_dist = float('inf')
+    for layer_type in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
+        for lane_obj in (layers.get(layer_type, []) or []):
+            try:
+                poly = lane_obj.polygon
+                if poly is None:
+                    continue
+                c = poly.centroid
+                d = float(((c.x - ego_point.x) ** 2 + (c.y - ego_point.y) ** 2) ** 0.5)
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest = lane_obj
+            except Exception:
+                continue
+
+    ego_rb = None
+    try:
+        if nearest is not None and hasattr(nearest, 'get_roadblock_id'):
+            ego_rb = str(nearest.get_roadblock_id())
+    except Exception:
+        ego_rb = None
+
+    if not ego_rb:
+        return pruned_route_ids, 0, False, None, 'no_ego_rb'
+
+    if intersection_pruned != 0:
+        return pruned_route_ids, 0, False, ego_rb, f'skip_intersection_pruned={intersection_pruned}'
+
+    if ego_rb in set(pruned_route_ids):
+        return pruned_route_ids, 0, True, ego_rb, 'ego_rb_in_pruned_route'
+
+    try:
+        bfs = BreadthFirstSearchRoadBlock(ego_rb, map_api)
+        (bridge_path, bridge_ids), found = bfs.search(target_roadblock_id=pruned_route_ids[:k_targets], max_depth=max_depth)
+        bridge_ids = [str(x) for x in (bridge_ids or [])]
+    except Exception as e:
+        return pruned_route_ids, 0, False, ego_rb, f'bfs_exception: {e}'
+
+    if not found or not bridge_ids:
+        return pruned_route_ids, 0, False, ego_rb, 'bfs_not_found'
+
+    new_route = _dedup_keep_order(bridge_ids + pruned_route_ids)
+    return new_route, int(len(bridge_ids)), True, ego_rb, 'bfs_bridge_found'
+
 
 
 def get_target_frame(conn, scenario_token, frame_index):
@@ -725,14 +900,24 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
     return lanes, lanes_avails, speed_limits, has_speed_limits
 
 
-def extract_route_lanes(point, map_api, radius=150, max_route_lanes=25, ego_heading=0, traffic_light_data=None):
-    """Extract route lanes based on ego position"""
+def extract_route_lanes(
+    point,
+    map_api,
+    radius=150,
+    max_route_lanes=25,
+    ego_heading=0,
+    traffic_light_data=None,
+    route_roadblock_ids: list[str] | None = None,
+):
+    """Extract route lanes (filtered by route_roadblock_ids if provided) based on ego position."""
     layers = map_api.get_proximal_map_objects(point, radius, [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR])
     
     route_lanes = np.zeros((max_route_lanes, POLYLINE_LEN, LANE_DIM), dtype=np.float32)
     route_lanes_avails = np.zeros((max_route_lanes, POLYLINE_LEN), dtype=np.bool_)
     route_speed_limits = np.zeros(max_route_lanes, dtype=np.float32)
     route_has_speed_limits = np.zeros(max_route_lanes, dtype=np.float32)
+
+    route_roadblock_id_set = set(route_roadblock_ids) if route_roadblock_ids else None
     
     # Convert traffic_light_data keys to strings to match lane_obj.id
     traffic_light_lookup = {}
@@ -758,6 +943,21 @@ def extract_route_lanes(point, map_api, radius=150, max_route_lanes=25, ego_head
         
         for lane_obj in lane_list:
             try:
+                # Filter by route roadblock ids (route roadblock id chain).
+                if route_roadblock_id_set is not None:
+                    rb_id = None
+                    try:
+                        if hasattr(lane_obj, 'get_roadblock_id'):
+                            rb_id = lane_obj.get_roadblock_id()
+                        elif hasattr(lane_obj, 'roadblock_id'):
+                            rb_id = lane_obj.roadblock_id
+                    except Exception:
+                        rb_id = None
+
+                    # Skip lanes/lane_connectors not belonging to (pruned) route roadblocks.
+                    if rb_id is None or str(rb_id) not in route_roadblock_id_set:
+                        continue
+
                 polygon = lane_obj.polygon
                 if polygon is None:
                     continue
@@ -850,6 +1050,35 @@ def generate_csv_summary(features, csv_path):
     print(f"CSV summary saved to: {csv_path}")
 
 
+
+def run_extraction(db_path: str,
+                   scenario_token: str,
+                   center_frame_index: int,
+                   output_path: str,
+                   csv_output_path: str | None = None):
+    """Programmatic entrypoint for batch runs.
+
+    This keeps the core logic in this file, while allowing wrappers to set
+    per-scene parameters safely.
+    """
+    global DB_PATH, SCENARIO_TOKEN, CENTER_FRAME_INDEX, OUTPUT_PATH, CSV_OUTPUT_PATH, DEBUG_LOGGER
+
+    DB_PATH = db_path
+    SCENARIO_TOKEN = scenario_token
+    CENTER_FRAME_INDEX = int(center_frame_index)
+    OUTPUT_PATH = output_path
+    if csv_output_path is not None:
+        CSV_OUTPUT_PATH = csv_output_path
+
+    # Re-init debug logger so each output gets its own log file name.
+    try:
+        DEBUG_LOGGER = _init_debug_logger()
+    except Exception:
+        pass
+
+    return main()
+
+
 def main():
     print("=" * 60)
     print("Starting complete feature extraction WITH VALID MARKING...")
@@ -903,7 +1132,18 @@ def main():
     print(f"  Map: {map_api.map_name}")
     
     point = Point2D(ego_x, ego_y)
-    
+
+    # Route roadblock ids from scenario.get_route_roadblock_ids (+ correction/pruning)
+    try:
+        route_roadblock_ids = get_pruned_route_roadblock_ids(conn, DB_PATH, SCENARIO_TOKEN, map_api, MAP_NAME)
+        DEBUG_LOGGER.info(f"route_roadblock_ids(pruned) len={len(route_roadblock_ids)} head={route_roadblock_ids[:5]}")
+    except Exception as e:
+        route_roadblock_ids = None
+        try:
+            DEBUG_LOGGER.warning(f"Failed to get route_roadblock_ids via scenario: {e}")
+        except Exception:
+            pass
+
     print("\n[6/7] Extracting lanes with boundaries and valid marking...")
     lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
         point, map_api, radius=100, max_lanes=MAX_LANES, ego_heading=ego_heading,
@@ -915,10 +1155,124 @@ def main():
     print(f"  lanes_has_speed_limit: {lanes_has_speed_limit.shape}")
     
     print("\n[7/7] Extracting route lanes with boundaries and valid marking...")
-    route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
-        point, map_api, radius=150, max_route_lanes=MAX_ROUTE_LANES, ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data
+
+    # ---- Single-case BFS bridge minimal experiment ----
+    # 1) old: use pruned route ids directly
+    route_lanes_old, route_lanes_avails_old, _, _ = extract_route_lanes(
+        point,
+        map_api,
+        radius=150,
+        max_route_lanes=MAX_ROUTE_LANES,
+        ego_heading=ego_heading,
+        traffic_light_data=traffic_light_data,
+        route_roadblock_ids=route_roadblock_ids,
     )
+    avails_sum_old = int(np.count_nonzero(route_lanes_avails_old))
+
+    # 2) intersection_pruned: proximal roadblock ids ∩ pruned_route
+    proximal_rb_ids: set[str] = set()
+    try:
+        prox_layers = map_api.get_proximal_map_objects(
+            point,
+            150,
+            [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
+        )
+        for lt in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
+            for lane_obj in (prox_layers.get(lt, []) or []):
+                try:
+                    rb = lane_obj.get_roadblock_id() if hasattr(lane_obj, 'get_roadblock_id') else None
+                    if rb is not None:
+                        proximal_rb_ids.add(str(rb))
+                except Exception:
+                    continue
+    except Exception:
+        prox_layers = {}
+
+    pruned_route_set = set([str(x) for x in (route_roadblock_ids or [])])
+    intersection_pruned = int(len(proximal_rb_ids.intersection(pruned_route_set)))
+
+    # 3) new: if intersection_pruned==0, bridge with BFS and re-run extract_route_lanes
+    new_route_ids = route_roadblock_ids or []
+    bridge_found = False
+    bridge_len = 0
+    ego_rb = None
+    bridge_reason = 'skip'
+
+    if intersection_pruned == 0 and route_roadblock_ids:
+        new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
+            map_api,
+            point,
+            list(route_roadblock_ids),
+            intersection_pruned=intersection_pruned,
+            radius=150,
+            k_targets=10,
+            max_depth=80,
+        )
+
+    route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
+        point,
+        map_api,
+        radius=150,
+        max_route_lanes=MAX_ROUTE_LANES,
+        ego_heading=ego_heading,
+        traffic_light_data=traffic_light_data,
+        route_roadblock_ids=new_route_ids,
+    )
+    avails_sum_new = int(np.count_nonzero(route_lanes_avails))
+
+    # Persist experiment logs to avoid stdout truncation.
+    try:
+        out_dir = '/workspace/validation_output'
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            test_path = os.path.join(out_dir, '.write_test')
+            with open(test_path, 'w') as f:
+                f.write('ok')
+            os.remove(test_path)
+        except Exception:
+            out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'validation_output'))
+            os.makedirs(out_dir, exist_ok=True)
+
+        log_path = os.path.join(out_dir, 'bfs_single_case.log')
+        with open(log_path, 'a') as f:
+            f.write('\n' + '=' * 80 + '\n')
+            f.write(f"db={os.path.basename(DB_PATH)} scene_token={SCENARIO_TOKEN} frame={CENTER_FRAME_INDEX} map={MAP_NAME}\n")
+            f.write(f"intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}\n")
+            f.write(f"route_len_old={(len(route_roadblock_ids) if route_roadblock_ids else 0)} route_len_new={(len(new_route_ids) if new_route_ids else 0)}\n")
+            f.write(f"avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}\n")
+
+        json_path = os.path.join(out_dir, 'bfs_single_case_result.json')
+        import json
+        with open(json_path, 'w') as f:
+            json.dump(
+                {
+                    'db_basename': os.path.basename(DB_PATH),
+                    'scene_token_hex': SCENARIO_TOKEN,
+                    'frame_index': int(CENTER_FRAME_INDEX),
+                    'map_name': MAP_NAME,
+                    'intersection_pruned': int(intersection_pruned),
+                    'ego_rb': ego_rb,
+                    'bridge_found': bool(bridge_found),
+                    'bridge_len': int(bridge_len),
+                    'bridge_reason': bridge_reason,
+                    'route_len_old': int(len(route_roadblock_ids) if route_roadblock_ids else 0),
+                    'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
+                    'avails_sum_old': int(avails_sum_old),
+                    'avails_sum_new': int(avails_sum_new),
+                },
+                f,
+                indent=2,
+            )
+    except Exception as e:
+        try:
+            DEBUG_LOGGER.warning(f"Failed to write bfs_single_case log/json: {e}")
+        except Exception:
+            pass
+
+    # Console summary (also captured by DEBUG_LOGGER).
+    print(f"  intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}")
+    print(f"  avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}")
+
     print(f"  route_lanes: {route_lanes.shape}")
     print(f"  route_lanes_avails: {route_lanes_avails.shape}")
     print(f"  route_lanes_speed_limit: {route_lanes_speed_limit.shape}")

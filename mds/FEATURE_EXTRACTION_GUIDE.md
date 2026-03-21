@@ -190,3 +190,37 @@ for i in range(last_valid_idx + 1, target_len):
 - 绿色虚线：ego 历史轨迹
 - 蓝色实线：ego 未来轨迹
 - 绿色实线：邻居未来轨迹
+
+---
+
+## BFS Bridge（route_lanes 断裂修复）
+
+当 `route_lanes_avails` 全 0 且 **intersection_pruned==0** 时，说明「自车附近可用 roadblock 集合」与「pruned_route roadblock 集合」没有交集，直接按 pruned_route 抽 lane 会导致 route_lanes 全空。此时会尝试用 **BFS bridge** 在路网里补一段连接片段。
+
+### 触发条件
+- `intersection_pruned == 0`
+- 且 `avails_sum_old == 0`（即旧的 route_lanes_avails 求和为 0）
+
+### ego_rb 获取方式
+- 在 `ego_pose` 的当前位置附近（固定半径搜索）收集候选 map objects：`Lane` 与 `LaneConnector`
+- 计算每个候选 roadblock 的几何中心到 ego 的距离，取距离最小者作为 `ego_rb`
+
+### BFS 到 pruned_route 前 K 个目标
+- 从 `ego_rb` 作为起点，在 roadblock graph 上做 BFS
+- 目标集合为 `pruned_route_roadblock_ids[:K]`（当前实现 K=10）
+- 若找到任一目标 roadblock，则回溯得到一条 bridge path（包含起点与目标）
+
+### 拼接 new_route
+- 设 bridge path 为 `bridge = [rb0(=ego_rb), rb1, ..., rbt(∈ pruned_route[:K])]`
+- 令 `new_route = bridge[1:] + pruned_route`（去掉 bridge 的第一个 ego_rb，避免重复）
+- 后续 route_lanes 的抽取/采样基于 `new_route`
+
+### 日志字段（/workspace/validation_output/bfs_single_case_result.json）
+脚本会把关键指标落盘，便于批量排查：
+- `intersection_pruned`
+- `ego_rb`
+- `bridge_found` / `bridge_reason`
+- `bridge_len`
+- `avails_sum_old` / `avails_sum_new`
+
+> 备注：如果 BFS 未找到目标（`bridge_found=False`），则保持原 route，不会引入额外 lane。
