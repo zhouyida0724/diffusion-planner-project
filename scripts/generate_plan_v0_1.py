@@ -22,6 +22,7 @@ Designed to run on host (uses sqlite3). DBs must be accessible at CACHE_BASE.
 
 from __future__ import annotations
 
+import argparse
 import bisect
 import datetime as dt
 import glob
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+# Defaults (override via CLI)
 CACHE_BASE = Path("/media/zhouyida/新加卷1/nuplan_datasets/data/cache")
 OUT_BASE = Path("plans")
 
@@ -41,8 +43,8 @@ N_SCENES = 200
 STRIDE = 8
 CAP_PER_SCENE = 100
 
-# We only need first (CAP_PER_SCENE-1)*STRIDE + 1 poses to generate capped indices.
-POSES_PREFIX_LIMIT = (CAP_PER_SCENE - 1) * STRIDE + 1  # e.g. 793
+# We only need first (cap_per_scene-1)*stride + 1 poses to generate capped indices.
+# This is computed from CLI args inside main.
 
 
 def ro_connect(db_path: Path) -> sqlite3.Connection:
@@ -181,12 +183,33 @@ def fetch_tags_for_lidar_tokens(con: sqlite3.Connection, lidar_tokens: List[byte
     return out
 
 
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Generate nuPlan v0.1 export plan (scene-level selection + stride/cap + tag enrichment).")
+    ap.add_argument("--cache-base", type=str, default=str(CACHE_BASE), help="nuPlan cache root containing train_* dirs")
+    ap.add_argument("--out-base", type=str, default=str(OUT_BASE), help="Output base directory for plans")
+    ap.add_argument("--seed", type=int, default=SEED)
+    ap.add_argument("--n-scenes", type=int, default=N_SCENES)
+    ap.add_argument("--stride", type=int, default=STRIDE)
+    ap.add_argument("--cap-per-scene", type=int, default=CAP_PER_SCENE)
+    ap.add_argument("--location", type=str, default="", help="Optional: force a specific location dir (e.g. train_boston). If empty, pick smallest train_* by ego_pose rows")
+    return ap.parse_args()
+
+
 def main() -> None:
-    random.seed(SEED)
+    args = parse_args()
+    random.seed(int(args.seed))
     now = dt.datetime.now()
 
-    location, inv = inventory_locations(CACHE_BASE)
-    location_dir = CACHE_BASE / location
+    cache_base = Path(args.cache_base)
+    out_base = Path(args.out_base)
+
+    if args.location:
+        location = str(args.location)
+        inv = {}
+    else:
+        location, inv = inventory_locations(cache_base)
+
+    location_dir = cache_base / location
     db_paths = sorted(location_dir.glob("*.db"))
 
     # Enumerate all scene tokens across all DBs.
@@ -199,12 +222,17 @@ def main() -> None:
         finally:
             con.close()
 
-    if len(all_scenes) < N_SCENES:
-        raise RuntimeError(f"Not enough scenes in {location}: have {len(all_scenes)}, need {N_SCENES}")
+    n_scenes = int(args.n_scenes)
+    stride = int(args.stride)
+    cap_per_scene = int(args.cap_per_scene)
+    poses_prefix_limit = (cap_per_scene - 1) * stride + 1
 
-    chosen = random.sample(all_scenes, N_SCENES)
+    if len(all_scenes) < n_scenes:
+        raise RuntimeError(f"Not enough scenes in {location}: have {len(all_scenes)}, need {n_scenes}")
 
-    out_dir = OUT_BASE / f"plan_v0.1_stride{STRIDE}_scene{N_SCENES}_cap{CAP_PER_SCENE}_{location}_{now.strftime('%Y%m%d_%H%M')}"
+    chosen = random.sample(all_scenes, n_scenes)
+
+    out_dir = out_base / f"plan_v0.1_stride{int(args.stride)}_scene{int(args.n_scenes)}_cap{int(args.cap_per_scene)}_{location}_{now.strftime('%Y%m%d_%H%M')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     index_path = out_dir / "index.jsonl"
@@ -229,7 +257,7 @@ def main() -> None:
                 # DB location (should match directory, but use metadata truth).
                 loc = get_location_from_log(con)
 
-                ego_prefix = fetch_ego_pose_prefix(con, sref.log_token, POSES_PREFIX_LIMIT)
+                ego_prefix = fetch_ego_pose_prefix(con, sref.log_token, poses_prefix_limit)
                 if not ego_prefix:
                     continue
                 max_ts = ego_prefix[-1][0]
@@ -260,9 +288,9 @@ def main() -> None:
                     }
                 )
 
-                # Generate indices 0, STRIDE, ... capped by CAP_PER_SCENE and prefix length.
-                for k in range(CAP_PER_SCENE):
-                    idx = k * STRIDE
+                # Generate indices 0, stride, ... capped by cap_per_scene and prefix length.
+                for k in range(cap_per_scene):
+                    idx = k * stride
                     if idx >= len(ego_prefix):
                         break
                     ts_us, _pose_tok = ego_prefix[idx]
@@ -299,9 +327,9 @@ def main() -> None:
     cfg = {
         "seed": SEED,
         "location": location,
-        "n_scenes": N_SCENES,
-        "stride": STRIDE,
-        "cap_per_scene": CAP_PER_SCENE,
+        "n_scenes": n_scenes,
+        "stride": stride,
+        "cap_per_scene": cap_per_scene,
         "poses_prefix_limit": POSES_PREFIX_LIMIT,
     }
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -312,9 +340,9 @@ def main() -> None:
         "location": location,
         "location_inventory": inv,
         "scene_pool_size": len(all_scenes),
-        "scenes_selected": N_SCENES,
-        "stride": STRIDE,
-        "cap_per_scene": CAP_PER_SCENE,
+        "scenes_selected": n_scenes,
+        "stride": stride,
+        "cap_per_scene": cap_per_scene,
         "poses_prefix_limit": POSES_PREFIX_LIMIT,
         "produced_samples": produced,
     }
