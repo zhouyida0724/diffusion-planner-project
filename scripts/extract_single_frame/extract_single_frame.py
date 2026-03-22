@@ -1051,6 +1051,195 @@ def generate_csv_summary(features, csv_path):
 
 
 
+
+def _get_db_path_from_conn(conn: sqlite3.Connection) -> str:
+    """Best-effort absolute/relative path for the opened sqlite DB."""
+    try:
+        cur = conn.cursor()
+        cur.execute('PRAGMA database_list')
+        rows = cur.fetchall()
+        # rows: [(seq,name,file), ...] -> pick main
+        for r in rows:
+            if len(r) >= 3 and r[1] == 'main':
+                return str(r[2])
+        if rows and len(rows[0]) >= 3:
+            return str(rows[0][2])
+    except Exception:
+        pass
+    return ''
+
+
+def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int) -> dict[str, np.ndarray]:
+    """Pure feature extraction.
+
+    Args:
+        conn: sqlite3 connection (row_factory should be sqlite3.Row).
+        map_api: nuPlan map api instance for the scenario location.
+        scenario_token_hex: scene.token hex string.
+        frame_index: index within ego_pose rows filtered by scene.log_token (ORDER BY timestamp).
+
+    Returns:
+        Dict of feature arrays, matching the saved NPZ keys.
+    """
+    db_path = _get_db_path_from_conn(conn)
+    map_name = getattr(map_api, 'map_name', None) or getattr(map_api, '_map_name', None) or MAP_NAME
+
+    center_token, center_timestamp, _ = get_target_frame(conn, scenario_token_hex, int(frame_index))
+
+    ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, _, _ =         extract_ego_data(conn, center_token, center_timestamp, scenario_token_hex)
+
+    traffic_light_data = get_traffic_lights_at_timestamp(conn, center_timestamp, map_name)
+
+    neighbor_past_agents, neighbor_future = extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading)
+    for i in range(1, MAX_NEIGHBORS):
+        if np.any(neighbor_past_agents[i, :, -1] != 0):
+            neighbor_past[i] = neighbor_past_agents[i]
+
+    static_objects = extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading)
+
+    point = Point2D(ego_x, ego_y)
+
+    # Route roadblock ids from scenario.get_route_roadblock_ids (+ correction/pruning)
+    try:
+        route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
+    except Exception:
+        route_roadblock_ids = None
+
+    lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
+        point, map_api, radius=100, max_lanes=MAX_LANES, ego_heading=ego_heading,
+        traffic_light_data=traffic_light_data
+    )
+
+    # ---- Single-case BFS bridge minimal experiment ----
+    route_lanes_old, route_lanes_avails_old, _, _ = extract_route_lanes(
+        point,
+        map_api,
+        radius=150,
+        max_route_lanes=MAX_ROUTE_LANES,
+        ego_heading=ego_heading,
+        traffic_light_data=traffic_light_data,
+        route_roadblock_ids=route_roadblock_ids,
+    )
+    avails_sum_old = int(np.count_nonzero(route_lanes_avails_old))
+
+    proximal_rb_ids: set[str] = set()
+    try:
+        prox_layers = map_api.get_proximal_map_objects(
+            point,
+            150,
+            [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
+        )
+        for lt in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
+            for lane_obj in (prox_layers.get(lt, []) or []):
+                try:
+                    rb = lane_obj.get_roadblock_id() if hasattr(lane_obj, 'get_roadblock_id') else None
+                    if rb is not None:
+                        proximal_rb_ids.add(str(rb))
+                except Exception:
+                    continue
+    except Exception:
+        prox_layers = {}
+
+    pruned_route_set = set([str(x) for x in (route_roadblock_ids or [])])
+    intersection_pruned = int(len(proximal_rb_ids.intersection(pruned_route_set)))
+
+    new_route_ids = route_roadblock_ids or []
+    bridge_found = False
+    bridge_len = 0
+    ego_rb = None
+    bridge_reason = 'skip'
+
+    if intersection_pruned == 0 and route_roadblock_ids:
+        new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
+            map_api,
+            point,
+            list(route_roadblock_ids),
+            intersection_pruned=intersection_pruned,
+            radius=150,
+            k_targets=10,
+            max_depth=80,
+        )
+
+    route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
+        point,
+        map_api,
+        radius=150,
+        max_route_lanes=MAX_ROUTE_LANES,
+        ego_heading=ego_heading,
+        traffic_light_data=traffic_light_data,
+        route_roadblock_ids=new_route_ids,
+    )
+    avails_sum_new = int(np.count_nonzero(route_lanes_avails))
+
+    # Persist experiment logs to avoid stdout truncation (kept identical to legacy main).
+    try:
+        out_dir = '/workspace/validation_output'
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            test_path = os.path.join(out_dir, '.write_test')
+            with open(test_path, 'w') as f:
+                f.write('ok')
+            os.remove(test_path)
+        except Exception:
+            out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'validation_output'))
+            os.makedirs(out_dir, exist_ok=True)
+
+        log_path = os.path.join(out_dir, 'bfs_single_case.log')
+        with open(log_path, 'a') as f:
+            f.write("\n" + "=" * 80 + "\n")
+            f.write(
+                f"db={os.path.basename(db_path)} scene_token={scenario_token_hex} frame={int(frame_index)} map={map_name}\n"
+            )
+            f.write(
+                f"intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}\n"
+            )
+            f.write(
+                f"route_len_old={(len(route_roadblock_ids) if route_roadblock_ids else 0)} route_len_new={(len(new_route_ids) if new_route_ids else 0)}\n"
+            )
+            f.write(f"avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}\n")
+
+        import json
+        json_path = os.path.join(out_dir, 'bfs_single_case_result.json')
+        with open(json_path, 'w') as f:
+            json.dump(
+                {
+                    'db_basename': os.path.basename(db_path),
+                    'scene_token_hex': scenario_token_hex,
+                    'frame_index': int(frame_index),
+                    'map_name': map_name,
+                    'intersection_pruned': int(intersection_pruned),
+                    'ego_rb': ego_rb,
+                    'bridge_found': bool(bridge_found),
+                    'bridge_len': int(bridge_len),
+                    'bridge_reason': bridge_reason,
+                    'route_len_old': int(len(route_roadblock_ids) if route_roadblock_ids else 0),
+                    'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
+                    'avails_sum_old': int(avails_sum_old),
+                    'avails_sum_new': int(avails_sum_new),
+                },
+                f,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+    return {
+        'ego_current_state': ego_current_state,
+        'ego_past': ego_past,
+        'ego_agent_future': ego_future,
+        'neighbor_agents_past': neighbor_past,
+        'neighbor_agents_future': neighbor_future,
+        'static_objects': static_objects,
+        'lanes': lanes,
+        'lanes_avails': lanes_avails,
+        'route_lanes': route_lanes,
+        'route_lanes_avails': route_lanes_avails,
+        'lanes_speed_limit': lanes_speed_limit,
+        'lanes_has_speed_limit': lanes_has_speed_limit,
+        'route_lanes_speed_limit': route_lanes_speed_limit,
+        'route_lanes_has_speed_limit': route_lanes_has_speed_limit,
+    }
+
 def run_extraction(db_path: str,
                    scenario_token: str,
                    center_frame_index: int,
@@ -1098,232 +1287,28 @@ def main():
     except Exception:
         pass
 
-    center_token, center_timestamp, ego_pose_token = get_target_frame(conn, SCENARIO_TOKEN, CENTER_FRAME_INDEX)
-    print(f"Center token: {center_token}")
-    print(f"Center timestamp: {center_timestamp}")
-    
-    print("\n[1/7] Extracting ego data...")
-    ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses = \
-        extract_ego_data(conn, center_token, center_timestamp, SCENARIO_TOKEN)
-    print(f"  ego_current_state: {ego_current_state.shape}")
-    print(f"  ego_past: {ego_past.shape}")
-    print(f"  ego_agent_future: {ego_future.shape}")
-    
-    print("\n[2/7] Extracting traffic light data...")
-    traffic_light_data = get_traffic_lights_at_timestamp(conn, center_timestamp, MAP_NAME)
-    print(f"  Found {len(traffic_light_data)} traffic lights")
-    
-    print("\n[3/7] Extracting neighbor agents...")
-    neighbor_past_agents, neighbor_future = extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading)
-    
-    for i in range(1, MAX_NEIGHBORS):
-        if np.any(neighbor_past_agents[i, :, -1] != 0):
-            neighbor_past[i] = neighbor_past_agents[i]
-    
-    print(f"  neighbor_agents_past: {neighbor_past.shape}")
-    print(f"  neighbor_agents_future: {neighbor_future.shape}")
-    
-    print("\n[4/7] Extracting static objects...")
-    static_objects = extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading)
-    print(f"  static_objects: {static_objects.shape}")
-    
     print("\n[5/7] Loading map API...")
     map_api = get_maps_api(MAP_ROOT, MAP_VERSION, MAP_NAME)
     print(f"  Map: {map_api.map_name}")
-    
-    point = Point2D(ego_x, ego_y)
 
-    # Route roadblock ids from scenario.get_route_roadblock_ids (+ correction/pruning)
-    try:
-        route_roadblock_ids = get_pruned_route_roadblock_ids(conn, DB_PATH, SCENARIO_TOKEN, map_api, MAP_NAME)
-        DEBUG_LOGGER.info(f"route_roadblock_ids(pruned) len={len(route_roadblock_ids)} head={route_roadblock_ids[:5]}")
-    except Exception as e:
-        route_roadblock_ids = None
-        try:
-            DEBUG_LOGGER.warning(f"Failed to get route_roadblock_ids via scenario: {e}")
-        except Exception:
-            pass
+    # Feature extraction (pure function)
+    features = extract_features(conn, map_api, SCENARIO_TOKEN, CENTER_FRAME_INDEX)
 
-    print("\n[6/7] Extracting lanes with boundaries and valid marking...")
-    lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
-        point, map_api, radius=100, max_lanes=MAX_LANES, ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data
-    )
-    print(f"  lanes: {lanes.shape}")
-    print(f"  lanes_avails: {lanes_avails.shape}")
-    print(f"  lanes_speed_limit: {lanes_speed_limit.shape}")
-    print(f"  lanes_has_speed_limit: {lanes_has_speed_limit.shape}")
-    
-    print("\n[7/7] Extracting route lanes with boundaries and valid marking...")
-
-    # ---- Single-case BFS bridge minimal experiment ----
-    # 1) old: use pruned route ids directly
-    route_lanes_old, route_lanes_avails_old, _, _ = extract_route_lanes(
-        point,
-        map_api,
-        radius=150,
-        max_route_lanes=MAX_ROUTE_LANES,
-        ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data,
-        route_roadblock_ids=route_roadblock_ids,
-    )
-    avails_sum_old = int(np.count_nonzero(route_lanes_avails_old))
-
-    # 2) intersection_pruned: proximal roadblock ids ∩ pruned_route
-    proximal_rb_ids: set[str] = set()
-    try:
-        prox_layers = map_api.get_proximal_map_objects(
-            point,
-            150,
-            [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
-        )
-        for lt in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
-            for lane_obj in (prox_layers.get(lt, []) or []):
-                try:
-                    rb = lane_obj.get_roadblock_id() if hasattr(lane_obj, 'get_roadblock_id') else None
-                    if rb is not None:
-                        proximal_rb_ids.add(str(rb))
-                except Exception:
-                    continue
-    except Exception:
-        prox_layers = {}
-
-    pruned_route_set = set([str(x) for x in (route_roadblock_ids or [])])
-    intersection_pruned = int(len(proximal_rb_ids.intersection(pruned_route_set)))
-
-    # 3) new: if intersection_pruned==0, bridge with BFS and re-run extract_route_lanes
-    new_route_ids = route_roadblock_ids or []
-    bridge_found = False
-    bridge_len = 0
-    ego_rb = None
-    bridge_reason = 'skip'
-
-    if intersection_pruned == 0 and route_roadblock_ids:
-        new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
-            map_api,
-            point,
-            list(route_roadblock_ids),
-            intersection_pruned=intersection_pruned,
-            radius=150,
-            k_targets=10,
-            max_depth=80,
-        )
-
-    route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
-        point,
-        map_api,
-        radius=150,
-        max_route_lanes=MAX_ROUTE_LANES,
-        ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data,
-        route_roadblock_ids=new_route_ids,
-    )
-    avails_sum_new = int(np.count_nonzero(route_lanes_avails))
-
-    # Persist experiment logs to avoid stdout truncation.
-    try:
-        out_dir = '/workspace/validation_output'
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            test_path = os.path.join(out_dir, '.write_test')
-            with open(test_path, 'w') as f:
-                f.write('ok')
-            os.remove(test_path)
-        except Exception:
-            out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'validation_output'))
-            os.makedirs(out_dir, exist_ok=True)
-
-        log_path = os.path.join(out_dir, 'bfs_single_case.log')
-        with open(log_path, 'a') as f:
-            f.write('\n' + '=' * 80 + '\n')
-            f.write(f"db={os.path.basename(DB_PATH)} scene_token={SCENARIO_TOKEN} frame={CENTER_FRAME_INDEX} map={MAP_NAME}\n")
-            f.write(f"intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}\n")
-            f.write(f"route_len_old={(len(route_roadblock_ids) if route_roadblock_ids else 0)} route_len_new={(len(new_route_ids) if new_route_ids else 0)}\n")
-            f.write(f"avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}\n")
-
-        json_path = os.path.join(out_dir, 'bfs_single_case_result.json')
-        import json
-        with open(json_path, 'w') as f:
-            json.dump(
-                {
-                    'db_basename': os.path.basename(DB_PATH),
-                    'scene_token_hex': SCENARIO_TOKEN,
-                    'frame_index': int(CENTER_FRAME_INDEX),
-                    'map_name': MAP_NAME,
-                    'intersection_pruned': int(intersection_pruned),
-                    'ego_rb': ego_rb,
-                    'bridge_found': bool(bridge_found),
-                    'bridge_len': int(bridge_len),
-                    'bridge_reason': bridge_reason,
-                    'route_len_old': int(len(route_roadblock_ids) if route_roadblock_ids else 0),
-                    'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
-                    'avails_sum_old': int(avails_sum_old),
-                    'avails_sum_new': int(avails_sum_new),
-                },
-                f,
-                indent=2,
-            )
-    except Exception as e:
-        try:
-            DEBUG_LOGGER.warning(f"Failed to write bfs_single_case log/json: {e}")
-        except Exception:
-            pass
-
-    # Console summary (also captured by DEBUG_LOGGER).
-    print(f"  intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}")
-    print(f"  avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}")
-
-    print(f"  route_lanes: {route_lanes.shape}")
-    print(f"  route_lanes_avails: {route_lanes_avails.shape}")
-    print(f"  route_lanes_speed_limit: {route_lanes_speed_limit.shape}")
-    print(f"  route_lanes_has_speed_limit: {route_lanes_has_speed_limit.shape}")
-    
     conn.close()
-    
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    np.savez(OUTPUT_PATH,
-        ego_current_state=ego_current_state,
-        ego_past=ego_past,
-        ego_agent_future=ego_future,
-        neighbor_agents_past=neighbor_past,
-        neighbor_agents_future=neighbor_future,
-        static_objects=static_objects,
-        lanes=lanes,
-        lanes_avails=lanes_avails,
-        route_lanes=route_lanes,
-        route_lanes_avails=route_lanes_avails,
-        lanes_speed_limit=lanes_speed_limit,
-        lanes_has_speed_limit=lanes_has_speed_limit,
-        route_lanes_speed_limit=route_lanes_speed_limit,
-        route_lanes_has_speed_limit=route_lanes_has_speed_limit)
-    
+    np.savez(OUTPUT_PATH, **features)
+
     print(f"\n{'=' * 60}")
     print(f"Saved NPZ to: {OUTPUT_PATH}")
     print(f"{'=' * 60}")
-    
-    features = {
-        'ego_current_state': ego_current_state,
-        'ego_past': ego_past,
-        'ego_agent_future': ego_future,
-        'neighbor_agents_past': neighbor_past,
-        'neighbor_agents_future': neighbor_future,
-        'static_objects': static_objects,
-        'lanes': lanes,
-        'lanes_avails': lanes_avails,
-        'route_lanes': route_lanes,
-        'route_lanes_avails': route_lanes_avails,
-        'lanes_speed_limit': lanes_speed_limit,
-        'lanes_has_speed_limit': lanes_has_speed_limit,
-        'route_lanes_speed_limit': route_lanes_speed_limit,
-        'route_lanes_has_speed_limit': route_lanes_has_speed_limit
-    }
-    
+
     generate_csv_summary(features, CSV_OUTPUT_PATH)
-    
+
     print("\n" + "=" * 60)
     print("FEATURE SUMMARY REPORT")
     print("=" * 60)
-    
+
     for name, arr in features.items():
         arr_min = arr.min()
         arr_max = arr.max()
@@ -1334,29 +1319,31 @@ def main():
         print(f"  Shape: {arr.shape}")
         print(f"  Value range: [{arr_min:.4f}, {arr_max:.4f}]")
         print(f"  Non-zero: {nonzero}/{total} ({nonzero_pct:.1f}%)")
-    
+
     print("\n" + "=" * 60)
     print("LANE FEATURE DETAIL (dim 0-11)")
     print("=" * 60)
-    lane_example = lanes[0]
+    lane_example = features['lanes'][0]
     for dim in range(LANE_DIM):
         dim_data = lane_example[:, dim]
         nonzero = np.count_nonzero(dim_data)
         print(f"  dim {dim}: nonzero={nonzero}/{POLYLINE_LEN}, min={dim_data.min():.4f}, max={dim_data.max():.4f}")
-    
+
     print("\n" + "=" * 60)
     print("LANE VALID MARKING DETAIL")
     print("=" * 60)
+    lanes_avails = features['lanes_avails']
     valid_lanes = np.sum(np.any(lanes_avails, axis=1))
     total_valid_points = np.sum(lanes_avails)
     total_points = lanes_avails.size
     print(f"  Valid lanes: {valid_lanes}/{MAX_LANES}")
     print(f"  Valid points: {total_valid_points}/{total_points} ({total_valid_points/total_points*100:.1f}%)")
-    
+
     print("\n" + "=" * 60)
     print("EXTRACTION COMPLETE!")
     print("=" * 60)
 
 
 if __name__ == '__main__':
+
     main()

@@ -152,7 +152,6 @@ def visualize_npz(npz_path, output_path=None):
 
 
     ego_future = data['ego_agent_future']
-    print(ego_future)
     if ego_future is not None:
         # Future trajectory: green thick line (3px)
         ax.plot(ego_future[:, 0], ego_future[:, 1], 'b-', linewidth=3, alpha=0.8)
