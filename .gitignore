@@ -20,3 +20,18 @@ training_outputs/
 # Data processing outputs
 data_process/__pycache__/
 data_process/scenarios_distribution.json
+
+# Plans / exports / validation artifacts (generated)
+plans/
+exports/
+validation_output/
+validation_output2/
+
+# Local scratch / debug artifacts
+scripts/extract_single_frame/_tmp_*.py
+scripts/extract_single_frame/*.bak*
+
+data_process/debug_log/
+test_viz/
+# Accidental nested outputs written by container (root-owned)
+diffusion-planner-project/
