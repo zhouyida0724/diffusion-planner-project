@@ -1069,7 +1069,7 @@ def _get_db_path_from_conn(conn: sqlite3.Connection) -> str:
     return ''
 
 
-def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int) -> dict[str, np.ndarray]:
+def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *, debug_log: bool = True) -> dict[str, np.ndarray]:
     """Pure feature extraction.
 
     Args:
@@ -1172,56 +1172,58 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int) -
     avails_sum_new = int(np.count_nonzero(route_lanes_avails))
 
     # Persist experiment logs to avoid stdout truncation (kept identical to legacy main).
-    try:
-        out_dir = '/workspace/validation_output'
+    # Batch export should disable this to avoid massive I/O.
+    if debug_log:
         try:
-            os.makedirs(out_dir, exist_ok=True)
-            test_path = os.path.join(out_dir, '.write_test')
-            with open(test_path, 'w') as f:
-                f.write('ok')
-            os.remove(test_path)
+            out_dir = '/workspace/validation_output'
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                test_path = os.path.join(out_dir, '.write_test')
+                with open(test_path, 'w') as f:
+                    f.write('ok')
+                os.remove(test_path)
+            except Exception:
+                out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'validation_output'))
+                os.makedirs(out_dir, exist_ok=True)
+
+            log_path = os.path.join(out_dir, 'bfs_single_case.log')
+            with open(log_path, 'a') as f:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(
+                    f"db={os.path.basename(db_path)} scene_token={scenario_token_hex} frame={int(frame_index)} map={map_name}\n"
+                )
+                f.write(
+                    f"intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}\n"
+                )
+                f.write(
+                    f"route_len_old={(len(route_roadblock_ids) if route_roadblock_ids else 0)} route_len_new={(len(new_route_ids) if new_route_ids else 0)}\n"
+                )
+                f.write(f"avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}\n")
+
+            import json
+            json_path = os.path.join(out_dir, 'bfs_single_case_result.json')
+            with open(json_path, 'w') as f:
+                json.dump(
+                    {
+                        'db_basename': os.path.basename(db_path),
+                        'scene_token_hex': scenario_token_hex,
+                        'frame_index': int(frame_index),
+                        'map_name': map_name,
+                        'intersection_pruned': int(intersection_pruned),
+                        'ego_rb': ego_rb,
+                        'bridge_found': bool(bridge_found),
+                        'bridge_len': int(bridge_len),
+                        'bridge_reason': bridge_reason,
+                        'route_len_old': int(len(route_roadblock_ids) if route_roadblock_ids else 0),
+                        'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
+                        'avails_sum_old': int(avails_sum_old),
+                        'avails_sum_new': int(avails_sum_new),
+                    },
+                    f,
+                    indent=2,
+                )
         except Exception:
-            out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'validation_output'))
-            os.makedirs(out_dir, exist_ok=True)
-
-        log_path = os.path.join(out_dir, 'bfs_single_case.log')
-        with open(log_path, 'a') as f:
-            f.write("\n" + "=" * 80 + "\n")
-            f.write(
-                f"db={os.path.basename(db_path)} scene_token={scenario_token_hex} frame={int(frame_index)} map={map_name}\n"
-            )
-            f.write(
-                f"intersection_pruned={intersection_pruned} ego_rb={ego_rb} bridge_found={bridge_found} bridge_len={bridge_len} reason={bridge_reason}\n"
-            )
-            f.write(
-                f"route_len_old={(len(route_roadblock_ids) if route_roadblock_ids else 0)} route_len_new={(len(new_route_ids) if new_route_ids else 0)}\n"
-            )
-            f.write(f"avails_sum_old={avails_sum_old} avails_sum_new={avails_sum_new}\n")
-
-        import json
-        json_path = os.path.join(out_dir, 'bfs_single_case_result.json')
-        with open(json_path, 'w') as f:
-            json.dump(
-                {
-                    'db_basename': os.path.basename(db_path),
-                    'scene_token_hex': scenario_token_hex,
-                    'frame_index': int(frame_index),
-                    'map_name': map_name,
-                    'intersection_pruned': int(intersection_pruned),
-                    'ego_rb': ego_rb,
-                    'bridge_found': bool(bridge_found),
-                    'bridge_len': int(bridge_len),
-                    'bridge_reason': bridge_reason,
-                    'route_len_old': int(len(route_roadblock_ids) if route_roadblock_ids else 0),
-                    'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
-                    'avails_sum_old': int(avails_sum_old),
-                    'avails_sum_new': int(avails_sum_new),
-                },
-                f,
-                indent=2,
-            )
-    except Exception:
-        pass
+            pass
 
     return {
         'ego_current_state': ego_current_state,
