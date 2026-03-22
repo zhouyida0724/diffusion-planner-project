@@ -14,6 +14,7 @@ import sqlite3
 import numpy as np
 import os
 import logging
+from collections import Counter
 from datetime import datetime
 from shapely import LineString
 
@@ -108,7 +109,62 @@ def _init_debug_logger():
     return logger
 
 
-DEBUG_LOGGER = _init_debug_logger()
+# Log style control:
+# - legacy: keep very verbose per-sample debug logging (file I/O + many warnings to stdout)
+# - quiet (default): suppress per-sample INFO logs; aggregate/limit WARNING prints
+EXTRACT_LOG_STYLE = os.environ.get('EXTRACT_LOG_STYLE', 'quiet').strip().lower()
+
+# Aggregated warning stats for batch exporters to read.
+LOG_WARNING_COUNTS: Counter[str] = Counter()
+LOG_WARNING_TOTAL: int = 0
+
+class _QuietLogger:
+    def __init__(self, *, print_first_n_per_key: int = 3):
+        self._print_first_n_per_key = int(print_first_n_per_key)
+
+    def info(self, msg: str, *args, **kwargs):
+        # keep silent in quiet mode
+        return
+
+    def warning(self, msg: str, *args, **kwargs):
+        global LOG_WARNING_TOTAL
+        LOG_WARNING_TOTAL += 1
+        key = str(msg).split('\n', 1)[0][:200]
+        LOG_WARNING_COUNTS[key] += 1
+
+        # Only print first N occurrences per key to avoid stderr/stdout spam.
+        if LOG_WARNING_COUNTS[key] <= self._print_first_n_per_key:
+            try:
+                print(f"[WARN] {msg}")
+            except Exception:
+                pass
+
+    def error(self, msg: str, *args, **kwargs):
+        # errors should still surface
+        try:
+            print(f"[ERROR] {msg}")
+        except Exception:
+            pass
+
+
+def reset_log_stats() -> None:
+    global LOG_WARNING_TOTAL
+    LOG_WARNING_COUNTS.clear()
+    LOG_WARNING_TOTAL = 0
+
+
+def get_log_stats() -> dict:
+    return {
+        'warning_total': int(LOG_WARNING_TOTAL),
+        'warning_by_key': dict(LOG_WARNING_COUNTS),
+    }
+
+
+# Initialize logger object
+if EXTRACT_LOG_STYLE == 'legacy':
+    DEBUG_LOGGER = _init_debug_logger()
+else:
+    DEBUG_LOGGER = _QuietLogger(print_first_n_per_key=int(os.environ.get('EXTRACT_WARN_PRINT_N', '3')))
 
 
 def quaternion_to_heading(qw, qx, qy, qz):
@@ -675,23 +731,24 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
                 neighbor_future[agent_idx + 1, i, 2] = last_valid_heading  # 方向保持不变
 
         # Debug: record valid points, padding behavior, and filled data for each agent
-        try:
-            valid_count = (last_valid_idx + 1) if last_valid_idx is not None else 0
-            padded_count = (NEIGHBOR_FUTURE_LEN - valid_count) if did_padding else 0
-            fut_str = np.array2string(
-                neighbor_future[agent_idx + 1],
-                precision=3,
-                suppress_small=True,
-                separator=", ",
-            )
-            DEBUG_LOGGER.info(
-                f"neighbor_future agent={agent_idx+1} track_token={track_token.hex() if isinstance(track_token, (bytes, bytearray)) else track_token} "
-                f"boxes_total={len(boxes)} center_box_idx={center_box_idx} min_diff={min_diff} "
-                f"valid_count={valid_count}/{NEIGHBOR_FUTURE_LEN} padded={did_padding} padded_count={padded_count} mode={padding_mode} "
-                f"after_padding={fut_str}"
-            )
-        except Exception as e:
-            DEBUG_LOGGER.warning(f"neighbor_future debug log failed for agent={agent_idx+1}: {e}")
+        if EXTRACT_LOG_STYLE == 'legacy':
+            try:
+                valid_count = (last_valid_idx + 1) if last_valid_idx is not None else 0
+                padded_count = (NEIGHBOR_FUTURE_LEN - valid_count) if did_padding else 0
+                fut_str = np.array2string(
+                    neighbor_future[agent_idx + 1],
+                    precision=3,
+                    suppress_small=True,
+                    separator=", ",
+                )
+                DEBUG_LOGGER.info(
+                    f"neighbor_future agent={agent_idx+1} track_token={track_token.hex() if isinstance(track_token, (bytes, bytearray)) else track_token} "
+                    f"boxes_total={len(boxes)} center_box_idx={center_box_idx} min_diff={min_diff} "
+                    f"valid_count={valid_count}/{NEIGHBOR_FUTURE_LEN} padded={did_padding} padded_count={padded_count} mode={padding_mode} "
+                    f"after_padding={fut_str}"
+                )
+            except Exception as e:
+                DEBUG_LOGGER.warning(f"neighbor_future debug log failed for agent={agent_idx+1}: {e}")
     
     return neighbor_past, neighbor_future
 
@@ -728,7 +785,17 @@ def _interpolate_points(line, num_points):
     return new_line
 
 
-def _lane_polyline_process_with_avails(lane_obj, centerline_coords, left_coords, right_coords, traffic_light_state, ego_point, ego_heading):
+def _lane_polyline_process_with_avails(
+    lane_obj,
+    centerline_coords,
+    left_coords,
+    right_coords,
+    traffic_light_state,
+    ego_point,
+    ego_heading,
+    *,
+    sample_local_around_ego: bool = False,
+):
     """
     Process lane to create polyline features with valid marking:
     - dim 0-1: polyline (x, y)
@@ -741,8 +808,31 @@ def _lane_polyline_process_with_avails(lane_obj, centerline_coords, left_coords,
     lane_feature = np.zeros((POLYLINE_LEN, LANE_DIM), dtype=np.float32)
     avails = np.zeros(POLYLINE_LEN, dtype=np.bool_)
     
+    # Sampling policy:
+    # - legacy: interpolate full baseline polyline to POLYLINE_LEN points
+    # - optional (route lanes only): sample a local window around the point closest to ego to avoid
+    #   "lane exists but all points are far" when ego is near one end of a long polyline.
+    local_window = False
+    if sample_local_around_ego:
+        local_window = os.environ.get('ROUTE_LANE_SAMPLE_LOCAL_AROUND_EGO', '0') == '1'
+
     if len(centerline_coords) >= 2:
-        sampled = _interpolate_points(centerline_coords, POLYLINE_LEN)
+        coords_to_sample = centerline_coords
+        if local_window and ego_point is not None:
+            try:
+                # Find closest node index to ego
+                d2 = [((x - ego_point.x) ** 2 + (y - ego_point.y) ** 2) for x, y in centerline_coords]
+                j = int(np.argmin(d2))
+                # Take a local window of nodes around j
+                half = int(os.environ.get('LANE_SAMPLE_LOCAL_HALF_NODES', '20'))
+                lo = max(0, j - half)
+                hi = min(len(centerline_coords), j + half + 1)
+                if hi - lo >= 2:
+                    coords_to_sample = centerline_coords[lo:hi]
+            except Exception:
+                coords_to_sample = centerline_coords
+
+        sampled = _interpolate_points(coords_to_sample, POLYLINE_LEN)
     else:
         sampled = np.zeros((POLYLINE_LEN, 2), dtype=np.float64)
     
@@ -872,10 +962,15 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
         traffic_light_state = traffic_light_lookup.get(lane_id, [0, 0, 0, 1])
         
         lane_feature, avails = _lane_polyline_process_with_avails(
-            lane_obj, centerline_coords, left_boundary_coords, right_boundary_coords,
-            traffic_light_state, point, ego_heading
+            lane_obj,
+            centerline_coords,
+            left_boundary_coords,
+            right_boundary_coords,
+            traffic_light_state,
+            point,
+            ego_heading,
         )
-        
+
         lanes[lane_idx] = lane_feature
         lanes_avails[lane_idx] = avails
         
@@ -890,12 +985,13 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
         lane_idx += 1
     
     # Debug: record nonzero counts
-    try:
-        DEBUG_LOGGER.info(
-            f"lanes nonzero={int(np.count_nonzero(lanes))} avails_true={int(np.count_nonzero(lanes_avails))} filled_lanes={lane_idx}/{max_lanes}"
-        )
-    except Exception as e:
-        DEBUG_LOGGER.warning(f"lanes debug log failed: {e}")
+    if EXTRACT_LOG_STYLE == 'legacy':
+        try:
+            DEBUG_LOGGER.info(
+                f"lanes nonzero={int(np.count_nonzero(lanes))} avails_true={int(np.count_nonzero(lanes_avails))} filled_lanes={lane_idx}/{max_lanes}"
+            )
+        except Exception as e:
+            DEBUG_LOGGER.warning(f"lanes debug log failed: {e}")
 
     return lanes, lanes_avails, speed_limits, has_speed_limits
 
@@ -1002,10 +1098,16 @@ def extract_route_lanes(
         traffic_light_state = traffic_light_lookup.get(lane_id, [0, 0, 0, 1])
         
         lane_feature, avails = _lane_polyline_process_with_avails(
-            lane_obj, centerline_coords, left_boundary_coords, right_boundary_coords,
-            traffic_light_state, point, ego_heading
+            lane_obj,
+            centerline_coords,
+            left_boundary_coords,
+            right_boundary_coords,
+            traffic_light_state,
+            point,
+            ego_heading,
+            sample_local_around_ego=True,
         )
-        
+
         route_lanes[route_idx] = lane_feature
         route_lanes_avails[route_idx] = avails
         
@@ -1020,12 +1122,13 @@ def extract_route_lanes(
         route_idx += 1
     
     # Debug: record nonzero counts
-    try:
-        DEBUG_LOGGER.info(
-            f"route_lanes nonzero={int(np.count_nonzero(route_lanes))} avails_true={int(np.count_nonzero(route_lanes_avails))} filled_route_lanes={route_idx}/{max_route_lanes}"
-        )
-    except Exception as e:
-        DEBUG_LOGGER.warning(f"route_lanes debug log failed: {e}")
+    if EXTRACT_LOG_STYLE == 'legacy':
+        try:
+            DEBUG_LOGGER.info(
+                f"route_lanes nonzero={int(np.count_nonzero(route_lanes))} avails_true={int(np.count_nonzero(route_lanes_avails))} filled_route_lanes={route_idx}/{max_route_lanes}"
+            )
+        except Exception as e:
+            DEBUG_LOGGER.warning(f"route_lanes debug log failed: {e}")
 
     return route_lanes, route_lanes_avails, route_speed_limits, route_has_speed_limits
 
@@ -1143,13 +1246,63 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
     pruned_route_set = set([str(x) for x in (route_roadblock_ids or [])])
     intersection_pruned = int(len(proximal_rb_ids.intersection(pruned_route_set)))
 
+    # Decide whether to apply BFS-bridge / route realignment.
+    # Legacy trigger: intersection_pruned==0.
+    # New trigger (for soft-flag root cause): even if intersection_pruned>0, if the nearest route lane is still far,
+    # it likely means the route_roadblock_ids are not aligned to ego's current segment (near overlap appears only late).
+    def _min_dist_m(lanes_xy12: np.ndarray, avails_25x20: np.ndarray) -> float | None:
+        try:
+            m = avails_25x20 > 0
+            if not np.any(m):
+                return None
+            xs = lanes_xy12[:, :, 0][m]
+            ys = lanes_xy12[:, :, 1][m]
+            if xs.size == 0:
+                return None
+            return float(np.sqrt(xs * xs + ys * ys).min())
+        except Exception:
+            return None
+
+    bridge_trigger_dist_m = float(os.environ.get('BFS_BRIDGE_TRIGGER_DIST_M', '10'))
+    rmin_old_m = _min_dist_m(route_lanes_old, route_lanes_avails_old)
+
     new_route_ids = route_roadblock_ids or []
     bridge_found = False
     bridge_len = 0
     ego_rb = None
     bridge_reason = 'skip'
 
-    if intersection_pruned == 0 and route_roadblock_ids:
+    need_bridge = False
+    if route_roadblock_ids:
+        if intersection_pruned == 0:
+            need_bridge = True
+            bridge_reason = 'intersection_pruned==0'
+        elif (rmin_old_m is not None) and (rmin_old_m > bridge_trigger_dist_m):
+            # Soft-flag trigger: route exists but is far. First try a cheap realignment: if there is any overlap
+            # between proximal roadblocks and route roadblocks, start the route from the earliest overlap.
+            try:
+                route_list = [str(x) for x in route_roadblock_ids]
+                inter = proximal_rb_ids.intersection(set(route_list))
+                if inter:
+                    pos = {v: i for i, v in enumerate(route_list)}
+                    idx_min = min(pos[x] for x in inter if x in pos)
+                    if idx_min is not None and idx_min > 0:
+                        new_route_ids = list(route_roadblock_ids)[idx_min:]
+                        bridge_found = True
+                        bridge_len = 0
+                        ego_rb = None
+                        bridge_reason = f'realign_from_overlap_idx={idx_min} (rmin_old_m>{bridge_trigger_dist_m})'
+                    else:
+                        need_bridge = True
+                        bridge_reason = f'rmin_old_m>{bridge_trigger_dist_m}'
+                else:
+                    need_bridge = True
+                    bridge_reason = f'rmin_old_m>{bridge_trigger_dist_m}'
+            except Exception:
+                need_bridge = True
+                bridge_reason = f'rmin_old_m>{bridge_trigger_dist_m}'
+
+    if need_bridge and route_roadblock_ids:
         new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
             map_api,
             point,

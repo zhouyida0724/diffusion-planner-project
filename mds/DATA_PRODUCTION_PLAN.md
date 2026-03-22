@@ -42,17 +42,17 @@
   - `plans/<plan_name>/index.jsonl` (the sample list)
   - `plans/<plan_name>/plan_config.yaml` (exact parameters used)
   - `plans/<plan_name>/stats.json` (counts by location, estimated size)
-  - `plans/<plan_name>/shards/shard_000.jsonl ...` (split index)
+  - `plans/<plan_name>/shards/shard_000.jsonl ...` (optional split index files)
 
 ### Step C — Export (sharded)
 **Goal**: run feature extraction on each shard with timeouts and lightweight checks.
 
-- **Input**: `shard_*.jsonl`, extraction code
+- **Input**: `index.jsonl` (or `shard_*.jsonl`), extraction code
 - **Output (per shard)**:
-  - `exports/<plan_name>/shards/shard_000.npz` (multi-frame arrays)
-  - `exports/<plan_name>/shards/shard_000.manifest.jsonl` (per-sample metadata + flags)
-  - `exports/<plan_name>/shards/shard_000.metrics.json` (aggregate stats)
-  - `exports/<plan_name>/shards/shard_000.log`
+  - `exports/<plan_name>/shards/shard_000/data.npz` (multi-frame arrays)
+  - `exports/<plan_name>/shards/shard_000/manifest.jsonl` (per-sample metadata + flags)
+  - `exports/<plan_name>/shards/shard_000/metrics.json` (aggregate stats)
+  - `exports/<plan_name>/shards/shard_000/run.stderr.log`
 
 ### Step D — QC aggregation
 **Goal**: merge shard-level QC into a plan-level view and produce anomaly lists.
@@ -128,220 +128,90 @@ Write to:
 - `plans/<plan_name>/tag_stats.json`
 - (optional) `plans/<plan_name>/tag_stats.csv`
 
-### 2.4 Optional: tag-balanced plan variant (future)
-If training requires near-uniform tag coverage, we can generate a second plan:
-- `index_tag_balanced.jsonl`
-
-Implementation idea (later): choose a **primary_tag** per sample using a priority list, then enforce per-primary-tag quotas.
-
 ---
 
+## 3. Multi-process sharded export (v0.1+)
 
-### 2.1 Why we need a plan
-A “plan” decouples **what to export** from **how/when we run export**.
+### 3.1 Design goal
+We need to reduce wall-clock time while keeping:
+- **reproducibility** (same plan + same shard params → same samples)
+- **no overlap / no missing** samples
+- **easy resume** (rerun only failed shards)
 
-Benefits:
-- reproducibility: same seed + config → same sample list
-- parallelism: shard files can run on multiple processes/machines
-- resume: if shard_017 fails, rerun only that shard
-- analytics: estimate size/time before spending days exporting
+### 3.2 Recommended sharding rule (no overlap / no missing)
+Use **deterministic modulo sharding** on the plan row index.
 
-### 2.2 Plan file format
-We use a simple JSONL (1 line per sample).
+Let plan rows be 0-based `plan_row_idx` in `index.jsonl`.
+For `num_shards = N`:
+- assign row `i` to shard `sid = i % N`
 
-`index.jsonl` schema (proposed):
-```json
-{
-  "sample_id": "<stable string>",
-  "location": "sg-one-north",
-  "db_path": "/media/.../train_singapore/xxx.db",
-  "db_name": "xxx.db",
-  "scene_token_hex": "8ede12113bf9547b",
-  "log_token_hex": "...",
-  "frame_index": 23102,
-  "timestamp_us": 1632906374707603
-}
+Each export worker runs with a fixed `--shard-id sid --num-shards N` and processes only its own rows.
+
+This guarantees:
+- no overlap: a row has exactly one `sid`
+- no missing: union over `sid=0..N-1` covers all rows
+
+### 3.3 Per-shard outputs
+Each shard writes to its own directory:
+
+`exports/<plan_name>/shards/shard_{sid:03d}/`
+- `data.npz`
+- `manifest.jsonl`
+- `metrics.json`
+- `RUN_INFO.json`
+- `run.stderr.log`
+
+Manifest should contain alignment fields:
+- `plan_row_idx` (row number in index.jsonl)
+- `shard_id` (sid)
+- `t` (index within shard's NPZ, 0..kept-1)
+- `sample_id`
+
+This makes downstream joins robust and debuggable.
+
+### 3.4 Driver (single machine)
+In `nuplan-simulation` container, start N workers in parallel.
+Example (N=4):
+
+```bash
+PLAN=plans/<plan_name>
+OUT_ROOT=exports/<plan_name>/shards
+N=4
+for SID in 0 1 2 3; do
+  python3 scripts/export_v0_1_single_npz.py \
+    --plan $PLAN \
+    --out $OUT_ROOT/shard_$(printf "%03d" $SID) \
+    --num-shards $N \
+    --shard-id $SID \
+    --limit 2000 \
+    2> $OUT_ROOT/shard_$(printf "%03d" $SID)/run.stderr.log &
+done
+wait
 ```
+
 Notes:
-- `sample_id` should be deterministic (e.g. `{db_name}:{scene}:{frame}`) to avoid duplicates.
-- Store both `location` and DB path; do **not** infer location from filename.
+- `--limit` applies to the first M rows of the plan (useful for smoke tests). Shards will split only within that prefix.
+- Each worker must set quiet log mode to avoid I/O bottleneck:
+  - `EXTRACT_LOG_STYLE=quiet EXTRACT_WARN_PRINT_N=0`
 
-### 2.3 Plan config
-Write the exact plan parameters alongside the index:
-- seed
-- db roots included/excluded
-- per-location quotas
-- stride policy
-- filters (min ego poses, skip short scenes)
-
-### 2.4 Sampling policies (initial options)
-We’ll start with policies that are easy to reason about:
-
-**Policy P0 (v0.1)** — “small-city smoke test”
-- Choose the **smallest** location (fewest planned frames) from inventory.
-- Export exactly **10,000 frames** from that location.
-
-**Policy P1** — uniform stride within scenes
-- For each scene, choose frame indices: `start + k*stride`.
-- Pros: time-uniform; Cons: may bias toward longer scenes.
-
-**Policy P2** — fixed quota per scene
-- Each scene contributes up to `K` frames sampled uniformly.
-- Pros: increases scene diversity.
-
-**Policy P3** — location-balanced quotas
-- Ensure each location contributes a target fraction/number.
-
-For v0.1 we keep it simple: location chosen first, then P1 or P2 inside it.
-
-### 2.5 Sharding strategy
-Sharding is a pure function of the index.
-
-Proposed defaults:
-- `frames_per_shard = 2000` (→ 10k frames = 5 shards)
-- shard file naming: `shard_{i:03d}.jsonl`
-
-Shard outputs mirror shard inputs.
-
-### 2.6 Plan-time estimates (cheap but useful)
-During plan creation, also estimate:
-- **estimated_npz_size_per_frame** (use measured ~0.152 MB/frame from the recent 50-frame run as an initial constant)
-- total estimated disk = `num_frames * 0.152MB` (to be updated after v0.1 run)
-- expected export time range (rough; refined after v0.1 benchmark)
+### 3.5 Resume strategy
+If `metrics.json` exists and marks shard as success, skip rerun; otherwise rerun only that shard.
 
 ---
 
-## 3. v0.1 execution: ~10k frames (scene-window sampling) from the smallest location
+## 4. v0.1 execution: ~20k frames (scene-level selection)
 
-### 3.1 Goals
-- measure **meaningful** throughput (frames/s) → requires map_api reuse (minimal refactor)
-- measure disk footprint (MB/frame; total)
-- validate a production-like loop (plan → export → QC) without hangs
-
-### 3.2 Sampling for v0.1 (finalized requirement)
-Instead of global-uniform sampling, we do **scene-level selection** and then export **uniform stride within the whole scene** (no windowing):
+### 4.1 Sampling for v0.1 (finalized requirement)
+We do **scene-level selection** and then export **uniform stride within each scene**:
 
 1) Choose a target location (start with the smallest location by ego_pose frames).
 2) Randomly select **N scenes = 200** (scene tokens from DB `scene` table).
 3) For each selected scene, export frame indices within that scene's log:
    - `0, 8, 16, 24, ...` (stride = 8)
-   - **cap_per_scene = 100** (at most 100 frames per scene)
+   - **cap_per_scene = 100**
 
-Notes:
-- This yields ~ `200 * 100 = 20,000` frames (order-of-magnitude target for v0.1).
-- PLAN must record the exact scene list + seed + stride + cap for reproducibility.
-
-### 3.3 Procedure
-1) Inventory → choose smallest location
-2) Generate plan with **scene selection (200 scenes) + stride=8 + cap_per_scene=100** + tag enrichment + tag stats
-3) Export as a single NPZ (for v0.1), with QC manifests/metrics
-4) (Optional later) visualization audit after NPZ is produced
-
-### 3.4 Success criteria
+### 4.2 Success criteria
 - Export completes without hangs (timeouts prevent deadlocks)
-- No NaN/Inf in outputs (hard fail → skip)
-- route_lanes truly missing (route_lanes_avails_sum==0) is treated as **hard skip**
+- No NaN/Inf in outputs (hard skip)
+- route_lanes truly missing (`route_lanes_avails_sum==0`) treated as hard skip
 - QC summary produced (skip counts + soft flag counts)
-
----
-
-## 4. Lightweight per-frame correctness checks (export-time)
-
-Checks are meant to be **fast** and to catch catastrophic errors:
-
-Hard failures (skip sample):
-- any NaN/Inf in required fields
-- unexpected tensor shape
-- lanes_avails all-zero
-
-Soft flags (record + keep sample, but track rate):
-- route_lanes_avails all-zero
-- route_lanes valid points all far from ego (e.g. min_dist > 50m; threshold configurable)
-- neighbor_future implausible jump (optional threshold)
-
-All flags go into `shard_XXX.manifest.jsonl`.
-
----
-
-## 5. NPZ organization (export output format)
-
-Avoid “one frame per file”. For production:
-
-- One shard → one NPZ containing stacked arrays:
-  - `ego_current_state`: `(T, 10)`
-  - `ego_past`: `(T, 21, 3)`
-  - ...
-  - `route_lanes`: `(T, 25, 20, 12)`
-  - avails similarly
-
-- Keep `manifest.jsonl` alongside, mapping each `t` index to its `(db, scene, frame)`.
-
----
-
-## 6. Visualization sampling (audit)
-
-- For each shard:
-  - random `K` samples (e.g. 10)
-  - plus all samples with soft flags
-- Aggregate by location for review
-
----
-
-## 7. v0.1 TODO checklist (what we will implement next)
-
-### TODO-P (Plan)
-- [ ] Implement PLAN generator that:
-  - [ ] inventories train_* locations and picks smallest location
-  - [ ] enumerates **scene tokens** (from `scene` table) within that location
-  - [ ] randomly selects **200 scenes** (seeded)
-  - [ ] for each scene, generates frame indices `0,8,16,...` (stride=8) with **cap_per_scene=100**
-  - [ ] enriches each sample with `location` + `tags` (scenario_tag aligned via lidar_pc)
-  - [ ] outputs `index.jsonl`, `scene_list.json`, `plan_config.yaml`, `stats.json`, `tag_stats.json`
-
-### TODO-R (Minimal refactor for meaningful timing)
-- [ ] Minimal refactor of single-frame extraction to allow **map_api reuse**:
-  - [ ] expose an API like `extract_features(conn, map_api, scene_token, frame_index) -> dict`
-  - [ ] keep CLI/debug behavior intact
-
-### TODO-E (Export v0.1)
-- [ ] Export script that:
-  - [ ] reads the v0.1 plan
-  - [ ] loops samples with timeout protection
-  - [ ] QC: hard-skip NaN/Inf, shape mismatch, `route_lanes_avails_sum==0`
-  - [ ] QC: soft-flag only `route_min_dist > 30m`
-  - [ ] writes **one** NPZ file + manifest + metrics
-
-### TODO-V (Visualization)
-- [ ] Deferred until after v0.1 NPZ is produced.
-
----
-
-## 8. v0.1 current status (2026-03-22)
-
-### Plan
-- Plan dir: `plans/plan_v0.1_stride8_scene200_cap100_train_boston_20260322_1644/`
-- Planned samples: 20,000 (200 scenes × cap_per_scene 100, stride=8)
-
-### Export (small-scale debug run)
-A full end-to-end small run **completed successfully** (plan → export → produced NPZ + manifest + metrics):
-- Output dir (container):
-  `exports/debug_limit3000_timeout5s_clean_20260322_105500/`
-- planned: 3000
-- kept: 2760
-- hard_skipped: 240 (all `route_lanes_avails_sum==0`)
-- timeouts: 0
-- soft_flag `route_min_dist_gt_30m`: 669
-- elapsed: 1743.6s (~29.1 min)
-- throughput: 1.58 kept fps
-- npz size: 184,078,508 bytes (~175.6 MiB)
-
-**Important note:** the run was slower than expected due to extremely frequent warning logs
-(`route_roadblock_correction failed ... NoneType has no attribute 'id'`). For production export, we should
-suppress or aggregate these warnings (count them in metrics) to avoid stderr I/O bottlenecks.
-
-## 9. Next after v0.1
-
-After reboot / next session:
-- Decide logging policy for production export (silence repetitive warnings).
-- Run full 20k export using the same plan.
-- Update MB/frame and fps estimates and refine sampling strategy.
