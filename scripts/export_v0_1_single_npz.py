@@ -14,6 +14,11 @@ Soft flag:
 Notes:
 - Reuses map_api (one per run, since v0.1 uses single location).
 - Disables per-frame debug logging inside extract_features to avoid massive I/O.
+
+Scheduling:
+- Default (--schedule=plan) processes samples in plan file order within this shard.
+- Locality-aware (--schedule=db_grouped) groups samples by db_path (deterministic: db_path sorted) to reduce
+  cross-DB random access / connection switching, while preserving modulo sharding (plan_row_idx % num_shards).
 """
 
 from __future__ import annotations
@@ -94,6 +99,17 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="Optional: only process first N lines")
     ap.add_argument("--num-shards", type=int, default=1, help="Total shards for modulo sharding")
     ap.add_argument("--shard-id", type=int, default=0, help="This shard id in [0, num_shards)")
+    ap.add_argument(
+        "--schedule",
+        type=str,
+        default="plan",
+        choices=["plan", "db_grouped"],
+        help=(
+            "Processing order within this shard. "
+            "'plan' preserves plan file order; 'db_grouped' groups by db_path (deterministic, sorted by db_path) "
+            "to reduce cross-DB random access."
+        ),
+    )
     args = ap.parse_args()
 
     if args.num_shards < 1:
@@ -176,12 +192,24 @@ def main() -> int:
     t0 = time.time()
     t_prep_s = time.time() - t_prog0
 
-    # Group by db_path to reuse sqlite connection
+    # ---- Step: Choose processing order within shard ----
+    # NOTE: Regardless of schedule, shard membership is defined solely by plan_row_idx % num_shards.
+    # We keep plan_row_idx in manifest for auditability and for no-overlap/no-missing checks.
     by_db: dict[str, list[dict]] = {}
     for r in records:
         by_db.setdefault(r["db_path"], []).append(r)
 
-    # Keep stable order: iterate records list but reuse connection cache
+    if args.schedule == "plan":
+        iter_records = records
+    elif args.schedule == "db_grouped":
+        # Deterministic grouping: process dbs in sorted(db_path) order; within each db keep plan order.
+        iter_records = []
+        for db_path in sorted(by_db.keys()):
+            iter_records.extend(by_db[db_path])
+    else:
+        raise ValueError(f"Unknown --schedule={args.schedule}")
+
+    # Reuse sqlite connections per db_path
     con_cache: dict[str, sqlite3.Connection] = {}
 
     def get_con(db_path: str) -> sqlite3.Connection:
@@ -190,7 +218,7 @@ def main() -> int:
         return con_cache[db_path]
 
     with open(manifest_path, "w", encoding="utf-8") as mf:
-        for idx, r in enumerate(records):
+        for idx, r in enumerate(iter_records):
             db_path = r["db_path"]
             scene = r["scene_token_hex"]
             frame = int(r["frame_index"])
@@ -318,7 +346,7 @@ def main() -> int:
             if (idx + 1) % 500 == 0:
                 dt_s = time.time() - t0
                 fps = (idx + 1) / max(dt_s, 1e-9)
-                print(f"[{idx+1}/{len(records)}] processed; kept={len(kept_meta)} skip={hard_skip} fps={fps:.2f}", file=sys.stderr, flush=True)
+                print(f"[{idx+1}/{len(iter_records)}] processed; kept={len(kept_meta)} skip={hard_skip} fps={fps:.2f}", file=sys.stderr, flush=True)
 
     # Close DB connections
     for con in con_cache.values():
@@ -356,6 +384,7 @@ def main() -> int:
         "num_shards": int(args.num_shards),
         "shard_id": int(args.shard_id),
         "planned": len(records),
+        "schedule": str(args.schedule),
         "kept": kept_n,
         "hard_skipped": hard_skip,
         "timeout_count": timeout_count,
@@ -407,6 +436,7 @@ def main() -> int:
         "env": {
             "EXTRACT_LOG_STYLE": os.environ.get('EXTRACT_LOG_STYLE', ''),
             "EXTRACT_WARN_PRINT_N": os.environ.get('EXTRACT_WARN_PRINT_N', ''),
+            "EXPORT_SCHEDULE": os.environ.get('EXPORT_SCHEDULE', ''),
         },
         "plan_dir": str(plan_dir),
         "out_dir": str(out_dir),
