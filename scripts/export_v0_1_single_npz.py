@@ -39,6 +39,10 @@ import sqlite3
 import importlib.util
 
 _esf_path = "/workspace/scripts/extract_single_frame/extract_single_frame.py"
+if not os.path.exists(_esf_path):
+    # Host/dev fallback: resolve relative to this file.
+    _esf_path = str((Path(__file__).resolve().parent / "extract_single_frame" / "extract_single_frame.py").resolve())
+
 _spec = importlib.util.spec_from_file_location("extract_single_frame", _esf_path)
 if _spec is None or _spec.loader is None:
     raise RuntimeError(f"Failed to load extractor from {_esf_path}")
@@ -291,6 +295,7 @@ def main() -> int:
             sample_id = r.get("sample_id", f"{Path(db_path).name}:{scene}:{frame}")
 
             qc_flags: list[str] = []
+            pf_for_manifest: dict | None = None
 
             try:
                 con = get_con(db_path)
@@ -344,6 +349,32 @@ def main() -> int:
                     try:
                         pf = feats.pop('_profile_flags')
                         if isinstance(pf, dict):
+                            # Keep a compact subset in manifest for sampling/visualization/debug.
+                            pf_for_manifest = {
+                                k: pf.get(k)
+                                for k in [
+                                    'need_bridge',
+                                    'bfs_called',
+                                    'bfs_triggered_by',
+                                    'bridge_found',
+                                    'bridge_len',
+                                    'bridge_reason',
+                                    'intersection_pruned',
+                                    'ego_rb',
+                                    'ego_rb_in_route',
+                                    'off_route',
+                                    'bad_route_geom',
+                                    'rmin_old_m',
+                                    'realign_from_overlap',
+                                    'overlap_idx',
+                                    'route_len_old',
+                                    'route_len_new',
+                                    'avails_sum_old',
+                                    'avails_sum_new',
+                                ]
+                                if k in pf
+                            }
+
                             nb = bool(pf.get('need_bridge', False))
                             bc = bool(pf.get('bfs_called', False))
                             bf = bool(pf.get('bridge_found', False))
@@ -433,6 +464,7 @@ def main() -> int:
                             "route_lanes_avails_sum": route_av_sum,
                             "lanes_avails_sum": lanes_av_sum,
                             "route_min_dist_m": rmin,
+                            "_profile_flags": pf_for_manifest,
                         },
                         ensure_ascii=False,
                     )
