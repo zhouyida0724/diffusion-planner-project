@@ -90,6 +90,28 @@ def route_min_dist_m(route_lanes: np.ndarray, route_avails: np.ndarray) -> float
     return float(d.min())
 
 
+def _summarize_durations(values: list[float]) -> dict:
+    """Return summary stats for a list of durations (seconds)."""
+    if not values:
+        return {
+            'count': 0,
+            'mean': None,
+            'p50': None,
+            'p90': None,
+            'p99': None,
+            'max': None,
+        }
+    a = np.asarray(values, dtype=np.float64)
+    return {
+        'count': int(a.size),
+        'mean': float(a.mean()),
+        'p50': float(np.percentile(a, 50)),
+        'p90': float(np.percentile(a, 90)),
+        'p99': float(np.percentile(a, 99)),
+        'max': float(a.max()),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", type=str, required=True, help="Path to plan directory containing index.jsonl")
@@ -189,6 +211,11 @@ def main() -> int:
     t_manifest_total = 0.0
     t_append_total = 0.0
 
+    # Optional per-submethod timings from extractor (EXTRACT_PROFILE=1)
+    # key -> list of durations (seconds)
+    extract_profile: dict[str, list[float]] = {}
+    extract_profile_total: list[float] = []
+
     t0 = time.time()
     t_prep_s = time.time() - t_prog0
 
@@ -252,6 +279,25 @@ def main() -> int:
                     signal.signal(signal.SIGALRM, old_handler)
                 t_ex = time.time() - t_ex0
                 t_extract_total += t_ex
+
+                # Optional: aggregate per-submethod timings produced by extractor.
+                # Must not affect REQUIRED_KEYS / npz buffers.
+                if isinstance(feats, dict) and '_timing' in feats:
+                    try:
+                        sample_timing = feats.pop('_timing')
+                        if isinstance(sample_timing, dict):
+                            total_s = 0.0
+                            for k, v in sample_timing.items():
+                                try:
+                                    fv = float(v)
+                                    extract_profile.setdefault(str(k), []).append(fv)
+                                    total_s += fv
+                                except Exception:
+                                    continue
+                            extract_profile_total.append(float(total_s))
+                    except Exception:
+                        # Never fail the export due to profiling metadata.
+                        pass
 
                 # ---- Step: sanity checks + QC ----
                 t_qc0 = time.time()
@@ -396,6 +442,15 @@ def main() -> int:
         "npz_path": str(npz_path),
         "npz_size_bytes": int(npz_path.stat().st_size),
         "manifest_path": str(manifest_path),
+
+        # Alias for convenience (same as timing_s.extract_total_s)
+        "total_extract_s": float(t_extract_total),
+
+        # Optional per-submethod timing profile (present only when EXTRACT_PROFILE=1)
+        "extract_profile": {
+            "by_step_s": {k: _summarize_durations(v) for k, v in sorted(extract_profile.items())},
+            "total_per_sample_s": _summarize_durations(extract_profile_total),
+        },
 
         "timing_s": {
             "prep_total_s": float(t_prep_s),

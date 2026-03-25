@@ -14,6 +14,8 @@ import sqlite3
 import numpy as np
 import os
 import logging
+import time
+import contextlib
 from collections import Counter
 from datetime import datetime
 from shapely import LineString
@@ -158,6 +160,30 @@ def get_log_stats() -> dict:
         'warning_total': int(LOG_WARNING_TOTAL),
         'warning_by_key': dict(LOG_WARNING_COUNTS),
     }
+
+
+# ------------------------
+# Optional timing profiling (gated by env var)
+# ------------------------
+
+def _extract_profile_enabled() -> bool:
+    """Whether to attach per-submethod timing profile to extracted features."""
+    v = os.environ.get('EXTRACT_PROFILE', '0')
+    return str(v).strip().lower() in {'1', 'true', 'yes', 'y'}
+
+
+@contextlib.contextmanager
+def _timing_ctx(timing: dict[str, float] | None, key: str):
+    """Accumulate elapsed seconds into timing[key] when timing dict is provided."""
+    if timing is None:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        timing[key] = float(timing.get(key, 0.0) + dt)
 
 
 # Initialize logger object
@@ -1187,61 +1213,80 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
     db_path = _get_db_path_from_conn(conn)
     map_name = getattr(map_api, 'map_name', None) or getattr(map_api, '_map_name', None) or MAP_NAME
 
-    center_token, center_timestamp, _ = get_target_frame(conn, scenario_token_hex, int(frame_index))
+    timing: dict[str, float] | None = {} if _extract_profile_enabled() else None
 
-    ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, _, _ =         extract_ego_data(conn, center_token, center_timestamp, scenario_token_hex)
+    with _timing_ctx(timing, 'get_target_frame'):
+        center_token, center_timestamp, _ = get_target_frame(conn, scenario_token_hex, int(frame_index))
 
-    traffic_light_data = get_traffic_lights_at_timestamp(conn, center_timestamp, map_name)
+    with _timing_ctx(timing, 'extract_ego_data'):
+        ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, _, _ = extract_ego_data(
+            conn, center_token, center_timestamp, scenario_token_hex
+        )
 
-    neighbor_past_agents, neighbor_future = extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading)
-    for i in range(1, MAX_NEIGHBORS):
-        if np.any(neighbor_past_agents[i, :, -1] != 0):
-            neighbor_past[i] = neighbor_past_agents[i]
+    with _timing_ctx(timing, 'get_traffic_lights_at_timestamp'):
+        traffic_light_data = get_traffic_lights_at_timestamp(conn, center_timestamp, map_name)
 
-    static_objects = extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading)
+    with _timing_ctx(timing, 'extract_neighbor_agents'):
+        neighbor_past_agents, neighbor_future = extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading)
+
+    with _timing_ctx(timing, 'fill_neighbor_past'):
+        for i in range(1, MAX_NEIGHBORS):
+            if np.any(neighbor_past_agents[i, :, -1] != 0):
+                neighbor_past[i] = neighbor_past_agents[i]
+
+    with _timing_ctx(timing, 'extract_static_objects'):
+        static_objects = extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading)
 
     point = Point2D(ego_x, ego_y)
 
     # Route roadblock ids from scenario.get_route_roadblock_ids (+ correction/pruning)
-    try:
-        route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
-    except Exception:
-        route_roadblock_ids = None
+    with _timing_ctx(timing, 'get_pruned_route_roadblock_ids'):
+        try:
+            route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
+        except Exception:
+            route_roadblock_ids = None
 
-    lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
-        point, map_api, radius=100, max_lanes=MAX_LANES, ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data
-    )
+    with _timing_ctx(timing, 'extract_lanes'):
+        lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
+            point,
+            map_api,
+            radius=100,
+            max_lanes=MAX_LANES,
+            ego_heading=ego_heading,
+            traffic_light_data=traffic_light_data,
+        )
 
     # ---- Single-case BFS bridge minimal experiment ----
-    route_lanes_old, route_lanes_avails_old, _, _ = extract_route_lanes(
-        point,
-        map_api,
-        radius=150,
-        max_route_lanes=MAX_ROUTE_LANES,
-        ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data,
-        route_roadblock_ids=route_roadblock_ids,
-    )
+    with _timing_ctx(timing, 'extract_route_lanes_old'):
+        route_lanes_old, route_lanes_avails_old, _, _ = extract_route_lanes(
+            point,
+            map_api,
+            radius=150,
+            max_route_lanes=MAX_ROUTE_LANES,
+            ego_heading=ego_heading,
+            traffic_light_data=traffic_light_data,
+            route_roadblock_ids=route_roadblock_ids,
+        )
     avails_sum_old = int(np.count_nonzero(route_lanes_avails_old))
 
     proximal_rb_ids: set[str] = set()
-    try:
-        prox_layers = map_api.get_proximal_map_objects(
-            point,
-            150,
-            [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
-        )
-        for lt in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
-            for lane_obj in (prox_layers.get(lt, []) or []):
-                try:
-                    rb = lane_obj.get_roadblock_id() if hasattr(lane_obj, 'get_roadblock_id') else None
-                    if rb is not None:
-                        proximal_rb_ids.add(str(rb))
-                except Exception:
-                    continue
-    except Exception:
-        prox_layers = {}
+    with _timing_ctx(timing, 'map_api.get_proximal_map_objects'):
+        try:
+            prox_layers = map_api.get_proximal_map_objects(
+                point,
+                150,
+                [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
+            )
+            for lt in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
+                for lane_obj in (prox_layers.get(lt, []) or []):
+                    try:
+                        rb = lane_obj.get_roadblock_id() if hasattr(lane_obj, 'get_roadblock_id') else None
+                        if rb is not None:
+                            proximal_rb_ids.add(str(rb))
+                    except Exception:
+                        continue
+        except Exception:
+            prox_layers = {}
 
     pruned_route_set = set([str(x) for x in (route_roadblock_ids or [])])
     intersection_pruned = int(len(proximal_rb_ids.intersection(pruned_route_set)))
@@ -1303,25 +1348,27 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
                 bridge_reason = f'rmin_old_m>{bridge_trigger_dist_m}'
 
     if need_bridge and route_roadblock_ids:
-        new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
-            map_api,
-            point,
-            list(route_roadblock_ids),
-            intersection_pruned=intersection_pruned,
-            radius=150,
-            k_targets=10,
-            max_depth=80,
-        )
+        with _timing_ctx(timing, 'bfs_bridge_route_if_needed'):
+            new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
+                map_api,
+                point,
+                list(route_roadblock_ids),
+                intersection_pruned=intersection_pruned,
+                radius=150,
+                k_targets=10,
+                max_depth=80,
+            )
 
-    route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
-        point,
-        map_api,
-        radius=150,
-        max_route_lanes=MAX_ROUTE_LANES,
-        ego_heading=ego_heading,
-        traffic_light_data=traffic_light_data,
-        route_roadblock_ids=new_route_ids,
-    )
+    with _timing_ctx(timing, 'extract_route_lanes_new'):
+        route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
+            point,
+            map_api,
+            radius=150,
+            max_route_lanes=MAX_ROUTE_LANES,
+            ego_heading=ego_heading,
+            traffic_light_data=traffic_light_data,
+            route_roadblock_ids=new_route_ids,
+        )
     avails_sum_new = int(np.count_nonzero(route_lanes_avails))
 
     # Persist experiment logs to avoid stdout truncation (kept identical to legacy main).
@@ -1378,7 +1425,7 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
         except Exception:
             pass
 
-    return {
+    out = {
         'ego_current_state': ego_current_state,
         'ego_past': ego_past,
         'ego_agent_future': ego_future,
@@ -1394,6 +1441,9 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
         'route_lanes_speed_limit': route_lanes_speed_limit,
         'route_lanes_has_speed_limit': route_lanes_has_speed_limit,
     }
+    if timing is not None:
+        out['_timing'] = dict(timing)
+    return out
 
 def run_extraction(db_path: str,
                    scenario_token: str,
