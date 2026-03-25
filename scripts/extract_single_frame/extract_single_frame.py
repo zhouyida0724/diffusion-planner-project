@@ -1317,6 +1317,11 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
     ego_rb = None
     bridge_reason = 'skip'
 
+    # Profiling flags (only materialized when EXTRACT_PROFILE=1).
+    bfs_called = False
+    realign_from_overlap = False
+    overlap_idx: int | None = None
+
     need_bridge = False
     if route_roadblock_ids:
         if intersection_pruned == 0:
@@ -1332,6 +1337,8 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
                     pos = {v: i for i, v in enumerate(route_list)}
                     idx_min = min(pos[x] for x in inter if x in pos)
                     if idx_min is not None and idx_min > 0:
+                        overlap_idx = int(idx_min)
+                        realign_from_overlap = True
                         new_route_ids = list(route_roadblock_ids)[idx_min:]
                         bridge_found = True
                         bridge_len = 0
@@ -1348,6 +1355,7 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
                 bridge_reason = f'rmin_old_m>{bridge_trigger_dist_m}'
 
     if need_bridge and route_roadblock_ids:
+        bfs_called = True
         with _timing_ctx(timing, 'bfs_bridge_route_if_needed'):
             new_route_ids, bridge_len, bridge_found, ego_rb, bridge_reason = bfs_bridge_route_if_needed(
                 map_api,
@@ -1443,6 +1451,22 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
     }
     if timing is not None:
         out['_timing'] = dict(timing)
+        # Extra profiling metadata (cheap scalars/strings only).
+        out['_profile_flags'] = {
+            'need_bridge': bool(need_bridge),
+            'bfs_called': bool(bfs_called),
+            'bridge_found': bool(bridge_found),
+            'bridge_len': int(bridge_len),
+            'bridge_reason': str(bridge_reason),
+            'intersection_pruned': int(intersection_pruned),
+            'rmin_old_m': (None if rmin_old_m is None else float(rmin_old_m)),
+            'realign_from_overlap': bool(realign_from_overlap),
+            'overlap_idx': (None if overlap_idx is None else int(overlap_idx)),
+            'route_len_old': int(len(route_roadblock_ids) if route_roadblock_ids else 0),
+            'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
+            'avails_sum_old': int(avails_sum_old),
+            'avails_sum_new': int(avails_sum_new),
+        }
     return out
 
 def run_extraction(db_path: str,

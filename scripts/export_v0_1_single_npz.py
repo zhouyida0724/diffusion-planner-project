@@ -112,6 +112,33 @@ def _summarize_durations(values: list[float]) -> dict:
     }
 
 
+def _bucketize(values: list[float], *, bins: list[float]) -> dict:
+    """Simple fixed-bin histogram.
+
+    Returns dict with keys like '<=b0', '(b0,b1]', ..., '>last'.
+    """
+    out = Counter()
+    for v in values:
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        placed = False
+        prev = None
+        for b in bins:
+            if x <= b:
+                if prev is None:
+                    out[f'<= {b}'] += 1
+                else:
+                    out[f'({prev}, {b}]'] += 1
+                placed = True
+                break
+            prev = b
+        if not placed:
+            out[f'> {bins[-1]}'] += 1
+    return dict(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", type=str, required=True, help="Path to plan directory containing index.jsonl")
@@ -216,6 +243,18 @@ def main() -> int:
     extract_profile: dict[str, list[float]] = {}
     extract_profile_total: list[float] = []
 
+    # Optional profiling flags from extractor (EXTRACT_PROFILE=1)
+    flags_need_bridge = Counter()
+    flags_bfs_called = Counter()
+    flags_bridge_found = Counter()
+    flags_bridge_reason = Counter()
+    flags_intersection_pruned: list[int] = []
+    flags_rmin_old_m: list[float] = []
+
+    # Correlate BFS timing with bfs_called.
+    bfs_time_called: list[float] = []
+    bfs_time_not_called: list[float] = []
+
     t0 = time.time()
     t_prep_s = time.time() - t_prog0
 
@@ -282,6 +321,7 @@ def main() -> int:
 
                 # Optional: aggregate per-submethod timings produced by extractor.
                 # Must not affect REQUIRED_KEYS / npz buffers.
+                sample_timing = None
                 if isinstance(feats, dict) and '_timing' in feats:
                     try:
                         sample_timing = feats.pop('_timing')
@@ -297,6 +337,50 @@ def main() -> int:
                             extract_profile_total.append(float(total_s))
                     except Exception:
                         # Never fail the export due to profiling metadata.
+                        sample_timing = None
+
+                # Optional: aggregate per-sample BFS trigger flags produced by extractor.
+                if isinstance(feats, dict) and '_profile_flags' in feats:
+                    try:
+                        pf = feats.pop('_profile_flags')
+                        if isinstance(pf, dict):
+                            nb = bool(pf.get('need_bridge', False))
+                            bc = bool(pf.get('bfs_called', False))
+                            bf = bool(pf.get('bridge_found', False))
+                            br = str(pf.get('bridge_reason', ''))
+                            ip = pf.get('intersection_pruned', None)
+                            rm = pf.get('rmin_old_m', None)
+
+                            flags_need_bridge[nb] += 1
+                            flags_bfs_called[bc] += 1
+                            flags_bridge_found[bf] += 1
+                            if br:
+                                flags_bridge_reason[br] += 1
+
+                            try:
+                                if ip is not None:
+                                    flags_intersection_pruned.append(int(ip))
+                            except Exception:
+                                pass
+                            try:
+                                if rm is not None:
+                                    flags_rmin_old_m.append(float(rm))
+                            except Exception:
+                                pass
+
+                            # Correlate BFS timing (only meaningful when bfs_called=True)
+                            # Treat BFS time as 0.0 when bfs is not called (key absent).
+                            bfs_dt = 0.0
+                            if isinstance(sample_timing, dict):
+                                try:
+                                    bfs_dt = float(sample_timing.get('bfs_bridge_route_if_needed', 0.0) or 0.0)
+                                except Exception:
+                                    bfs_dt = 0.0
+                            if bc:
+                                bfs_time_called.append(float(bfs_dt))
+                            else:
+                                bfs_time_not_called.append(float(bfs_dt))
+                    except Exception:
                         pass
 
                 # ---- Step: sanity checks + QC ----
@@ -450,6 +534,24 @@ def main() -> int:
         "extract_profile": {
             "by_step_s": {k: _summarize_durations(v) for k, v in sorted(extract_profile.items())},
             "total_per_sample_s": _summarize_durations(extract_profile_total),
+            "flags": {
+                "need_bridge": {str(k): int(v) for k, v in flags_need_bridge.items()},
+                "bfs_called": {str(k): int(v) for k, v in flags_bfs_called.items()},
+                "bridge_found": {str(k): int(v) for k, v in flags_bridge_found.items()},
+                "bridge_reason": dict(flags_bridge_reason),
+                "intersection_pruned": {
+                    "summary": _summarize_durations([float(x) for x in flags_intersection_pruned]),
+                    "buckets": _bucketize([float(x) for x in flags_intersection_pruned], bins=[0, 1, 2, 5, 10, 20]),
+                },
+                "rmin_old_m": {
+                    "summary": _summarize_durations([float(x) for x in flags_rmin_old_m]),
+                    "buckets": _bucketize([float(x) for x in flags_rmin_old_m], bins=[0, 1, 2, 5, 10, 20, 30, 50]),
+                },
+                "bfs_time_s": {
+                    "called": _summarize_durations(bfs_time_called),
+                    "not_called": _summarize_durations(bfs_time_not_called),
+                },
+            },
         },
 
         "timing_s": {
