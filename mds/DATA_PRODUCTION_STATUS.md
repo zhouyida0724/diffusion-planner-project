@@ -39,6 +39,29 @@
   - per-shard planned=500
 - **Soft-flag issue** (`route_min_dist_gt_30m`) persists and is treated as a routing-quality problem; current plan is to store it as meta for training-time reweighting rather than blocking export.
 
+### Updates (2026-03-26)
+- **Routing empty-route root cause confirmed**: the majority of BFS calls were due to `route_lanes_old` being empty (`avails_sum_old==0`, `rmin_old_m=None`), which correlates with `ego_rb_in_route=false` (route roadblock ids misaligned with ego). Overlap-realign is often a no-op in these cases.
+- **Profiling infrastructure added** (gated by `EXTRACT_PROFILE=1`):
+  - per-submethod timing (`_timing`) aggregated into shard `metrics.json`
+  - BFS trigger flags / reason distributions (`_profile_flags`) aggregated into `metrics.json` and (compact form) optionally written into `manifest.jsonl` for sampling/viz.
+- **BFS wall-clock cap introduced**: `BFS_MAX_TIME_S=0.5` (BFS internal timeout) + exporter treats BFS timeout as hard-skip (`qc_error=bfs_timeout`).
+  - This avoids spending ~5s per slow BFS case and significantly improves throughput on Boston baselines.
+- **DB-locality scheduling**: `EXPORT_SCHEDULE=db_grouped` implemented and validated (reduces cross-DB thrashing).
+
+### Production (Boston 50w planned, sliced)
+- Generated Boston plan with 500k planned samples: `plans/plan_v0.1_stride8_scene5000_cap100_train_boston_20260324_2254/`.
+- Production strategy: split into **5 slices × 100k planned**; run each slice with `num_shards=8/12`, `db_grouped`, `BFS_MAX_TIME_S=0.5`.
+- **Slice01 (N=8)**: `exports/boston50w_prod/slice01_20260326_093747/`
+  - planned=100000, kept=79613, hard_skipped=20387
+  - elapsed_max≈4181s, fps_kept≈19.04, size≈5.2G
+- **Slice02 (N=12)**: `exports_local/boston50w_prod/slice02_N12_20260326_105143/` (exports/ is root-owned)
+  - planned=100000, kept=83379, hard_skipped=16621
+  - elapsed_max≈3229s, fps_kept≈25.82, size≈5.5G
+
+### Ops note
+- `exports/` directory is currently root-owned (not writable by uid=1000 container runs). Using `exports_local/` until permissions are normalized.
+
 ### Next
-- Add flat per-frame meta fields into `manifest.jsonl` (routing quality bucket + tags) to support training-time sampling/reweighting.
-- Run 3k/20k export using **N=4 sharding**, then aggregate QC across shards.
+- Continue slices 03–05 with N=12 if resources remain stable.
+- Normalize output directory permissions (`exports/` vs `exports_local/`) and standardize run metadata.
+- (Optional) Add a cheap deterministic route realignment (not BFS) to reduce empty-route rate, then re-evaluate whether BFS can be made truly rare.
