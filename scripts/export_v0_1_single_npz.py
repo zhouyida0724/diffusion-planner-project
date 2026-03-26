@@ -233,6 +233,9 @@ def main() -> int:
 
     hard_skip = 0
     timeout_count = 0
+    bfs_timeout_count = 0
+    hard_skip_reasons = Counter()
+
     soft_flag_far = 0
     soft_flag_counts = Counter()
 
@@ -414,6 +417,14 @@ def main() -> int:
                     except Exception:
                         pass
 
+                # Hard-skip: BFS wall-clock timeout (controlled by BFS_MAX_TIME_S).
+                # Exporter policy: treat this as a hard failure (do not keep sample) so downstream training doesn't
+                # silently include broken routing.
+                if pf_for_manifest is not None:
+                    br = str(pf_for_manifest.get('bridge_reason', '') or '')
+                    if br.startswith('bfs_exception: timeout'):
+                        raise RuntimeError('bfs_timeout')
+
                 # ---- Step: sanity checks + QC ----
                 t_qc0 = time.time()
                 for k in REQUIRED_KEYS:
@@ -475,6 +486,7 @@ def main() -> int:
             except _Timeout:
                 hard_skip += 1
                 timeout_count += 1
+                hard_skip_reasons['timeout'] += 1
                 mf.write(
                     json.dumps(
                         {
@@ -491,6 +503,18 @@ def main() -> int:
 
             except Exception as e:
                 hard_skip += 1
+                err = str(e)
+                # Classify common hard-skip reasons for metrics.
+                if err == 'bfs_timeout':
+                    bfs_timeout_count += 1
+                    hard_skip_reasons['bfs_timeout'] += 1
+                elif err == 'route_lanes_avails_sum==0':
+                    hard_skip_reasons['route_lanes_avails_sum==0'] += 1
+                elif err == 'lanes_avails_sum==0':
+                    hard_skip_reasons['lanes_avails_sum==0'] += 1
+                else:
+                    hard_skip_reasons[err] += 1
+
                 mf.write(
                     json.dumps(
                         {
@@ -498,7 +522,7 @@ def main() -> int:
                             "sample_id": sample_id,
                             "t": None,
                             "qc_hard_skip": True,
-                            "qc_error": str(e),
+                            "qc_error": err,
                         },
                         ensure_ascii=False,
                     )
@@ -550,6 +574,8 @@ def main() -> int:
         "kept": kept_n,
         "hard_skipped": hard_skip,
         "timeout_count": timeout_count,
+        "bfs_timeout_count": bfs_timeout_count,
+        "hard_skip_reasons": dict(hard_skip_reasons),
         "soft_flag_counts": dict(soft_flag_counts),
         "elapsed_s": elapsed,
         "fps_kept": kept_n / max(elapsed, 1e-9),

@@ -438,10 +438,23 @@ def bfs_bridge_route_if_needed(
     if ego_rb in set(pruned_route_ids):
         return pruned_route_ids, 0, True, ego_rb, 'ego_rb_in_pruned_route'
 
+    # Wall-clock guard: BFS can sometimes explode on dense graphs; we cap it to avoid hitting per-sample SIGALRM (5s).
+    bfs_max_time_s = 0.5
+    try:
+        bfs_max_time_s = float(os.environ.get('BFS_MAX_TIME_S', '0.5'))
+    except Exception:
+        bfs_max_time_s = 0.5
+
     try:
         bfs = BreadthFirstSearchRoadBlock(ego_rb, map_api)
-        (bridge_path, bridge_ids), found = bfs.search(target_roadblock_id=pruned_route_ids[:k_targets], max_depth=max_depth)
+        (bridge_path, bridge_ids), found = bfs.search(
+            target_roadblock_id=pruned_route_ids[:k_targets],
+            max_depth=max_depth,
+            max_time_s=bfs_max_time_s,
+        )
         bridge_ids = [str(x) for x in (bridge_ids or [])]
+    except TimeoutError:
+        return pruned_route_ids, 0, False, ego_rb, 'bfs_exception: timeout'
     except Exception as e:
         return pruned_route_ids, 0, False, ego_rb, f'bfs_exception: {e}'
 
@@ -1209,7 +1222,7 @@ def _get_db_path_from_conn(conn: sqlite3.Connection) -> str:
     return ''
 
 
-def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *, debug_log: bool = True) -> dict[str, np.ndarray]:
+def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *, debug_log: bool = True, routing_mode: str = 'auto') -> dict[str, np.ndarray]:
     """Pure feature extraction.
 
     Args:
@@ -1250,12 +1263,27 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
 
     point = Point2D(ego_x, ego_y)
 
-    # Route roadblock ids from scenario.get_route_roadblock_ids (+ correction/pruning)
-    with _timing_ctx(timing, 'get_pruned_route_roadblock_ids'):
+    routing_mode = (routing_mode or 'auto').strip().lower()
+
+    # Route roadblock ids (raw from scenario), used by NOFIX/REALIGN/BFS modes.
+    with _timing_ctx(timing, 'get_raw_route_roadblock_ids'):
         try:
-            route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
+            scenario = build_nuplan_scenario_from_db(conn, db_path, scenario_token_hex, map_name)
+            route_roadblock_ids_raw = list(scenario.get_route_roadblock_ids())
         except Exception:
-            route_roadblock_ids = None
+            route_roadblock_ids_raw = []
+
+    # Route roadblock ids used for downstream route-lane filtering.
+    # - auto: apply upstream route_roadblock_correction() first (legacy behavior)
+    # - nofix/realign/bfs: use the original route_roadblock_ids as requested
+    if routing_mode == 'auto':
+        with _timing_ctx(timing, 'get_pruned_route_roadblock_ids'):
+            try:
+                route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
+            except Exception:
+                route_roadblock_ids = None
+    else:
+        route_roadblock_ids = list(route_roadblock_ids_raw)
 
     with _timing_ctx(timing, 'extract_lanes'):
         lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
@@ -1368,8 +1396,22 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
 
     bad_route_geom = (avails_sum_old == 0) or (rmin_old_m is None) or (float(rmin_old_m) > 30.0)
 
-    # (a) Always attempt overlap realign first when route geometry is bad.
-    if bad_route_geom and route_list:
+    # Explicit benchmark routing modes:
+    #  - nofix:    no overlap-realign, no BFS (use original route_roadblock_ids)
+    #  - realign:  overlap-realign only (no BFS)
+    #  - bfs:      BFS-bridge only (no overlap-realign)
+    #  - auto:     legacy behavior (overlap-realign gated by bad_route_geom + BFS bridging)
+
+    if routing_mode == 'nofix':
+        need_bridge = False
+        bfs_triggered_by = 'disabled'
+        bridge_reason = 'nofix'
+        new_route_ids = list(route_list)
+
+    elif routing_mode == 'realign':
+        # overlap-realign only (no BFS)
+        need_bridge = False
+        bfs_triggered_by = 'disabled'
         try:
             inter = proximal_rb_ids.intersection(route_set)
             if inter:
@@ -1381,41 +1423,95 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
                     new_route_ids = route_list[idx_min:]
                     bridge_found = True
                     bridge_len = 0
-                    bridge_reason = f'realign_from_overlap_idx={idx_min} (bad_route_geom)'
+                    bridge_reason = f'realign_from_overlap_idx={idx_min}'
                 else:
                     bridge_reason = 'overlap_idx=0 (no_realign)'
+                    new_route_ids = list(route_list)
             else:
                 bridge_reason = 'no_overlap_for_realign'
+                new_route_ids = list(route_list)
         except Exception:
             bridge_reason = 'overlap_realign_exception'
+            new_route_ids = list(route_list)
 
-    # (b) Only call BFS when (off_route AND bad_route_geom AND realign failed).
-    # (c) Hard-gate BFS by intersection_pruned==0 (avoid BFS when intersection_pruned>0).
-    need_bridge = bool(route_list) and off_route and bad_route_geom and (not realign_from_overlap)
-    if need_bridge and (intersection_pruned == 0):
-        bfs_called = True
-        bfs_triggered_by = 'off_route_and_bad_route_geom'
-        with _timing_ctx(timing, 'bfs_bridge_route_if_needed'):
-            new_route_ids, bridge_len, bridge_found, ego_rb_bfs, bridge_reason = bfs_bridge_route_if_needed(
-                map_api,
-                point,
-                list(route_list),
-                intersection_pruned=intersection_pruned,
-                radius=150,
-                k_targets=10,
-                max_depth=80,
-            )
-        # Keep the original ego_rb guess if present; otherwise use BFS-computed ego_rb.
-        if not ego_rb:
-            ego_rb = ego_rb_bfs
-        ego_rb_in_route = bool(ego_rb) and (ego_rb in set([str(x) for x in (route_roadblock_ids or [])]))
-    elif need_bridge and (intersection_pruned != 0):
-        bfs_triggered_by = f'skip_intersection_pruned={intersection_pruned}'
-    elif need_bridge and realign_from_overlap:
-        bfs_triggered_by = 'realign_succeeded'
-    else:
-        if not need_bridge:
+    elif routing_mode == 'bfs':
+        # BFS-bridge only (no overlap-realign)
+        need_bridge = bool(route_list) and off_route
+        if need_bridge and (intersection_pruned == 0):
+            bfs_called = True
+            bfs_triggered_by = 'off_route'
+            with _timing_ctx(timing, 'bfs_bridge_route_if_needed'):
+                new_route_ids, bridge_len, bridge_found, ego_rb_bfs, bridge_reason = bfs_bridge_route_if_needed(
+                    map_api,
+                    point,
+                    list(route_list),
+                    intersection_pruned=intersection_pruned,
+                    radius=150,
+                    k_targets=10,
+                    max_depth=80,
+                )
+            if not ego_rb:
+                ego_rb = ego_rb_bfs
+            ego_rb_in_route = bool(ego_rb) and (ego_rb in set([str(x) for x in (route_roadblock_ids or [])]))
+        elif need_bridge and (intersection_pruned != 0):
+            bfs_triggered_by = f'skip_intersection_pruned={intersection_pruned}'
+            bridge_reason = 'bfs_skipped_intersection_pruned'
+            new_route_ids = list(route_list)
+        else:
             bfs_triggered_by = 'gate_not_met'
+            bridge_reason = 'bfs_gate_not_met'
+            new_route_ids = list(route_list)
+
+    else:
+        # auto (legacy behavior)
+        # (a) Always attempt overlap realign first when route geometry is bad.
+        if bad_route_geom and route_list:
+            try:
+                inter = proximal_rb_ids.intersection(route_set)
+                if inter:
+                    pos = {v: i for i, v in enumerate(route_list)}
+                    idx_min = min(pos[x] for x in inter if x in pos)
+                    if idx_min is not None and idx_min > 0:
+                        overlap_idx = int(idx_min)
+                        realign_from_overlap = True
+                        new_route_ids = route_list[idx_min:]
+                        bridge_found = True
+                        bridge_len = 0
+                        bridge_reason = f'realign_from_overlap_idx={idx_min} (bad_route_geom)'
+                    else:
+                        bridge_reason = 'overlap_idx=0 (no_realign)'
+                else:
+                    bridge_reason = 'no_overlap_for_realign'
+            except Exception:
+                bridge_reason = 'overlap_realign_exception'
+
+        # (b) Only call BFS when (off_route AND bad_route_geom AND realign failed).
+        # (c) Hard-gate BFS by intersection_pruned==0 (avoid BFS when intersection_pruned>0).
+        need_bridge = bool(route_list) and off_route and bad_route_geom and (not realign_from_overlap)
+        if need_bridge and (intersection_pruned == 0):
+            bfs_called = True
+            bfs_triggered_by = 'off_route_and_bad_route_geom'
+            with _timing_ctx(timing, 'bfs_bridge_route_if_needed'):
+                new_route_ids, bridge_len, bridge_found, ego_rb_bfs, bridge_reason = bfs_bridge_route_if_needed(
+                    map_api,
+                    point,
+                    list(route_list),
+                    intersection_pruned=intersection_pruned,
+                    radius=150,
+                    k_targets=10,
+                    max_depth=80,
+                )
+            # Keep the original ego_rb guess if present; otherwise use BFS-computed ego_rb.
+            if not ego_rb:
+                ego_rb = ego_rb_bfs
+            ego_rb_in_route = bool(ego_rb) and (ego_rb in set([str(x) for x in (route_roadblock_ids or [])]))
+        elif need_bridge and (intersection_pruned != 0):
+            bfs_triggered_by = f'skip_intersection_pruned={intersection_pruned}'
+        elif need_bridge and realign_from_overlap:
+            bfs_triggered_by = 'realign_succeeded'
+        else:
+            if not need_bridge:
+                bfs_triggered_by = 'gate_not_met'
 
     with _timing_ctx(timing, 'extract_route_lanes_new'):
         route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
@@ -1502,6 +1598,16 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
     if timing is not None:
         out['_timing'] = dict(timing)
         # Extra profiling metadata (cheap scalars/strings only).
+        # NOTE: Keep these lightweight (scalars/short strings) so batch export stays cheap.
+        # Extended debugging fields below help diagnose off-route + empty route lane cases.
+        route_prefix10 = [str(x) for x in (route_roadblock_ids or [])[:10]]
+        proximal_rb_count = int(len(proximal_rb_ids)) if proximal_rb_ids is not None else 0
+        proximal_overlap_count = 0
+        try:
+            proximal_overlap_count = int(len(proximal_rb_ids.intersection(route_set))) if proximal_rb_ids is not None else 0
+        except Exception:
+            proximal_overlap_count = 0
+
         out['_profile_flags'] = {
             'need_bridge': bool(need_bridge),
             'bfs_called': bool(bfs_called),
@@ -1521,6 +1627,10 @@ def extract_features(conn, map_api, scenario_token_hex: str, frame_index: int, *
             'route_len_new': int(len(new_route_ids) if new_route_ids else 0),
             'avails_sum_old': int(avails_sum_old),
             'avails_sum_new': int(avails_sum_new),
+            # Extended debug-only fields (EXTRACT_PROFILE=1)
+            'route_prefix10': route_prefix10,
+            'proximal_rb_count': proximal_rb_count,
+            'proximal_overlap_count': proximal_overlap_count,
         }
     return out
 

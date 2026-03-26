@@ -1,4 +1,5 @@
 import numpy as np
+import time
 from collections import deque
 from typing import Dict, Optional, Tuple, Union, List
 
@@ -38,7 +39,10 @@ class BreadthFirstSearchRoadBlock:
         self._target_roadblock_ids: List[str] = None
 
     def search(
-        self, target_roadblock_id: Union[str, List[str]], max_depth: int
+        self,
+        target_roadblock_id: Union[str, List[str]],
+        max_depth: int,
+        max_time_s: Optional[float] = None,
     ) -> Tuple[List[RoadBlockGraphEdgeMapObject], bool]:
         """
         Apply BFS to find route to target roadblock.
@@ -53,6 +57,16 @@ class BreadthFirstSearchRoadBlock:
 
         start_edge = self._queue[0]
 
+        t0 = time.perf_counter()
+        max_time_s_f = None
+        if max_time_s is not None:
+            try:
+                max_time_s_f = float(max_time_s)
+            except Exception:
+                max_time_s_f = None
+            if max_time_s_f is not None and max_time_s_f <= 0:
+                max_time_s_f = None
+
         # Initial search states
         path_found: bool = False
         end_edge: RoadBlockGraphEdgeMapObject = start_edge
@@ -62,6 +76,9 @@ class BreadthFirstSearchRoadBlock:
         self._parent[start_edge.id + f"_{depth}"] = None
 
         while self._queue:
+            if max_time_s_f is not None and (time.perf_counter() - t0) > max_time_s_f:
+                raise TimeoutError("timeout")
+
             current_edge = self._queue.popleft()
 
             # Early exit condition
