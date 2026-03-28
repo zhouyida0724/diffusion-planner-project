@@ -277,13 +277,12 @@ def train_loop(
     loader_it = iter(train_loader)
 
     while step < cfg.steps:
+        step_t0 = time.time()
         try:
             batch = next(loader_it)
         except StopIteration:
             loader_it = iter(train_loader)
             batch = next(loader_it)
-
-        step_t0 = time.time()
 
         x = batch["x"].to(device=device, dtype=torch.float32)
         y = batch["y"].to(device=device, dtype=torch.float32)
@@ -548,13 +547,12 @@ def train_loop_diffusion_eps(
 
     # Main training loop
     while step < cfg.steps:
+        step_t0 = time.time()
         try:
             batch = next(loader_it)
         except StopIteration:
             loader_it = iter(train_loader)
             batch = next(loader_it)
-
-        step_t0 = time.time()
 
         x = batch["x"].to(device=device, dtype=torch.float32)
         y0 = batch["y"].to(device=device, dtype=torch.float32)
