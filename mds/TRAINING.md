@@ -12,8 +12,15 @@
 - [x] Expanded **5.2** into concrete implementation plan (data/model/diffusion/loss/opt/ddp/ckpt + equivalence tests)
 - [x] Added **deployment to nuPlan closed-loop sim** section (planner wrapper + runtime feature extraction reuse + runner + nuboard)
 
+### Training container self-check (done)
+- [x] Verified container launched by `scripts/training_docker_setup.sh run`
+  - GPU visible in container (`nvidia-smi -L` OK)
+  - torch CUDA OK: `torch 2.1.0+cu121`, `cuda_available=True`, `device_count=1`
+  - imports OK: `numpy/torch/tqdm/einops`
+  - data mount readable: `/workspace/exports_local/boston50w_prod/...`
+  - output writable: `/workspace/training_outputs/...`
+
 ### Next executable steps
-- [ ] **Verify training container** from `scripts/training_docker_setup.sh` (GPU/torch/imports/data mounts/write perms) and fix the script if broken
 - [ ] Implement **our** training code **inside this repo** (new clean module + clear docs structure) + equivalence tests vs official
 - [ ] First sanity run: 100–1000 steps, verify no-NaN + throughput + basic qualitative checks
 
