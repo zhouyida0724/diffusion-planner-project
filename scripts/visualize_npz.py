@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Visualize NPZ data as PNG.
+"""Wrapper for backwards-compatible entrypoint.
 
-NOTE: Keep this script as the stable CLI entrypoint.
-Reusable logic lives in `src/platform/viz/npz_viz.py`.
+This file remains at scripts/visualize_npz.py for stable CLI usage.
+Implementation lives in scripts/export/diffusion_planner/viz/visualize_npz.py.
 """
 
-import sys
+from __future__ import annotations
+
+import runpy
 from pathlib import Path
 
 
-# Ensure project root is importable when running as `python scripts/visualize_npz.py ...`.
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+def main() -> None:
+    target = (
+        Path(__file__).resolve().parent
+        / "export"
+        / "diffusion_planner"
+        / "viz"
+        / "visualize_npz.py"
+    )
+    runpy.run_path(str(target), run_name="__main__")
 
-from src.platform.viz.npz_viz import visualize_npz  # noqa: E402
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python visualize_npz.py <input.npz> [output.png]")
-        sys.exit(1)
-    
-    npz_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else None
-    visualize_npz(npz_path, output_path)
+if __name__ == "__main__":
+    main()

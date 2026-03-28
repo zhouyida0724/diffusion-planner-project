@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[4]
 
     candidates = sorted(repo_root.glob("validation_output2/boston50w_viz_50_*/slice*/single_npz/*.npz"))
     if not candidates:

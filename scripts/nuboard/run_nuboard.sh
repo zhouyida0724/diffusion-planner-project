@@ -6,8 +6,8 @@ set -euo pipefail
 # Defaults to the latest simulation output under outputs/sim/exp/simulation/**/<timestamp>/
 # and starts nuBoard with simulation_path=[<that_dir>].
 #
-# This script is a thin wrapper around scripts/run_nuboard_outputs.sh.
-# The previous behavior is preserved in scripts/run_nuboard_legacy.sh.
+# This script is a thin wrapper around scripts/nuboard/run_nuboard_outputs.sh.
+# The previous behavior is preserved in scripts/nuboard/run_nuboard_legacy.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

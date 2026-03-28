@@ -27,13 +27,13 @@ sys.modules.setdefault("pytest", types.ModuleType("pytest"))
 
 # Import the refactored extractor as a plain module.
 _THIS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_THIS_DIR / "extract_single_frame"))
+sys.path.insert(0, str(_THIS_DIR.parent / "extract" / "extract_single_frame"))
 import extract_single_frame as esf  # noqa: E402
 
 from nuplan.common.maps.nuplan_map.map_factory import get_maps_api  # noqa: E402
 
 
-REPO_ROOT = _THIS_DIR.parent
+REPO_ROOT = _THIS_DIR.parents[3]
 DEFAULT_MANIFEST = REPO_ROOT / "validation_output" / "bfsfix_manifest_5.json"
 DEFAULT_MAP_ROOT = REPO_ROOT / "data" / "nuplan" / "maps"
 DEFAULT_MAP_VERSION = "9.12.1817"
