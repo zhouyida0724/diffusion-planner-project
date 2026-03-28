@@ -57,11 +57,16 @@
 - **Slice02 (N=12)**: `exports_local/boston50w_prod/slice02_N12_20260326_105143/` (exports/ is root-owned)
   - planned=100000, kept=83379, hard_skipped=16621
   - elapsed_max≈3229s, fps_kept≈25.82, size≈5.5G
+- **Slice03 (N=12)**: `exports_local/boston50w_prod/slice03_N12_20260326_115618/`
+  - planned=100000, kept=78522, hard_skipped=21478
+  - timeout=5, bfs_timeout=0
+  - elapsed_max≈3336s, fps_kept≈23.54, size≈5.2G
+- **Slice04**: previously started then stopped; partial dir may exist (`exports_local/boston50w_prod/slice04_N12_20260326_131020/`, no metrics). Needs clean restart.
 
 ### Ops note
 - `exports/` directory is currently root-owned (not writable by uid=1000 container runs). Using `exports_local/` until permissions are normalized.
 
 ### Next
-- Continue slices 03–05 with N=12 if resources remain stable.
+- Restart **slice04** (delete partial outputs first), then run slice05.
 - Normalize output directory permissions (`exports/` vs `exports_local/`) and standardize run metadata.
 - (Optional) Add a cheap deterministic route realignment (not BFS) to reduce empty-route rate, then re-evaluate whether BFS can be made truly rare.
