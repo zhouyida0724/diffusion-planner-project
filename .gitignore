@@ -29,6 +29,11 @@ benchmarks/
 validation_output/
 validation_output2/
 
+# Unified outputs (generated)
+outputs/
+!outputs/
+!outputs/README.md
+
 # Local scratch / debug artifacts
 scripts/extract_single_frame/_tmp_*.py
 scripts/extract_single_frame/*.bak*
