@@ -118,11 +118,21 @@ nuBoard will be available at: **http://localhost:5007**
 # Override port
 ../scripts/run_nuboard.sh 5010
 
-# Use a specific simulation output directory (relative to /workspace)
+# Use a specific simulation output directory (relative to repo root)
 ../scripts/run_nuboard.sh outputs/sim/exp/simulation/closed_loop_nonreactive_agents/2026.03.28.17.17.40
 
 # Port + specific directory
 ../scripts/run_nuboard.sh 5010 outputs/sim/exp/simulation/closed_loop_nonreactive_agents/2026.03.28.17.17.40
+```
+
+### Data root override (if your container uses a different nuPlan cache)
+
+`run_nuboard.sh` defaults to:
+- `NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini`
+
+Override it like:
+```bash
+NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini ../scripts/run_nuboard.sh
 ```
 
 ### Viewing Results
