@@ -124,15 +124,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def _discover_slice_dirs(dataset_root: Path) -> list[Path]:
-    """Heuristic: treat a root as a dataset root if it contains slice subdirs with shards/."""
+    """Heuristic: treat a root as a dataset root if it contains slice subdirs with shards/.
+
+    We only include slices that appear to contain at least one valid shard.
+    """
 
     if not dataset_root.is_dir():
         return []
 
     slice_dirs: list[Path] = []
     for p in sorted(dataset_root.iterdir()):
-        if p.is_dir() and (p / "shards").is_dir():
+        if not (p.is_dir() and (p / "shards").is_dir()):
+            continue
+
+        shards_root = p / "shards"
+        has_any = False
+        for sd in shards_root.glob("shard_*"):
+            if (sd / "data.npz").is_file() and (sd / "manifest.jsonl").is_file():
+                has_any = True
+                break
+
+        if has_any:
             slice_dirs.append(p)
+
     return slice_dirs
 
 
