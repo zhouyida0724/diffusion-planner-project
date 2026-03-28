@@ -42,6 +42,7 @@ class ShardStats:
     hard_skipped: int = 0
     kept: int = 0
     soft_flag_counts: Dict[str, int] = field(default_factory=dict)
+    tag_counts: Dict[str, int] = field(default_factory=dict)
 
     @property
     def hard_skip_ratio(self) -> float:
@@ -99,14 +100,36 @@ def _scan_manifest(manifest_path: Path) -> ShardStats:
                         continue
                     st.soft_flag_counts[str(flg)] = st.soft_flag_counts.get(str(flg), 0) + 1
 
+            tags = obj.get("tags", None)
+            if isinstance(tags, list):
+                for tg in tags:
+                    if not tg:
+                        continue
+                    st.tag_counts[str(tg)] = st.tag_counts.get(str(tg), 0) + 1
+
     return st
+
+
+def _expand_prod_root_if_needed(root: Path) -> List[Path]:
+    """If `root` looks like a prod root containing slice* dirs, expand to those slices."""
+    if not root.is_dir():
+        return [root]
+    slice_dirs = sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("slice")])
+    # Only treat as prod root if it has slice dirs and doesn't itself look like a shard/shards dir.
+    if slice_dirs and not (root / "manifest.jsonl").exists() and not (root / "data.npz").exists():
+        return slice_dirs
+    return [root]
 
 
 def scan_roots(roots: List[Path], *, repo_root: Path) -> DatasetScanStats:
     by_shard: Dict[str, ShardStats] = {}
     totals = ShardStats()
 
+    expanded: List[Path] = []
     for r in roots:
+        expanded.extend(_expand_prod_root_if_needed(r))
+
+    for r in expanded:
         for shard_dir in _iter_shard_dirs(r):
             manifest = shard_dir / "manifest.jsonl"
             if not manifest.exists():
@@ -120,6 +143,8 @@ def scan_roots(roots: List[Path], *, repo_root: Path) -> DatasetScanStats:
             totals.kept += st.kept
             for k, v in st.soft_flag_counts.items():
                 totals.soft_flag_counts[k] = totals.soft_flag_counts.get(k, 0) + int(v)
+            for k, v in st.tag_counts.items():
+                totals.tag_counts[k] = totals.tag_counts.get(k, 0) + int(v)
 
     return DatasetScanStats(totals=totals, by_shard=by_shard)
 
@@ -163,6 +188,12 @@ def main() -> None:
     if total.soft_flag_counts:
         print("--- soft flags (total) ---")
         for k, v in sorted(total.soft_flag_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"{k}: {v}")
+
+    if total.tag_counts:
+        print("--- scenario tags (total, top 30) ---")
+        items = sorted(total.tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:30]
+        for k, v in items:
             print(f"{k}: {v}")
 
     print("--- per-shard ---")
