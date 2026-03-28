@@ -152,8 +152,10 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         ckpt_path: str,
         past_trajectory_sampling: TrajectorySampling,
         future_trajectory_sampling: TrajectorySampling,
+        config: object | None = None,  # accepted for hydra compatibility (unused)
         device: str = "cpu",
-        enable_ema: bool = True,  # kept for hydra compatibility; unused in skeleton
+        enable_ema: bool = True,  # accepted for hydra compatibility (unused)
+        **_: object,
     ):
         self._ckpt_path = str(ckpt_path)
         self._past_trajectory_sampling = past_trajectory_sampling
