@@ -24,6 +24,8 @@ data_process/scenarios_distribution.json
 # Plans / exports / validation artifacts (generated)
 plans/
 exports/
+exports_local/
+benchmarks/
 validation_output/
 validation_output2/
 

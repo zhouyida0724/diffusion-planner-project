@@ -14,6 +14,11 @@ Soft flag:
 Notes:
 - Reuses map_api (one per run, since v0.1 uses single location).
 - Disables per-frame debug logging inside extract_features to avoid massive I/O.
+
+Scheduling:
+- Default (--schedule=plan) processes samples in plan file order within this shard.
+- Locality-aware (--schedule=db_grouped) groups samples by db_path (deterministic: db_path sorted) to reduce
+  cross-DB random access / connection switching, while preserving modulo sharding (plan_row_idx % num_shards).
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ import sqlite3
 import importlib.util
 
 _esf_path = "/workspace/scripts/extract_single_frame/extract_single_frame.py"
+if not os.path.exists(_esf_path):
+    # Host/dev fallback: resolve relative to this file.
+    _esf_path = str((Path(__file__).resolve().parent / "extract_single_frame" / "extract_single_frame.py").resolve())
+
 _spec = importlib.util.spec_from_file_location("extract_single_frame", _esf_path)
 if _spec is None or _spec.loader is None:
     raise RuntimeError(f"Failed to load extractor from {_esf_path}")
@@ -85,6 +94,55 @@ def route_min_dist_m(route_lanes: np.ndarray, route_avails: np.ndarray) -> float
     return float(d.min())
 
 
+def _summarize_durations(values: list[float]) -> dict:
+    """Return summary stats for a list of durations (seconds)."""
+    if not values:
+        return {
+            'count': 0,
+            'mean': None,
+            'p50': None,
+            'p90': None,
+            'p99': None,
+            'max': None,
+        }
+    a = np.asarray(values, dtype=np.float64)
+    return {
+        'count': int(a.size),
+        'mean': float(a.mean()),
+        'p50': float(np.percentile(a, 50)),
+        'p90': float(np.percentile(a, 90)),
+        'p99': float(np.percentile(a, 99)),
+        'max': float(a.max()),
+    }
+
+
+def _bucketize(values: list[float], *, bins: list[float]) -> dict:
+    """Simple fixed-bin histogram.
+
+    Returns dict with keys like '<=b0', '(b0,b1]', ..., '>last'.
+    """
+    out = Counter()
+    for v in values:
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        placed = False
+        prev = None
+        for b in bins:
+            if x <= b:
+                if prev is None:
+                    out[f'<= {b}'] += 1
+                else:
+                    out[f'({prev}, {b}]'] += 1
+                placed = True
+                break
+            prev = b
+        if not placed:
+            out[f'> {bins[-1]}'] += 1
+    return dict(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", type=str, required=True, help="Path to plan directory containing index.jsonl")
@@ -94,6 +152,17 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="Optional: only process first N lines")
     ap.add_argument("--num-shards", type=int, default=1, help="Total shards for modulo sharding")
     ap.add_argument("--shard-id", type=int, default=0, help="This shard id in [0, num_shards)")
+    ap.add_argument(
+        "--schedule",
+        type=str,
+        default="plan",
+        choices=["plan", "db_grouped"],
+        help=(
+            "Processing order within this shard. "
+            "'plan' preserves plan file order; 'db_grouped' groups by db_path (deterministic, sorted by db_path) "
+            "to reduce cross-DB random access."
+        ),
+    )
     args = ap.parse_args()
 
     if args.num_shards < 1:
@@ -164,6 +233,9 @@ def main() -> int:
 
     hard_skip = 0
     timeout_count = 0
+    bfs_timeout_count = 0
+    hard_skip_reasons = Counter()
+
     soft_flag_far = 0
     soft_flag_counts = Counter()
 
@@ -173,15 +245,44 @@ def main() -> int:
     t_manifest_total = 0.0
     t_append_total = 0.0
 
+    # Optional per-submethod timings from extractor (EXTRACT_PROFILE=1)
+    # key -> list of durations (seconds)
+    extract_profile: dict[str, list[float]] = {}
+    extract_profile_total: list[float] = []
+
+    # Optional profiling flags from extractor (EXTRACT_PROFILE=1)
+    flags_need_bridge = Counter()
+    flags_bfs_called = Counter()
+    flags_bridge_found = Counter()
+    flags_bridge_reason = Counter()
+    flags_intersection_pruned: list[int] = []
+    flags_rmin_old_m: list[float] = []
+
+    # Correlate BFS timing with bfs_called.
+    bfs_time_called: list[float] = []
+    bfs_time_not_called: list[float] = []
+
     t0 = time.time()
     t_prep_s = time.time() - t_prog0
 
-    # Group by db_path to reuse sqlite connection
+    # ---- Step: Choose processing order within shard ----
+    # NOTE: Regardless of schedule, shard membership is defined solely by plan_row_idx % num_shards.
+    # We keep plan_row_idx in manifest for auditability and for no-overlap/no-missing checks.
     by_db: dict[str, list[dict]] = {}
     for r in records:
         by_db.setdefault(r["db_path"], []).append(r)
 
-    # Keep stable order: iterate records list but reuse connection cache
+    if args.schedule == "plan":
+        iter_records = records
+    elif args.schedule == "db_grouped":
+        # Deterministic grouping: process dbs in sorted(db_path) order; within each db keep plan order.
+        iter_records = []
+        for db_path in sorted(by_db.keys()):
+            iter_records.extend(by_db[db_path])
+    else:
+        raise ValueError(f"Unknown --schedule={args.schedule}")
+
+    # Reuse sqlite connections per db_path
     con_cache: dict[str, sqlite3.Connection] = {}
 
     def get_con(db_path: str) -> sqlite3.Connection:
@@ -190,13 +291,14 @@ def main() -> int:
         return con_cache[db_path]
 
     with open(manifest_path, "w", encoding="utf-8") as mf:
-        for idx, r in enumerate(records):
+        for idx, r in enumerate(iter_records):
             db_path = r["db_path"]
             scene = r["scene_token_hex"]
             frame = int(r["frame_index"])
             sample_id = r.get("sample_id", f"{Path(db_path).name}:{scene}:{frame}")
 
             qc_flags: list[str] = []
+            pf_for_manifest: dict | None = None
 
             try:
                 con = get_con(db_path)
@@ -224,6 +326,104 @@ def main() -> int:
                     signal.signal(signal.SIGALRM, old_handler)
                 t_ex = time.time() - t_ex0
                 t_extract_total += t_ex
+
+                # Optional: aggregate per-submethod timings produced by extractor.
+                # Must not affect REQUIRED_KEYS / npz buffers.
+                sample_timing = None
+                if isinstance(feats, dict) and '_timing' in feats:
+                    try:
+                        sample_timing = feats.pop('_timing')
+                        if isinstance(sample_timing, dict):
+                            total_s = 0.0
+                            for k, v in sample_timing.items():
+                                try:
+                                    fv = float(v)
+                                    extract_profile.setdefault(str(k), []).append(fv)
+                                    total_s += fv
+                                except Exception:
+                                    continue
+                            extract_profile_total.append(float(total_s))
+                    except Exception:
+                        # Never fail the export due to profiling metadata.
+                        sample_timing = None
+
+                # Optional: aggregate per-sample BFS trigger flags produced by extractor.
+                if isinstance(feats, dict) and '_profile_flags' in feats:
+                    try:
+                        pf = feats.pop('_profile_flags')
+                        if isinstance(pf, dict):
+                            # Keep a compact subset in manifest for sampling/visualization/debug.
+                            pf_for_manifest = {
+                                k: pf.get(k)
+                                for k in [
+                                    'need_bridge',
+                                    'bfs_called',
+                                    'bfs_triggered_by',
+                                    'bridge_found',
+                                    'bridge_len',
+                                    'bridge_reason',
+                                    'intersection_pruned',
+                                    'ego_rb',
+                                    'ego_rb_in_route',
+                                    'off_route',
+                                    'bad_route_geom',
+                                    'rmin_old_m',
+                                    'realign_from_overlap',
+                                    'overlap_idx',
+                                    'route_len_old',
+                                    'route_len_new',
+                                    'avails_sum_old',
+                                    'avails_sum_new',
+                                ]
+                                if k in pf
+                            }
+
+                            nb = bool(pf.get('need_bridge', False))
+                            bc = bool(pf.get('bfs_called', False))
+                            bf = bool(pf.get('bridge_found', False))
+                            br = str(pf.get('bridge_reason', ''))
+                            ip = pf.get('intersection_pruned', None)
+                            rm = pf.get('rmin_old_m', None)
+
+                            flags_need_bridge[nb] += 1
+                            flags_bfs_called[bc] += 1
+                            flags_bridge_found[bf] += 1
+                            if br:
+                                flags_bridge_reason[br] += 1
+
+                            try:
+                                if ip is not None:
+                                    flags_intersection_pruned.append(int(ip))
+                            except Exception:
+                                pass
+                            try:
+                                if rm is not None:
+                                    flags_rmin_old_m.append(float(rm))
+                            except Exception:
+                                pass
+
+                            # Correlate BFS timing (only meaningful when bfs_called=True)
+                            # Treat BFS time as 0.0 when bfs is not called (key absent).
+                            bfs_dt = 0.0
+                            if isinstance(sample_timing, dict):
+                                try:
+                                    bfs_dt = float(sample_timing.get('bfs_bridge_route_if_needed', 0.0) or 0.0)
+                                except Exception:
+                                    bfs_dt = 0.0
+                            if bc:
+                                bfs_time_called.append(float(bfs_dt))
+                            else:
+                                bfs_time_not_called.append(float(bfs_dt))
+                    except Exception:
+                        pass
+
+                # Hard-skip: BFS wall-clock timeout (controlled by BFS_MAX_TIME_S).
+                # Exporter policy: treat this as a hard failure (do not keep sample) so downstream training doesn't
+                # silently include broken routing.
+                if pf_for_manifest is not None:
+                    br = str(pf_for_manifest.get('bridge_reason', '') or '')
+                    if br.startswith('bfs_exception: timeout'):
+                        raise RuntimeError('bfs_timeout')
 
                 # ---- Step: sanity checks + QC ----
                 t_qc0 = time.time()
@@ -275,6 +475,7 @@ def main() -> int:
                             "route_lanes_avails_sum": route_av_sum,
                             "lanes_avails_sum": lanes_av_sum,
                             "route_min_dist_m": rmin,
+                            "_profile_flags": pf_for_manifest,
                         },
                         ensure_ascii=False,
                     )
@@ -285,6 +486,7 @@ def main() -> int:
             except _Timeout:
                 hard_skip += 1
                 timeout_count += 1
+                hard_skip_reasons['timeout'] += 1
                 mf.write(
                     json.dumps(
                         {
@@ -301,6 +503,18 @@ def main() -> int:
 
             except Exception as e:
                 hard_skip += 1
+                err = str(e)
+                # Classify common hard-skip reasons for metrics.
+                if err == 'bfs_timeout':
+                    bfs_timeout_count += 1
+                    hard_skip_reasons['bfs_timeout'] += 1
+                elif err == 'route_lanes_avails_sum==0':
+                    hard_skip_reasons['route_lanes_avails_sum==0'] += 1
+                elif err == 'lanes_avails_sum==0':
+                    hard_skip_reasons['lanes_avails_sum==0'] += 1
+                else:
+                    hard_skip_reasons[err] += 1
+
                 mf.write(
                     json.dumps(
                         {
@@ -308,7 +522,7 @@ def main() -> int:
                             "sample_id": sample_id,
                             "t": None,
                             "qc_hard_skip": True,
-                            "qc_error": str(e),
+                            "qc_error": err,
                         },
                         ensure_ascii=False,
                     )
@@ -318,7 +532,7 @@ def main() -> int:
             if (idx + 1) % 500 == 0:
                 dt_s = time.time() - t0
                 fps = (idx + 1) / max(dt_s, 1e-9)
-                print(f"[{idx+1}/{len(records)}] processed; kept={len(kept_meta)} skip={hard_skip} fps={fps:.2f}", file=sys.stderr, flush=True)
+                print(f"[{idx+1}/{len(iter_records)}] processed; kept={len(kept_meta)} skip={hard_skip} fps={fps:.2f}", file=sys.stderr, flush=True)
 
     # Close DB connections
     for con in con_cache.values():
@@ -356,9 +570,12 @@ def main() -> int:
         "num_shards": int(args.num_shards),
         "shard_id": int(args.shard_id),
         "planned": len(records),
+        "schedule": str(args.schedule),
         "kept": kept_n,
         "hard_skipped": hard_skip,
         "timeout_count": timeout_count,
+        "bfs_timeout_count": bfs_timeout_count,
+        "hard_skip_reasons": dict(hard_skip_reasons),
         "soft_flag_counts": dict(soft_flag_counts),
         "elapsed_s": elapsed,
         "fps_kept": kept_n / max(elapsed, 1e-9),
@@ -367,6 +584,33 @@ def main() -> int:
         "npz_path": str(npz_path),
         "npz_size_bytes": int(npz_path.stat().st_size),
         "manifest_path": str(manifest_path),
+
+        # Alias for convenience (same as timing_s.extract_total_s)
+        "total_extract_s": float(t_extract_total),
+
+        # Optional per-submethod timing profile (present only when EXTRACT_PROFILE=1)
+        "extract_profile": {
+            "by_step_s": {k: _summarize_durations(v) for k, v in sorted(extract_profile.items())},
+            "total_per_sample_s": _summarize_durations(extract_profile_total),
+            "flags": {
+                "need_bridge": {str(k): int(v) for k, v in flags_need_bridge.items()},
+                "bfs_called": {str(k): int(v) for k, v in flags_bfs_called.items()},
+                "bridge_found": {str(k): int(v) for k, v in flags_bridge_found.items()},
+                "bridge_reason": dict(flags_bridge_reason),
+                "intersection_pruned": {
+                    "summary": _summarize_durations([float(x) for x in flags_intersection_pruned]),
+                    "buckets": _bucketize([float(x) for x in flags_intersection_pruned], bins=[0, 1, 2, 5, 10, 20]),
+                },
+                "rmin_old_m": {
+                    "summary": _summarize_durations([float(x) for x in flags_rmin_old_m]),
+                    "buckets": _bucketize([float(x) for x in flags_rmin_old_m], bins=[0, 1, 2, 5, 10, 20, 30, 50]),
+                },
+                "bfs_time_s": {
+                    "called": _summarize_durations(bfs_time_called),
+                    "not_called": _summarize_durations(bfs_time_not_called),
+                },
+            },
+        },
 
         "timing_s": {
             "prep_total_s": float(t_prep_s),
@@ -407,6 +651,7 @@ def main() -> int:
         "env": {
             "EXTRACT_LOG_STYLE": os.environ.get('EXTRACT_LOG_STYLE', ''),
             "EXTRACT_WARN_PRINT_N": os.environ.get('EXTRACT_WARN_PRINT_N', ''),
+            "EXPORT_SCHEDULE": os.environ.get('EXPORT_SCHEDULE', ''),
         },
         "plan_dir": str(plan_dir),
         "out_dir": str(out_dir),

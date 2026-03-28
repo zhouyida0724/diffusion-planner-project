@@ -325,12 +325,12 @@ def main() -> None:
 
     # Write cfg
     cfg = {
-        "seed": SEED,
+        "seed": int(args.seed),
         "location": location,
         "n_scenes": n_scenes,
         "stride": stride,
         "cap_per_scene": cap_per_scene,
-        "poses_prefix_limit": POSES_PREFIX_LIMIT,
+        "poses_prefix_limit": poses_prefix_limit,
     }
     with open(cfg_path, "w", encoding="utf-8") as f:
         for k, v in cfg.items():
@@ -343,7 +343,7 @@ def main() -> None:
         "scenes_selected": n_scenes,
         "stride": stride,
         "cap_per_scene": cap_per_scene,
-        "poses_prefix_limit": POSES_PREFIX_LIMIT,
+        "poses_prefix_limit": poses_prefix_limit,
         "produced_samples": produced,
     }
     with open(stats_path, "w", encoding="utf-8") as f:

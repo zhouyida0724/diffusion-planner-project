@@ -13,6 +13,13 @@ echo "OUT_ROOT=$OUT_ROOT"
 echo "LIMIT=$LIMIT"
 echo "NUM_SHARDS=$NUM_SHARDS"
 
+# Optional: locality-aware scheduling within each shard.
+# Set EXPORT_SCHEDULE=db_grouped to group samples by db_path (deterministic) to reduce cross-DB random access.
+EXPORT_SCHEDULE=${EXPORT_SCHEDULE:-}
+if [[ -n "$EXPORT_SCHEDULE" ]]; then
+  echo "EXPORT_SCHEDULE=$EXPORT_SCHEDULE"
+fi
+
 for ((SID=0; SID<NUM_SHARDS; SID++)); do
   OUT_DIR="$OUT_ROOT/shard_$(printf '%03d' $SID)"
   mkdir -p "$OUT_DIR"
@@ -26,6 +33,7 @@ for ((SID=0; SID<NUM_SHARDS; SID++)); do
         --limit "$LIMIT" \
         --num-shards "$NUM_SHARDS" \
         --shard-id "$SID" \
+        ${EXPORT_SCHEDULE:+--schedule "$EXPORT_SCHEDULE"} \
         2> "$OUT_DIR/run.stderr.log"
   ) &
 done
