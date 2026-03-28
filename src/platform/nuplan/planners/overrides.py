@@ -10,7 +10,7 @@ from typing import List, Optional
 class PlannerOverrides:
     """Hydra override args for selecting/configuring a planner."""
 
-    # E.g. ["planner=idm_planner"] or ["planner=diffusion_planner", "+diffusion_planner.ckpt_path=/path"]
+    # E.g. ["planner=idm_planner"] or ["planner=diffusion_planner", "diffusion_planner.ckpt_path=/path"]
     args: List[str]
 
 
@@ -21,5 +21,7 @@ def idm_planner_overrides() -> PlannerOverrides:
 def diffusion_planner_overrides(ckpt_path: Optional[str] = None) -> PlannerOverrides:
     args: List[str] = ["planner=diffusion_planner"]
     if ckpt_path:
-        args.append(f"+diffusion_planner.ckpt_path={ckpt_path}")
+        # nuPlan composes planner configs under the `planner` root key.
+        # The diffusion planner config lives at `planner.diffusion_planner.ckpt_path`.
+        args.append(f"planner.diffusion_planner.ckpt_path={ckpt_path}")
     return PlannerOverrides(args=args)

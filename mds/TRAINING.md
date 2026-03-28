@@ -198,22 +198,34 @@ exports_local/boston50w_prod/sliceXX_N12_<ts>/
 - 强制断言：每个字段 shape 与训练一致（避免 silent mismatch）。
 
 ### 6.4 Planner 适配（nuPlan closed-loop）
-实现/注册一个 nuPlan planner（以 nuPlan devkit 的 planner API 为准）：
-- `initialize(...)`
-- `compute_trajectory(observation, map_api, route, ...) -> Trajectory`
-
-`compute_trajectory` 内部步骤：
-1) 从 observation/map/route 提取 features（复用 extract_features）
-2) policy.sample 生成未来轨迹
-3) 转成 nuPlan 的 `Trajectory` 类型返回（包含时间步与姿态）
+本仓库的 `planner=diffusion_planner`（Hydra）入口仍然保持不变：
+- `_target_ = nuplan.diffusion_planner.planner.DiffusionPlanner`
+- 运行时根据 checkpoint **自动识别格式**：
+  - 若 ckpt 包含 `model_state`（我们的 training skeleton, `checkpoint_*.pt`），则加载 `SimpleFutureMLP` 并用最小特征提取（`ego_current_state + ego_past`）推理
+  - 否则走 legacy diffusion 模型路径
+  - 任一路径失败会 fallback 到 constant-velocity 轨迹（并打印明确 warning），避免 silent crash
 
 ### 6.5 Runner（跑仿真 + nuboard）
-- 提供一个 runner 脚本（bash/python），参数至少包含：
-  - checkpoint 路径
-  - 场景集合（val set）
-  - 仿真 horizon/step
-  - 输出目录
-- 产物：仿真 metrics + 可用 nuboard 回放。
+我们提供了 runner 脚本：
+- `scripts/sim/run_diffusion_simulation.py`
+
+最小用法（在 **nuplan-simulation 容器** 内）：
+```bash
+# 5-scenario smoke test
+python3 scripts/sim/run_diffusion_simulation.py \
+  --num 5 \
+  --planner diffusion_planner \
+  --ckpt outputs/training/<exp_name>/checkpoint_latest.pt
+
+# 指定单个 scenario token
+python3 scripts/sim/run_diffusion_simulation.py \
+  --scenario <scenario_token> \
+  --ckpt outputs/training/<exp_name>/checkpoint_step_000200.pt
+```
+
+Nuboard：
+- 仿真输出默认写到 `$NUPLAN_EXP_ROOT`（nuPlan 默认 exp 目录）
+- 可用 `scripts/run_nuboard.py` 或 `scripts/nuboard/run_nuboard_outputs.sh` 打开回放（按仓库现有脚本为准）
 
 ### 6.6 部署后最小验收
 - 单场景跑通不 crash
