@@ -32,8 +32,37 @@ import warnings
 from collections import Counter
 from pathlib import Path
 
+# NOTE: This repo has a top-level package named `platform` which would shadow
+# Python's stdlib `platform` module if we put `src/` on sys.path.
+# To avoid breaking dependencies (e.g., pandas), we load our reusable IO helpers
+# by file path.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 import numpy as np
 import sqlite3
+
+import importlib.util as _importlib_util
+
+def _load_helper(module_name: str, path: Path):
+    spec = _importlib_util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module {module_name} from {path}")
+    mod = _importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+_io_dir = _REPO_ROOT / "src" / "platform" / "io"
+_manifest = _load_helper("_export_io_manifest", _io_dir / "manifest.py")
+_metrics = _load_helper("_export_io_metrics", _io_dir / "metrics.py")
+_npz = _load_helper("_export_io_npz_writer", _io_dir / "npz_writer.py")
+_qc = _load_helper("_export_io_qc", _io_dir / "qc.py")
+
+write_jsonl_line = _manifest.write_jsonl_line
+bucketize = _metrics.bucketize
+summarize_durations = _metrics.summarize_durations
+save_npz_compressed = _npz.save_npz_compressed
+is_finite = _qc.is_finite
+route_min_dist_m = _qc.route_min_dist_m
 
 # Import the refactored extractor by path (container may not treat /workspace/scripts as a package).
 import importlib.util
@@ -74,73 +103,6 @@ def ro_connect(db_path: str) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     return con
 
-
-def is_finite(arr: np.ndarray) -> bool:
-    if np.issubdtype(arr.dtype, np.floating):
-        return bool(np.isfinite(arr).all())
-    return True
-
-
-def route_min_dist_m(route_lanes: np.ndarray, route_avails: np.ndarray) -> float | None:
-    # route_lanes: (25,20,12), avails: (25,20)
-    mask = route_avails > 0
-    if not np.any(mask):
-        return None
-    xs = route_lanes[:, :, 0][mask]
-    ys = route_lanes[:, :, 1][mask]
-    d = np.sqrt(xs * xs + ys * ys)
-    if d.size == 0:
-        return None
-    return float(d.min())
-
-
-def _summarize_durations(values: list[float]) -> dict:
-    """Return summary stats for a list of durations (seconds)."""
-    if not values:
-        return {
-            'count': 0,
-            'mean': None,
-            'p50': None,
-            'p90': None,
-            'p99': None,
-            'max': None,
-        }
-    a = np.asarray(values, dtype=np.float64)
-    return {
-        'count': int(a.size),
-        'mean': float(a.mean()),
-        'p50': float(np.percentile(a, 50)),
-        'p90': float(np.percentile(a, 90)),
-        'p99': float(np.percentile(a, 99)),
-        'max': float(a.max()),
-    }
-
-
-def _bucketize(values: list[float], *, bins: list[float]) -> dict:
-    """Simple fixed-bin histogram.
-
-    Returns dict with keys like '<=b0', '(b0,b1]', ..., '>last'.
-    """
-    out = Counter()
-    for v in values:
-        try:
-            x = float(v)
-        except Exception:
-            continue
-        placed = False
-        prev = None
-        for b in bins:
-            if x <= b:
-                if prev is None:
-                    out[f'<= {b}'] += 1
-                else:
-                    out[f'({prev}, {b}]'] += 1
-                placed = True
-                break
-            prev = b
-        if not placed:
-            out[f'> {bins[-1]}'] += 1
-    return dict(out)
 
 
 def main() -> int:
@@ -464,22 +426,19 @@ def main() -> int:
 
                 # ---- Step: write manifest ----
                 t_mf0 = time.time()
-                mf.write(
-                    json.dumps(
-                        {
-                            **r,
-                            "sample_id": sample_id,
-                            "t": int(shard_t),
-                            "qc_hard_skip": False,
-                            "qc_flags": qc_flags,
-                            "route_lanes_avails_sum": route_av_sum,
-                            "lanes_avails_sum": lanes_av_sum,
-                            "route_min_dist_m": rmin,
-                            "_profile_flags": pf_for_manifest,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+                write_jsonl_line(
+                    mf,
+                    {
+                        **r,
+                        "sample_id": sample_id,
+                        "t": int(shard_t),
+                        "qc_hard_skip": False,
+                        "qc_flags": qc_flags,
+                        "route_lanes_avails_sum": route_av_sum,
+                        "lanes_avails_sum": lanes_av_sum,
+                        "route_min_dist_m": rmin,
+                        "_profile_flags": pf_for_manifest,
+                    },
                 )
                 t_manifest_total += (time.time() - t_mf0)
 
@@ -487,18 +446,15 @@ def main() -> int:
                 hard_skip += 1
                 timeout_count += 1
                 hard_skip_reasons['timeout'] += 1
-                mf.write(
-                    json.dumps(
-                        {
-                            **r,
-                            "sample_id": sample_id,
-                            "t": None,
-                            "qc_hard_skip": True,
-                            "qc_error": "timeout",
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+                write_jsonl_line(
+                    mf,
+                    {
+                        **r,
+                        "sample_id": sample_id,
+                        "t": None,
+                        "qc_hard_skip": True,
+                        "qc_error": "timeout",
+                    },
                 )
 
             except Exception as e:
@@ -515,18 +471,15 @@ def main() -> int:
                 else:
                     hard_skip_reasons[err] += 1
 
-                mf.write(
-                    json.dumps(
-                        {
-                            **r,
-                            "sample_id": sample_id,
-                            "t": None,
-                            "qc_hard_skip": True,
-                            "qc_error": err,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+                write_jsonl_line(
+                    mf,
+                    {
+                        **r,
+                        "sample_id": sample_id,
+                        "t": None,
+                        "qc_hard_skip": True,
+                        "qc_error": err,
+                    },
                 )
 
             if (idx + 1) % 500 == 0:
@@ -551,7 +504,7 @@ def main() -> int:
     t_stack_s = time.time() - t_stack0
 
     t_npz0 = time.time()
-    np.savez_compressed(npz_path, **stacked)
+    save_npz_compressed(npz_path, stacked)
     t_npz_save_s = time.time() - t_npz0
 
     elapsed = time.time() - t0
@@ -590,24 +543,24 @@ def main() -> int:
 
         # Optional per-submethod timing profile (present only when EXTRACT_PROFILE=1)
         "extract_profile": {
-            "by_step_s": {k: _summarize_durations(v) for k, v in sorted(extract_profile.items())},
-            "total_per_sample_s": _summarize_durations(extract_profile_total),
+            "by_step_s": {k: summarize_durations(v) for k, v in sorted(extract_profile.items())},
+            "total_per_sample_s": summarize_durations(extract_profile_total),
             "flags": {
                 "need_bridge": {str(k): int(v) for k, v in flags_need_bridge.items()},
                 "bfs_called": {str(k): int(v) for k, v in flags_bfs_called.items()},
                 "bridge_found": {str(k): int(v) for k, v in flags_bridge_found.items()},
                 "bridge_reason": dict(flags_bridge_reason),
                 "intersection_pruned": {
-                    "summary": _summarize_durations([float(x) for x in flags_intersection_pruned]),
-                    "buckets": _bucketize([float(x) for x in flags_intersection_pruned], bins=[0, 1, 2, 5, 10, 20]),
+                    "summary": summarize_durations([float(x) for x in flags_intersection_pruned]),
+                    "buckets": bucketize([float(x) for x in flags_intersection_pruned], bins=[0, 1, 2, 5, 10, 20]),
                 },
                 "rmin_old_m": {
-                    "summary": _summarize_durations([float(x) for x in flags_rmin_old_m]),
-                    "buckets": _bucketize([float(x) for x in flags_rmin_old_m], bins=[0, 1, 2, 5, 10, 20, 30, 50]),
+                    "summary": summarize_durations([float(x) for x in flags_rmin_old_m]),
+                    "buckets": bucketize([float(x) for x in flags_rmin_old_m], bins=[0, 1, 2, 5, 10, 20, 30, 50]),
                 },
                 "bfs_time_s": {
-                    "called": _summarize_durations(bfs_time_called),
-                    "not_called": _summarize_durations(bfs_time_not_called),
+                    "called": summarize_durations(bfs_time_called),
+                    "not_called": summarize_durations(bfs_time_not_called),
                 },
             },
         },
