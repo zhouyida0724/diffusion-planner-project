@@ -30,7 +30,7 @@ validation_output/
 validation_output2/
 
 # Unified outputs (generated)
-outputs/
+outputs/**
 !outputs/
 !outputs/README.md
 
