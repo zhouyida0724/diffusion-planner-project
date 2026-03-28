@@ -66,6 +66,11 @@
   - timeout=0, bfs_timeout=0
   - elapsed_max≈3026.67s, fps_kept≈26.63, size≈5.3G
   - hard_skip_reasons: route_lanes_avails_sum==0 (19385)
+- **Slice05 (N=12)**: `exports_local/boston50w_prod/slice05_N12_20260328_221211/`
+  - planned=100000, kept=81895, hard_skipped=18105
+  - timeout=0, bfs_timeout=0
+  - elapsed_max≈3029.17s, fps_kept≈27.04, size≈5.4G
+  - hard_skip_reasons: route_lanes_avails_sum==0 (18105)
 
 ### Ops note
 - `exports/` directory is currently root-owned (not writable by uid=1000 container runs). Using `exports_local/` until permissions are normalized.
