@@ -1,141 +1,102 @@
 #!/usr/bin/env python3
-"""
-run_diffusion_simulation.py - Run nuPlan closed-loop simulation with Diffusion Planner
+"""run_diffusion_simulation.py - Run nuPlan closed-loop simulation with Diffusion Planner.
 
-Usage:
-    python run_diffusion_simulation.py --scenarios_file=data/scenarios_200_valid.csv
-    python run_diffusion_simulation.py --scenario=TOKEN
-    python run_diffusion_simulation.py --num=200
-    python run_diffusion_simulation.py --planner idm --num=1
-    python run_diffusion_simulation.py --planner diffusion --checkpoint /workspace/checkpoints/model.pth --num=1
+CLI is kept stable; implementation uses `src.platform.nuplan` helpers.
 """
 
 import argparse
-import subprocess
-import os
+import sys
+from pathlib import Path
 
-CONFIG_FILE = '/workspace/nuplan-visualization/nuplan/planning/script/config/common/scenario_filter/one_hand_picked_scenario.yaml'
+# Ensure repo root is importable when running as a script
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-def main():
-    parser = argparse.ArgumentParser(description='Run Diffusion Planner simulation')
-    parser.add_argument('--scenarios_file', type=str, default=None,
-                        help='CSV file with scenario tokens')
-    parser.add_argument('--scenario', type=str, default=None, help='Specific scenario token')
-    parser.add_argument('--num', type=int, default=None, help='Number of random scenarios')
-    parser.add_argument('--planner', type=str, default='diffusion', choices=['diffusion', 'idm'],
-                        help='Planner type: diffusion or idm (default: diffusion)')
-    parser.add_argument('--checkpoint', type=str, default='/workspace/checkpoints/model.pth',
-                        help='Diffusion model checkpoint path (default: /workspace/checkpoints/model.pth)')
+from src.platform.nuplan.planners.overrides import diffusion_planner_overrides, idm_planner_overrides
+from src.platform.nuplan.runners.simulation import (
+    DEFAULT_DATA_ROOT,
+    DEFAULT_SCENARIO_FILTER_CONFIG_FILE,
+    build_run_simulation_cmd,
+    make_invocation,
+    run,
+    write_scenario_filter_yaml_for_tokens,
+)
+
+CONFIG_FILE = DEFAULT_SCENARIO_FILTER_CONFIG_FILE
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run Diffusion Planner simulation")
+    parser.add_argument("--scenarios_file", type=str, default=None, help="CSV file with scenario tokens")
+    parser.add_argument("--scenario", type=str, default=None, help="Specific scenario token")
+    parser.add_argument("--num", type=int, default=None, help="Number of random scenarios")
+    parser.add_argument(
+        "--planner",
+        type=str,
+        default="diffusion",
+        choices=["diffusion", "idm"],
+        help="Planner type: diffusion or idm (default: diffusion)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="/workspace/checkpoints/model.pth",
+        help="Diffusion model checkpoint path (default: /workspace/checkpoints/model.pth)",
+    )
     args = parser.parse_args()
-    
-    os.environ['PYTHONPATH'] = '/workspace/nuplan-visualization:/workspace/diffusion_planner'
-    
-    # Determine planner based on args
-    if args.planner == 'idm':
-        planner_name = 'idm_planner'
-        planner_config = ['planner=idm_planner']
+
+    pythonpath = "/workspace/nuplan-visualization:/workspace/diffusion_planner"
+
+    if args.planner == "idm":
+        planner_overrides = idm_planner_overrides().args
     else:
-        planner_name = 'diffusion_planner'
-        # Use quoted form to prevent shell interpretation of '+'
-        planner_config = ['planner=diffusion_planner', f'+diffusion_planner.ckpt_path={args.checkpoint}']
-    
+        planner_overrides = diffusion_planner_overrides(args.checkpoint).args
+
     if args.scenarios_file:
-        # Read tokens from file
         tokens = []
-        with open(args.scenarios_file, 'r') as f:
+        with open(args.scenarios_file, "r") as f:
             next(f)  # Skip header
             for line in f:
-                parts = line.strip().split(',')
-                if parts:
+                parts = line.strip().split(",")
+                if parts and parts[0]:
                     tokens.append(parts[0])
-        
-        print(f"Loaded {len(tokens)} scenarios from {args.scenarios_file}")
-        
-        # Write config with tokens
-        tokens_yaml = '\n'.join([f"  - '{t}'" for t in tokens])
-        with open(CONFIG_FILE, 'w') as f:
-            f.write(f"""_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
-scenario_types: null
-scenario_tokens:
-{tokens_yaml}
-log_names: null
-map_names: null
-num_scenarios_per_type: 1
-limit_total_scenarios: null
-timestamp_threshold_s: null
-ego_displacement_minimum_m: null
-expand_scenarios: false
-remove_invalid_goals: true
-shuffle: false
-""")
-        
-        cmd = [
-            'python3', '-m', 'nuplan.planning.script.run_simulation',
-            '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
-            'scenario_builder=nuplan',
-            'scenario_filter=one_hand_picked_scenario',
-            'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-            'worker=sequential',
-            'verbose=true'
-        ]
-    elif args.scenario:
-        # Single scenario
-        with open(CONFIG_FILE, 'w') as f:
-            f.write(f"""_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
-scenario_types: null
-scenario_tokens:
-  - '{args.scenario}'
-log_names: null
-map_names: null
-num_scenarios_per_type: 1
-limit_total_scenarios: null
-timestamp_threshold_s: null
-ego_displacement_minimum_m: null
-expand_scenarios: false
-remove_invalid_goals: true
-shuffle: false
-""")
-        
-        cmd = [
-            'python3', '-m', 'nuplan.planning.script.run_simulation',
-            '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
-            'scenario_builder=nuplan',
-            'scenario_filter=one_hand_picked_scenario',
-            'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-            'worker=sequential',
-            'verbose=true'
-        ]
-    elif args.num:
-        # Random N scenarios
-        cmd = [
-            'python3', '-m', 'nuplan.planning.script.run_simulation',
-            '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
-            'scenario_builder=nuplan',
-            'scenario_filter=simulation_test_split',
-            'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-            f'scenario_filter.limit_total_scenarios={args.num}',
-            'worker=sequential',
-            'verbose=true'
-        ]
-    else:
-        # Default: run 1 random scenario
-        cmd = [
-            'python3', '-m', 'nuplan.planning.script.run_simulation',
-            '+simulation=closed_loop_nonreactive_agents',
-            *planner_config,
-            'scenario_builder=nuplan',
-            'scenario_filter=simulation_test_split',
-            'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-            'scenario_filter.limit_total_scenarios=1',
-            'worker=sequential',
-            'verbose=true'
-        ]
-    
-    print(f"Running: {' '.join(cmd)}")
-    subprocess.run(cmd, env=os.environ)
 
-if __name__ == '__main__':
+        print(f"Loaded {len(tokens)} scenarios from {args.scenarios_file}")
+        write_scenario_filter_yaml_for_tokens(scenario_tokens=tokens, config_file=CONFIG_FILE)
+
+        cmd = build_run_simulation_cmd(
+            planner_overrides=planner_overrides,
+            scenario_filter="one_hand_picked_scenario",
+            data_root=DEFAULT_DATA_ROOT,
+        )
+
+    elif args.scenario:
+        write_scenario_filter_yaml_for_tokens(scenario_tokens=[args.scenario], config_file=CONFIG_FILE)
+        cmd = build_run_simulation_cmd(
+            planner_overrides=planner_overrides,
+            scenario_filter="one_hand_picked_scenario",
+            data_root=DEFAULT_DATA_ROOT,
+        )
+
+    elif args.num:
+        cmd = build_run_simulation_cmd(
+            planner_overrides=planner_overrides,
+            scenario_filter="simulation_test_split",
+            data_root=DEFAULT_DATA_ROOT,
+            extra_overrides=[f"scenario_filter.limit_total_scenarios={args.num}"],
+        )
+
+    else:
+        cmd = build_run_simulation_cmd(
+            planner_overrides=planner_overrides,
+            scenario_filter="simulation_test_split",
+            data_root=DEFAULT_DATA_ROOT,
+            extra_overrides=["scenario_filter.limit_total_scenarios=1"],
+        )
+
+    print(f"Running: {' '.join(cmd)}")
+    invocation = make_invocation(cmd=cmd, pythonpath=pythonpath)
+    raise SystemExit(run(invocation))
+
+
+if __name__ == "__main__":
     main()

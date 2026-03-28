@@ -1,14 +1,14 @@
-#!/bin/bash
-# run_nuboard.sh - Launch nuBoard visualization
-# Usage: ./run_nuboard.sh [port_number]
-# Default port: 5007 (to avoid conflict with training container's TensorBoard on 5006)
+#!/usr/bin/env bash
+set -euo pipefail
 
-export PYTHONPATH=/workspace/nuplan-visualization
+# run_nuboard.sh
+# One-click nuBoard launcher.
+# Defaults to the latest simulation output under outputs/sim/exp/simulation/**/<timestamp>/
+# and starts nuBoard with simulation_path=[<that_dir>].
+#
+# This script is a thin wrapper around scripts/run_nuboard_outputs.sh.
+# The previous behavior is preserved in scripts/run_nuboard_legacy.sh.
 
-PORT=${1:-5007}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-cd /workspace/nuplan-visualization
-python3 -m nuplan.planning.script.run_nuboard \
-    scenario_builder=nuplan \
-    'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini' \
-    port_number=$PORT
+exec "${SCRIPT_DIR}/run_nuboard_outputs.sh" "$@"
