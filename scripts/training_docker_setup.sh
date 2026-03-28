@@ -20,16 +20,27 @@ HOST_WORKSPACE="/home/zhouyida/.openclaw/workspace"
 # Install training dependencies inside container
 install_deps() {
     echo "Installing training dependencies..."
-    docker exec $CONTAINER_NAME bash -c '
+    docker exec $CONTAINER_NAME bash -lc '
+        set -e
         pip3 install --upgrade pip --quiet
-        
-        pip3 install --quiet torch==2.0.0+cu118 --index-url https://download.pytorch.org/whl/cu118
-        
+
+        # Torch is usually baked into the image.
+        # Only install Torch if it is missing, and keep versions consistent.
+        python3 - <<"PY" || (
+import torch
+print("torch", torch.__version__, "cuda", torch.version.cuda)
+PY
+          pip3 install --quiet \
+            torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121 \
+            --index-url https://download.pytorch.org/whl/cu121
+        )
+
         pip3 install --quiet \
                 pytorch_lightning==2.0.1 \
                 timm==1.0.10 \
                 numpy \
                 tqdm \
+                einops \
                 pyyaml \
                 matplotlib \
                 scipy \
@@ -51,6 +62,9 @@ case "${1:-run}" in
         
         docker run -d \
             --name $CONTAINER_NAME \
+            --gpus all \
+            -e NVIDIA_VISIBLE_DEVICES=all \
+            -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
             -p 5006:5006 \
             -p 2000:2000 \
             -v $HOST_DATA_DIR:/workspace/data \

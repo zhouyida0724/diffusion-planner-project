@@ -4,11 +4,24 @@
 
 ## Checklist (where we are)
 
-- [x] Boston 50w export: slice01–slice04 completed; slice05 running (finalize paths + slice-level metrics table after completion)
+### Data production (done)
+- [x] Boston 50w export **slice01–slice05** completed (sharded NPZ + manifest + metrics)
+
+### Docs (done)
 - [x] `TRAINING.md` structure agreed (data-prep is based on our exports; preprocess + implementation summary live under Training)
-- [ ] Expand **5.2** into concrete implementation plan (data/model/diffusion/loss/opt/ddp/ckpt)
-- [ ] Add **deployment to nuPlan closed-loop sim** (planner wrapper + runtime feature extraction reuse + runner + nuboard)
-- [ ] Implement our training code **outside repo** (a clearly deletable scratch dir), plus equivalence tests vs official
+- [x] Expanded **5.2** into concrete implementation plan (data/model/diffusion/loss/opt/ddp/ckpt + equivalence tests)
+- [x] Added **deployment to nuPlan closed-loop sim** section (planner wrapper + runtime feature extraction reuse + runner + nuboard)
+
+### Training container self-check (done)
+- [x] Verified container launched by `scripts/training_docker_setup.sh run`
+  - GPU visible in container (`nvidia-smi -L` OK)
+  - torch CUDA OK: `torch 2.1.0+cu121`, `cuda_available=True`, `device_count=1`
+  - imports OK: `numpy/torch/tqdm/einops`
+  - data mount readable: `/workspace/exports_local/boston50w_prod/...`
+  - output writable: `/workspace/training_outputs/...`
+
+### Next executable steps
+- [ ] Implement **our** training code **inside this repo** (new clean module + clear docs structure) + equivalence tests vs official
 - [ ] First sanity run: 100–1000 steps, verify no-NaN + throughput + basic qualitative checks
 
 ---
@@ -78,7 +91,7 @@ exports_local/boston50w_prod/sliceXX_N12_<ts>/
 - slice02: `exports_local/boston50w_prod/slice02_N12_20260326_105143/`
 - slice03: `exports_local/boston50w_prod/slice03_N12_20260326_115618/`
 - slice04: `exports_local/boston50w_prod/slice04_N12_20260328_205401/`
-- slice05: running / TBD
+- slice05: `exports_local/boston50w_prod/slice05_N12_20260328_221211/` (planned=100000, kept=81895, hard=18105)
 
 ### 4.2 manifest 对齐与字段（训练侧必须读）
 - `manifest.jsonl` 每行对应一条样本；建议训练侧把 manifest 作为“事实来源”。
