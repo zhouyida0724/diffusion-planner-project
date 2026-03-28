@@ -32,24 +32,47 @@ def main() -> None:
     parser.add_argument(
         "--planner",
         type=str,
-        default="diffusion",
-        choices=["diffusion", "idm"],
-        help="Planner type: diffusion or idm (default: diffusion)",
+        default="diffusion_planner",
+        choices=["diffusion_planner", "diffusion", "idm_planner", "idm"],
+        help=(
+            "Planner type. Accepts: diffusion_planner|diffusion (same) or idm_planner|idm (same). "
+            "Default: diffusion_planner"
+        ),
     )
+    # Keep both spellings for backwards/forwards compatibility.
     parser.add_argument(
         "--checkpoint",
+        "--ckpt",
         type=str,
-        default="/workspace/checkpoints/model.pth",
-        help="Diffusion model checkpoint path (default: /workspace/checkpoints/model.pth)",
+        default=None,
+        help=(
+            "Checkpoint path. Supports legacy .pth as well as training-skeleton .pt checkpoints under "
+            "outputs/training/<exp>/checkpoint_*.pt."
+        ),
     )
     args = parser.parse_args()
 
-    pythonpath = "/workspace/nuplan-visualization:/workspace/diffusion_planner"
+    # Ensure both nuPlan vendor code and our repo code are importable in the simulation subprocess.
+    # Put repo root first so `src.*` is always resolvable.
+    repo_root = Path(__file__).resolve().parents[2]
+    pythonpath = f"{repo_root}:/workspace/nuplan-visualization"
 
-    if args.planner == "idm":
+    planner_key = args.planner
+    if planner_key in {"idm", "idm_planner"}:
         planner_overrides = idm_planner_overrides().args
     else:
-        planner_overrides = diffusion_planner_overrides(args.checkpoint).args
+        ckpt = args.checkpoint
+        if ckpt is None:
+            # Keep old default for legacy users, but explicit is preferred.
+            ckpt = "/workspace/checkpoints/model.pth"
+        else:
+            # Make ckpt path robust to Hydra changing CWD during runs.
+            p = Path(ckpt)
+            if not p.is_absolute():
+                repo_root = Path(__file__).resolve().parents[2]
+                p = (repo_root / p).resolve()
+            ckpt = str(p)
+        planner_overrides = diffusion_planner_overrides(ckpt).args
 
     if args.scenarios_file:
         tokens = []
