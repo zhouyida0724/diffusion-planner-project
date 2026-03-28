@@ -14,7 +14,7 @@
 
 ### Next executable steps
 - [ ] **Verify training container** from `scripts/training_docker_setup.sh` (GPU/torch/imports/data mounts/write perms) and fix the script if broken
-- [ ] Implement our training code **outside repo** (clearly deletable scratch dir) + equivalence tests vs official
+- [ ] Implement **our** training code **inside this repo** (new clean module + clear docs structure) + equivalence tests vs official
 - [ ] First sanity run: 100–1000 steps, verify no-NaN + throughput + basic qualitative checks
 
 ---
