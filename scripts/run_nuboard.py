@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""
-run_nuboard.py - Launch nuBoard visualization
+"""Wrapper for backwards-compatible entrypoint.
+
+Historically users ran: python3 scripts/run_nuboard.py ...
+Now the implementation is a shell script under scripts/nuboard/run_nuboard.sh.
 """
 
-import subprocess
+from __future__ import annotations
+
 import os
+import subprocess
+from pathlib import Path
 
-os.environ['PYTHONPATH'] = '/workspace/nuplan-visualization'
 
-subprocess.run([
-    'python3', '-m', 'nuplan.planning.script.run_nuboard',
-    'scenario_builder=nuplan',
-    'scenario_builder.data_root=/workspace/data/nuplan/data/cache/mini',
-])
+def main() -> None:
+    script = Path(__file__).resolve().parent / "nuboard" / "run_nuboard.sh"
+    raise SystemExit(subprocess.call([str(script), *os.sys.argv[1:]]))
+
+
+if __name__ == "__main__":
+    main()

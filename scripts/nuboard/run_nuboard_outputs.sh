@@ -140,7 +140,7 @@ ERROR: NUPLAN_DATA_ROOT does not exist: ${NUPLAN_DATA_ROOT}
 
 Set it explicitly, e.g.:
   NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini \
-    ./scripts/run_nuboard.sh
+    ./scripts/run_nuboard.py
 EOF
   exit 1
 fi

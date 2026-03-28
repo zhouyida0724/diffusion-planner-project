@@ -13,20 +13,19 @@ Docker-based nuPlan closed-loop simulation environment with nuBoard visualizatio
 ### 1. Pull Docker Image
 
 ```bash
-cd scripts
-./docker_setup.sh pull
+./scripts/docker/docker_setup.sh pull
 ```
 
 ### 2. Run Container
 
 ```bash
-./docker_setup.sh run
+./scripts/docker/docker_setup.sh run
 ```
 
 ### 3. Enter Container
 
 ```bash
-./docker_setup.sh enter
+./scripts/docker/docker_setup.sh enter
 ```
 
 ---
@@ -101,7 +100,7 @@ data/nuplan/exp/exp/simulation/closed_loop_nonreactive_agents/<timestamp>/
 
 ```bash
 # Inside Docker container
-../scripts/run_nuboard.sh
+../scripts/run_nuboard.py
 ```
 
 By default, this will:
@@ -116,23 +115,23 @@ nuBoard will be available at: **http://localhost:5007**
 
 ```bash
 # Override port
-../scripts/run_nuboard.sh 5010
+../scripts/run_nuboard.py 5010
 
 # Use a specific simulation output directory (relative to repo root)
-../scripts/run_nuboard.sh outputs/sim/exp/simulation/closed_loop_nonreactive_agents/2026.03.28.17.17.40
+../scripts/run_nuboard.py outputs/sim/exp/simulation/closed_loop_nonreactive_agents/2026.03.28.17.17.40
 
 # Port + specific directory
-../scripts/run_nuboard.sh 5010 outputs/sim/exp/simulation/closed_loop_nonreactive_agents/2026.03.28.17.17.40
+../scripts/run_nuboard.py 5010 outputs/sim/exp/simulation/closed_loop_nonreactive_agents/2026.03.28.17.17.40
 ```
 
 ### Data root override (if your container uses a different nuPlan cache)
 
-`run_nuboard.sh` defaults to:
+`run_nuboard.py` (wrapper around `scripts/nuboard/run_nuboard.sh`) defaults to:
 - `NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini`
 
 Override it like:
 ```bash
-NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini ../scripts/run_nuboard.sh
+NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini ../scripts/run_nuboard.py
 ```
 
 ### Viewing Results
@@ -152,20 +151,20 @@ NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini ../scripts/run_nuboard.s
 
 | Script | Description |
 |--------|-------------|
-| `docker_setup.sh` | Docker container management |
-| `run_simulation.sh` | Run closed-loop simulation |
-| `run_nuboard.sh` | Start nuBoard visualization |
+| `scripts/docker/docker_setup.sh` | Docker container management |
+| `scripts/run_simulation.py` | Run closed-loop simulation |
+| `scripts/run_nuboard.py` | Start nuBoard visualization |
 
 ### Docker Setup Commands
 
 ```bash
-./docker_setup.sh pull    # Pull image from Docker Hub
-./docker_setup.sh run     # Create and start container
-./docker_setup.sh start   # Start existing container
-./docker_setup.sh stop    # Stop container
-./docker_setup.sh enter   # Enter container shell
-./docker_setup.sh rebuild # Rebuild image from container
-./docker_setup.sh push    # Push to Docker Hub
+./scripts/docker/docker_setup.sh pull    # Pull image from Docker Hub
+./scripts/docker/docker_setup.sh run     # Create and start container
+./scripts/docker/docker_setup.sh start   # Start existing container
+./scripts/docker/docker_setup.sh stop    # Stop container
+./scripts/docker/docker_setup.sh enter   # Enter container shell
+./scripts/docker/docker_setup.sh rebuild # Rebuild image from container
+./scripts/docker/docker_setup.sh push    # Push to Docker Hub
 ```
 
 ---
@@ -177,7 +176,7 @@ NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini ../scripts/run_nuboard.s
 If nuBoard shows "No simulation data" in SCENARIO tab, use pickle format:
 
 ```bash
-# Add this to run_simulation.sh:
+# Add this to run_simulation.py (Hydra overrides):
 callback.simulation_log_callback.serialization_type=pickle
 ```
 

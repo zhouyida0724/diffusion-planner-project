@@ -39,7 +39,7 @@ def main() -> int:
     ap.add_argument("--bfs-max-time-s", type=float, default=0.5)
     args = ap.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[4]
     plan_dir = (repo_root / args.plan).resolve()
     if not (plan_dir / "index.jsonl").exists():
         raise FileNotFoundError(f"plan index.jsonl not found under: {plan_dir}")

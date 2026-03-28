@@ -17,12 +17,14 @@ import numpy as np
 
 # Add nuplan-visualization to path (legacy behavior)
 sys.path.insert(0, "/workspace/nuplan-visualization")
-_local_nuplan_vis = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "nuplan-visualization"))
+_local_nuplan_vis = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "nuplan-visualization")
+)
 if os.path.isdir(_local_nuplan_vis):
     sys.path.insert(0, _local_nuplan_vis)
 
 # Ensure repo root is importable so we can import src/ modules when running this file directly.
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
