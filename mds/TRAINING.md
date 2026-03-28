@@ -1,17 +1,28 @@
 # TRAINING.md (Diffusion Planner repro – using our exported features)
 
-**Status:** draft (paper-first, but training pipeline is built around our exported sharded NPZ + manifest).
+**Status:** WIP. Paper-first, but the primary training input is **our exported sharded NPZ + manifest**.
+
+## Checklist (where we are)
+
+- [x] Boston 50w export: slice01–slice04 completed; slice05 running (finalize paths + slice-level metrics table after completion)
+- [x] `TRAINING.md` structure agreed (data-prep is based on our exports; preprocess + implementation summary live under Training)
+- [ ] Expand **5.2** into concrete implementation plan (data/model/diffusion/loss/opt/ddp/ckpt)
+- [ ] Add **deployment to nuPlan closed-loop sim** (planner wrapper + runtime feature extraction reuse + runner + nuboard)
+- [ ] Implement our training code **outside repo** (a clearly deletable scratch dir), plus equivalence tests vs official
+- [ ] First sanity run: 100–1000 steps, verify no-NaN + throughput + basic qualitative checks
+
+---
 
 ## 1) 目标与范围
 
 ### 目标
 - 复现论文：**Diffusion-Based Planning for Autonomous Driving with Flexible Guidance** (ICLR 2025)
-- 在 **nuPlan** 上训练可用于 closed-loop planning 的 Diffusion Planner（先以 Boston 50w 导出数据跑通训练闭环，再扩展规模/地域）。
+- 在 **nuPlan** 上训练可用于 closed-loop planning 的 Diffusion Planner：先用 Boston 50w 导出数据跑通“训练→部署→闭环仿真”的闭环，再扩展规模/地域。
 
 ### 当前范围（我们先做到什么）
 - ✅ 数据生产：从 nuPlan 场景导出 **sharded** 数据集（`data.npz + manifest.jsonl + metrics.json`）
 - 🔄 训练：实现与官方一致的训练数据流 + 训练 loop，并用“等价性测试”对齐官方实现
-- ⏳ 评测：训练后在 nuPlan closed-loop（或最小 offline 指标）上 sanity check
+- ⏳ 部署与评测：训练后接入 nuPlan closed-loop simulation，跑指标与 nuboard 可视化
 
 ### 非目标（暂不做 / 后续再做）
 - 不在训练阶段“在线修复 routing 异常帧”：soft flag 只做 tag/分桶。
@@ -22,11 +33,8 @@
 ## 2) 链接（权威来源）
 - Paper (arxiv PDF): https://arxiv.org/pdf/2501.15564
 - Official repo: https://github.com/ZhengYinan-AIR/Diffusion-Planner
-- Official README training entrypoints:
-  - `data_process.sh`
-  - `torch_run.sh`
 
-> 备注：我们仓库内已有 `training/` 目录**不作为参考**（历史遗留/误导），训练实现以论文 + 官方 repo 为准。
+> 备注：本仓库内已有 `training/` 目录**不作为参考**（历史遗留/误导）。训练实现以论文 + 官方 repo 为准。
 
 ---
 
@@ -40,7 +48,7 @@
 - GPU 可用：
   - `nvidia-smi`
   - `python -c "import torch; print(torch.cuda.is_available())"`
-- 记录版本：torch/cuda/driver/pytorch-lightning（若使用）
+- 记录版本：torch/cuda/driver（以及 lightning/accelerate 等，若使用）
 
 ### 目录约定（我们自己的）
 - 训练输入（导出数据）：`/workspace/exports_local/boston50w_prod/...`（容器内路径示例；以实际挂载为准）
@@ -70,82 +78,151 @@ exports_local/boston50w_prod/sliceXX_N12_<ts>/
 - slice02: `exports_local/boston50w_prod/slice02_N12_20260326_105143/`
 - slice03: `exports_local/boston50w_prod/slice03_N12_20260326_115618/`
 - slice04: `exports_local/boston50w_prod/slice04_N12_20260328_205401/`
-- slice05: **running / TBD**（产出后补充路径与统计）
+- slice05: running / TBD
 
-### 4.2 manifest 对齐与字段
-- `manifest.jsonl` 每行对应一条样本（与 `data.npz` 内 batch 维通过 `t`/row_idx 对齐）。
-- 强烈建议训练侧保留并读取 manifest 的关键字段：
-  - `plan_row_idx`, `t`, `db_path`, `scene_token`, `frame_id`（或 sample_id）
-  - QC 字段：`qc_hard_skip`, `qc_error`, `qc_flags`（soft tags）
+### 4.2 manifest 对齐与字段（训练侧必须读）
+- `manifest.jsonl` 每行对应一条样本；建议训练侧把 manifest 作为“事实来源”。
+- 关键字段（建议至少保留）：
+  - 对齐审计：`plan_row_idx`, `t`
+  - 定位回溯：`db_path`, `scene_token`, `frame_id`（或 sample_id）
+  - QC：`qc_hard_skip`, `qc_error`, `qc_flags`（soft tags）
 
 ### 4.3 hard/soft 的使用策略
-- **hard skip**（例如 `route_lanes_avails_sum==0`）在 exporter 已剔除（但训练侧仍建议 assert/统计验证）。
-- **soft flag**（例如 `route_min_dist_gt_30m`）不在线修复：训练时通过采样比例/分桶控制。
+- hard skip（例如 `route_lanes_avails_sum==0`）在 exporter 已剔除；训练侧仍建议做统计断言（防止数据混入）。
+- soft flag（例如 `route_min_dist_gt_30m`）不在线修复：训练时通过采样比例/分桶控制。
 
 ### 4.4 数据集切分建议（先简单可审计）
-建议优先按 **db_path 或 scene_token** 做 train/val 切分，避免时间邻近泄漏：
+优先按 **db_path 或 scene_token** 做 train/val 切分，避免时间邻近泄漏：
 - Train: slice01–slice04
-- Val: slice05（或从 slice04/05 中抽取固定 db 子集）
-
-> 最终切分策略要与论文设置对齐；当前先保证可复现与可审计。
+- Val: slice05（或从 slice04/05 抽固定 db 子集）
 
 ---
 
 ## 5) 训练（含：预处理 + 代码实现概要 + 启动方式）
 
-### 5.1 训练输入适配（从 sharded data.npz 读取）
-我们导出的格式是 **“每 shard 一个堆叠 data.npz”**，因此训练 dataloader 推荐实现为：
-- index 构建：扫描 `shards/shard_*/manifest.jsonl`，得到全局样本表（包含 shard_path + t）
-- `__getitem__`：打开对应 shard 的 `data.npz`，按 t 取出单样本各字段
-- 注意：避免每次 `np.load` 反复打开文件导致 IO 爆炸
-  - 方案 A：每个 worker 维护 LRU cache（npz handle / mmap）
-  - 方案 B：预先把 shard 转成更适合随机访问的格式（如 zarr / webdataset）——后续再做
+### 5.1 训练输入适配（从 sharded `data.npz` 随机读取）
+我们的导出是“每 shard 一个堆叠 NPZ”，因此 dataloader 推荐实现为：
+- **IndexBuilder**：扫描 `shards/shard_*/manifest.jsonl` → 生成全局样本表（每行至少含 `{shard_dir, t, plan_row_idx, qc_*}`），并落盘缓存（避免每次启动全量扫描）。
+- **NPZBackend**：`__getitem__` 根据 `(shard_dir, t)` 从 `data.npz` 取单样本（注意 shape / avails）。
+- **性能底线**：严禁每次 sample 都 `np.load` 打开/关闭。
+  - 在 DataLoader worker 内做 LRU（`np.load(..., mmap_mode='r')`）或 per-worker cache。
 
-> 这里会实现一个最小可用版本，先确保逻辑正确，再做性能优化。
+### 5.2 训练代码实现概要（展开：每块怎么落地）
+> 目标：我们自己写 training code，但能“证明”与论文/官方实现对齐。
 
-### 5.2 训练代码实现概要（与官方对齐）
-我们会按官方 repo 的训练入口（`torch_run.sh` -> `train_predictor.py`）梳理并对齐：
-- 数据：输入字段、shape、归一化、mask/avails
-- 模型：DiT-based backbone + condition fusion（按论文/官方实现）
-- Diffusion：噪声注入方式、time embedding、预测目标（x0/eps/score 等）
-- Loss：各项 loss 的定义与权重
-- 优化器/调度器：AdamW / cosine / warmup 等（以官方为准）
+#### 5.2.1 Data（字段/shape/归一化/mask）
+- **dataset 输出统一 dict**：`{features..., target..., meta...}`，其中 `meta` 至少包含 `plan_row_idx/db_path/scene_token` 用于 debug。
+- **mask/avails**：训练时必须显式使用（attention mask 或乘 mask），并在 loss 中忽略不可用 timestep/agent。
+- **Normalize**：先不做神秘标准化，只做：
+  - 坐标系一致性校验（ego-centric / global 的约定）
+  - NaN/Inf assert + 合理范围 clamp（可选）
+  - 若官方/论文要求 mean/std：提供 `compute_stats.py` 生成 `stats.json` 并在训练加载。
 
-### 5.3 预处理（放在训练流程里，而不是单独章节）
-因为我们以导出数据为主，预处理分两层：
-1) **必要预处理**（训练必须）
-   - 读取 manifest，过滤/分桶/重采样
-   - 构建 train/val index
-2) **可选预处理**（性能/质量）
-   - cache index
-   - 统计每个字段的 mean/std（若论文需要）
+#### 5.2.2 Model（DiT backbone + condition fusion）
+建议拆成 4 个显式模块（便于对齐/单测）：
+1) `ConditionEncoder`：把动态参与者 + 静态 polyline（lanes/route_lanes/traffic lights）编码成 token。
+2) `TrajectoryRepresentation`：明确要生成的未来轨迹张量定义（ego-only vs joint participants）。
+3) `DiTBackbone`：输入 `x_t + cond_tokens + t_embed`，输出预测（`eps` 或 `x0`，以官方为准）。
+4) `OutputHead`：把 backbone 输出映射回轨迹张量维度。
 
-### 5.4 与官方实现一致性的“可证明”检查
-我们会做三步对齐，避免“看起来能跑但其实不一致”：
-1) **Forward/Loss 对齐**：固定 seed + 固定 batch，对比 shape + 数值统计
-2) **1-step update 对齐**：跑一步 optimizer，比较关键层权重 diff
-3) **加载官方 ckpt（可选）**：如果要二进制兼容，需对齐 module name/state_dict
+#### 5.2.3 Diffusion（训练目标与 scheduler）
+- `NoiseScheduler`：管理 `betas/alphas/alpha_bar`，提供 `q_sample(x0,t,noise)`。
+- **训练 target**：必须明确且与官方一致（predict `eps` / `x0` / `v`）。
+- 推理 sampler（部署会用）：DDIM/DDPM 或 DPM-Solver（论文强调实时性）。
 
-### 5.5 启动方式（先占位，待我们训练代码落地后给出最终命令）
-- Sanity run：小数据 + 小 steps（验证 loss/NaN/吞吐）
-- Full run：多卡 torchrun
-- Resume：从 checkpoint 恢复
+#### 5.2.4 Loss（每项 loss 的定义、mask、log）
+- `loss_diffusion = MSE(pred, target)`（按 eps/x0 定义）并带 mask。
+- 可选正则（以论文/官方为准）：smoothness/jerk 等。
+- **必须分项 log**：`loss_total/loss_diff/loss_reg/...`，否则后期无法定位。
+
+#### 5.2.5 Optimizer/Scheduler（以官方为准）
+- AdamW +（可选）no_decay 参数组（LayerNorm/bias）。
+- cosine + warmup（如官方采用）。
+- gradient clip（如官方采用）。
+
+#### 5.2.6 DDP/Checkpoint/复现信息
+- 入口用 `torchrun`（DDP）。
+- checkpoint 必须保存：`model/optimizer/scheduler/step` + **config snapshot** + **data index hash**。
+
+#### 5.2.7 与官方实现一致性的“可证明”检查（强制项）
+1) **Forward/Loss 对齐**：固定 seed + 固定 batch，对比：shape + 数值统计（mean/std/max/NaN）。
+2) **1-step update 对齐**：跑一步 optimizer，比关键层权重 diff。
+3) （可选）**state_dict 兼容**：若要加载官方 ckpt，则需对齐 module 命名/参数组织。
+
+### 5.3 预处理（放在训练流程里）
+- 必要预处理：读 manifest → 过滤/分桶/重采样 → 构建 train/val index。
+- 可选预处理：cache index、统计 mean/std、把 NPZ 转换为更友好的格式（zarr/webdataset）。
+
+### 5.4 启动方式（先给骨架；等训练代码落地后补最终命令）
+- Sanity run：小数据 + 100–1000 steps（验证 loss/NaN/吞吐）。
+- Full run：多卡 torchrun。
+- Resume：从 checkpoint 恢复。
 
 ---
 
-## 6) 评估与对照
+## 6) 部署到 nuPlan 闭环仿真（我们自己的 nuPlan-simulation 工程入口）
+
+> 本节选择“后者”：优先对齐 **我们现有的 `nuplan-simulation` 工程/入口**，把训练出的模型作为一个 planner 挂进去跑 closed-loop。
+
+### 6.1 产物约定（训练输出）
+训练输出目录（建议）：
+- `training_outputs/<exp_name>/`
+  - `checkpoints/last.ckpt` 或 `model.pth`
+  - `config.yaml`（完整快照）
+  - `stats.json`（若用）
+
+### 6.2 Inference Wrapper（模型推理封装）
+实现一个最小推理类，例如 `DiffusionPlannerPolicy`：
+- `load(ckpt_path, device)`
+- `build_cond(features)`（把 runtime features 变成 model 输入）
+- `sample(cond, num_steps, guidance_cfg) -> future_traj`
+
+### 6.3 Runtime Feature Extraction（运行时特征提取必须与训练一致）
+- **必须复用**我们已经验证过的单帧特征提取逻辑（当前在 export pipeline 里）。
+- 推荐做法：把单帧 `extract_features(...)` 抽成一个可 import 的函数/模块：
+  - 训练侧：dataset 读 NPZ（离线）
+  - 仿真侧：planner 每 tick 调 `extract_features(...)`（在线）
+- 强制断言：每个字段 shape 与训练一致（避免 silent mismatch）。
+
+### 6.4 Planner 适配（nuPlan closed-loop）
+实现/注册一个 nuPlan planner（以 nuPlan devkit 的 planner API 为准）：
+- `initialize(...)`
+- `compute_trajectory(observation, map_api, route, ...) -> Trajectory`
+
+`compute_trajectory` 内部步骤：
+1) 从 observation/map/route 提取 features（复用 extract_features）
+2) policy.sample 生成未来轨迹
+3) 转成 nuPlan 的 `Trajectory` 类型返回（包含时间步与姿态）
+
+### 6.5 Runner（跑仿真 + nuboard）
+- 提供一个 runner 脚本（bash/python），参数至少包含：
+  - checkpoint 路径
+  - 场景集合（val set）
+  - 仿真 horizon/step
+  - 输出目录
+- 产物：仿真 metrics + 可用 nuboard 回放。
+
+### 6.6 部署后最小验收
+- 单场景跑通不 crash
+- 轨迹输出合理（无 NaN、无爆炸）
+- metrics 正常产出
+- nuboard 可视化可打开
+
+---
+
+## 7) 评估与对照
 
 最小验收（必须）：
 - 能跑通训练 N steps，不 NaN
-- loss 曲线合理（下降或稳定）
-- 抽样可视化输入/输出（与我们已有 `visualize_npz.py` 兼容）
+- loss 曲线合理
+- 抽样可视化输入/输出（与 `visualize_npz.py` 兼容）
 
 对照（推荐）：
-- 使用官方 repo + 官方 checkpoint 做一次相同设置的 eval sanity check（确认环境无偏差）
+- 用官方 repo + 官方 checkpoint 做一次 sanity（确认环境无偏差；并非要完全复刻官方 pipeline）。
 
 ---
 
-## 7) 复现记录与排障
+## 8) 复现记录与排障
 
 每次训练 run 需要记录：
 - 数据版本：slice 列表 + 每 slice 的 `RUN_INFO.json` / metrics 汇总
@@ -161,4 +238,4 @@ exports_local/boston50w_prod/sliceXX_N12_<ts>/
 ---
 
 ## Appendix: slice-level metrics quick table (optional)
-（后续可自动生成/追加）
+（slice05 完成后补一个简表）
