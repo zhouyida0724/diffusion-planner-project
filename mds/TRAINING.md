@@ -87,7 +87,7 @@ exports_local/boston50w_prod/sliceXX_N12_<ts>/
 ```
 
 已完成 slice（截至当前文档编写时）：
-- slice01: `exports/boston50w_prod/slice01_20260326_093747/`（N=8）
+- slice01: `exports_local/boston50w_prod/slice01_20260326_093747/`（N=8）
 - slice02: `exports_local/boston50w_prod/slice02_N12_20260326_105143/`
 - slice03: `exports_local/boston50w_prod/slice03_N12_20260326_115618/`
 - slice04: `exports_local/boston50w_prod/slice04_N12_20260328_205401/`
