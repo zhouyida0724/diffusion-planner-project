@@ -19,9 +19,18 @@ def idm_planner_overrides() -> PlannerOverrides:
 
 
 def diffusion_planner_overrides(ckpt_path: Optional[str] = None) -> PlannerOverrides:
+    """Select diffusion_planner and point its _target_ to our repo-local planner.
+
+    We intentionally do NOT modify vendor code under `nuplan-visualization/`.
+    Instead, we override the hydra target at runtime.
+    """
     args: List[str] = ["planner=diffusion_planner"]
+
+    # Override the planner implementation.
+    args.append(
+        "planner.diffusion_planner._target_=src.platform.nuplan.planners.diffusion_planner_ckpt_planner.DiffusionPlannerCkpt"
+    )
+
     if ckpt_path:
-        # nuPlan composes planner configs under the `planner` root key.
-        # The diffusion planner config lives at `planner.diffusion_planner.ckpt_path`.
         args.append(f"planner.diffusion_planner.ckpt_path={ckpt_path}")
     return PlannerOverrides(args=args)

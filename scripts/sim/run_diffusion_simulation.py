@@ -52,7 +52,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    pythonpath = "/workspace/nuplan-visualization:/workspace/diffusion_planner"
+    # Ensure both nuPlan vendor code and our repo code are importable in the simulation subprocess.
+    # Put repo root first so `src.*` is always resolvable.
+    repo_root = Path(__file__).resolve().parents[2]
+    pythonpath = f"{repo_root}:/workspace/nuplan-visualization"
 
     planner_key = args.planner
     if planner_key in {"idm", "idm_planner"}:
