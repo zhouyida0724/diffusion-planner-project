@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner, PlannerInitialization, PlannerInput
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
@@ -191,11 +192,14 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         # nothing else required
         return
 
-    @property
     def name(self) -> str:
         return "diffusion_planner_ckpt"
 
-    def compute_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
+    def observation_type(self) -> type[Observation]:
+        # We only need ego history; detections are unused for now.
+        return DetectionsTracks
+
+    def compute_planner_trajectory(self, current_input: PlannerInput) -> AbstractTrajectory:
         if self._model is None:
             raise RuntimeError("Model is not loaded")
 
