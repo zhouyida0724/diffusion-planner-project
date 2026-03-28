@@ -14,15 +14,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Prefer container path layout when available.
+# In Docker we usually have:
+#   - repo mounted at: /workspace/<repo_name> (this script lives inside it)
+#   - nuplan-visualization mounted at: /workspace/nuplan-visualization
+# We should therefore use:
+#   - REPO_ROOT for outputs
+#   - /workspace/nuplan-visualization for nuBoard code when available
 if [[ -d /workspace/nuplan-visualization ]]; then
-  WORKSPACE=/workspace
+  NUPLAN_VIZ_ROOT="/workspace/nuplan-visualization"
 else
-  WORKSPACE="${REPO_ROOT}"
+  NUPLAN_VIZ_ROOT="${REPO_ROOT}/nuplan-visualization"
 fi
 
-NUPLAN_VIZ_ROOT="${WORKSPACE}/nuplan-visualization"
-OUTPUTS_ROOT_DEFAULT="${WORKSPACE}/outputs/sim/exp/simulation"
+# Default outputs root is relative to this repo.
+OUTPUTS_ROOT_DEFAULT="${REPO_ROOT}/outputs/sim/exp/simulation"
 
 usage() {
   cat <<'EOF'
@@ -111,9 +116,9 @@ EOF
   fi
 fi
 
-# Normalize relative paths to absolute (relative to workspace).
+# Normalize relative paths to absolute (relative to repo root).
 if [[ "${SIM_DIR}" != /* ]]; then
-  SIM_DIR="${WORKSPACE}/${SIM_DIR}"
+  SIM_DIR="${REPO_ROOT}/${SIM_DIR}"
 fi
 
 if [[ ! -d "${SIM_DIR}" ]]; then
