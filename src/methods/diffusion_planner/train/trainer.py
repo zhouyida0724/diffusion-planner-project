@@ -193,16 +193,31 @@ class _PerfTracker:
         if ema is None:
             ema = float("nan")
 
+        # Use observed wall-clock average (includes data loading) for projections.
+        avg_step_s = float("nan")
+        if last:
+            denom = float(int(last.get("step", 0)) + 1)
+            if denom > 0:
+                avg_step_s = float(last.get("wall_s_since_start", float("nan"))) / denom
+
         # projections
         proj_steps = {
             "n_steps": int(self.cfg.steps),
-            "time_s": float(ema) * int(self.cfg.steps),
+            "time_s": float(avg_step_s) * int(self.cfg.steps),
+            "avg_step_s": float(avg_step_s),
+            "ema_step_s": float(ema),
         }
 
         # Boston50w kept samples: ~404k
         kept = 404_000
         epoch_steps = int((kept + int(self.cfg.batch_size) - 1) // int(self.cfg.batch_size))
-        proj_epoch = {"kept_samples": kept, "epoch_steps": epoch_steps, "time_s": float(ema) * epoch_steps}
+        proj_epoch = {
+            "kept_samples": kept,
+            "epoch_steps": epoch_steps,
+            "time_s": float(avg_step_s) * epoch_steps,
+            "avg_step_s": float(avg_step_s),
+            "ema_step_s": float(ema),
+        }
 
         # achieved tflops from profiler (if available)
         achieved_tflops = None
@@ -449,6 +464,10 @@ def _print_perf_summary(perf: _PerfTracker) -> None:
             )
 
     if steps:
+        print(
+            f"avg_step_s (wall): {steps.get('avg_step_s', float('nan')):.4f} | "
+            f"ema_step_s (compute-only-ish): {steps.get('ema_step_s', float('nan')):.4f}"
+        )
         print(f"projected time for {steps.get('n_steps')} steps: {_fmt_hhmmss(steps.get('time_s', float('nan')))}")
     if epoch:
         print(
