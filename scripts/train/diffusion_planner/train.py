@@ -16,6 +16,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -28,15 +29,64 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.methods.diffusion_planner.data.npz_dataset import ShardedNpzDataset
+from src.methods.diffusion_planner.models.eps_mlp import EpsMLP
 from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
-from src.methods.diffusion_planner.train.trainer import TrainConfig, train_loop
+from src.methods.diffusion_planner.train.trainer import TrainConfig, train_loop, train_loop_diffusion_eps
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--data-root", type=str, required=True,
-                   help="Slice dir, shards dir, or shard dir containing data.npz + manifest.jsonl")
+
+    # Back-compat: old single-root flag.
+    p.add_argument(
+        "--data-root",
+        type=str,
+        default=None,
+        help="(Deprecated) Single root (slice/shards/shard dir). Use --train-roots instead.",
+    )
+
+    p.add_argument(
+        "--train-roots",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "One or more roots. Each can be a slice dir, a shards/ dir, a shard_*/ dir, "
+            "or a boston50w_prod root when used with --train-slices."
+        ),
+    )
+    p.add_argument(
+        "--val-roots",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional validation roots (same conventions as --train-roots).",
+    )
+
+    p.add_argument(
+        "--train-slices",
+        type=str,
+        nargs="+",
+        default=None,
+        help="When a train-root points to boston50w_prod, pick these slice directory names.",
+    )
+    p.add_argument(
+        "--val-slices",
+        type=str,
+        nargs="+",
+        default=None,
+        help="When a val-root points to boston50w_prod, pick these slice directory names.",
+    )
+
     p.add_argument("--exp-name", type=str, required=True)
+
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="diffusion_eps",
+        choices=["mlp", "diffusion_eps"],
+        help="Training mode. 'mlp' keeps the original regression baseline.",
+    )
 
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=32)
@@ -47,16 +97,54 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
 
-    p.add_argument("--max-samples", type=int, default=None,
-                   help="Optionally cap number of kept samples to index (for smoke tests).")
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Optionally cap number of kept samples to index (for smoke tests).",
+    )
 
     return p.parse_args()
+
+
+def _expand_roots(roots: list[str] | None, slices: list[str] | None) -> list[str]:
+    """Expand boston50w_prod roots + slice list into explicit slice dirs."""
+
+    if not roots:
+        return []
+
+    out: list[str] = []
+    for r in roots:
+        rp = Path(r).expanduser()
+        if slices is None:
+            out.append(str(rp))
+            continue
+
+        # If user provided slices, we interpret rp as a *dataset root* (e.g. boston50w_prod)
+        # containing slice directories.
+        for s in slices:
+            out.append(str((rp / s).resolve()))
+
+    return out
 
 
 def main() -> None:
     args = parse_args()
 
-    ds = ShardedNpzDataset(args.data_root, max_samples=args.max_samples)
+    if args.train_roots is None and args.data_root is not None:
+        train_roots = [args.data_root]
+    else:
+        train_roots = args.train_roots or []
+
+    val_roots = args.val_roots or []
+
+    train_roots = _expand_roots(train_roots, args.train_slices)
+    val_roots = _expand_roots(val_roots, args.val_slices)
+
+    if not train_roots:
+        raise SystemExit("No training roots provided. Use --train-roots (or legacy --data-root).")
+
+    ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
     print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
 
     dl = DataLoader(
@@ -67,8 +155,6 @@ def main() -> None:
         pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
         drop_last=True,
     )
-
-    model = SimpleFutureMLP(x_dim=ds.x_dim, T=ds.y_T)
 
     cfg = TrainConfig(
         exp_name=args.exp_name,
@@ -82,7 +168,18 @@ def main() -> None:
         device=args.device,
     )
 
-    exp_dir = train_loop(cfg=cfg, model=model, train_loader=dl)
+    # Pre-create exp dir so we can write data stats even if training crashes.
+    exp_dir = Path(cfg.out_root) / cfg.exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "data_stats.json").write_text(json.dumps(ds.get_data_stats(), indent=2))
+
+    if args.mode == "mlp":
+        model = SimpleFutureMLP(x_dim=ds.x_dim, T=ds.y_T)
+        exp_dir = train_loop(cfg=cfg, model=model, train_loader=dl)
+    else:
+        model = EpsMLP(x_dim=ds.x_dim, T=ds.y_T)
+        exp_dir = train_loop_diffusion_eps(cfg=cfg, model=model, train_loader=dl)
+
     print(f"Done. Outputs written to: {exp_dir}")
 
 

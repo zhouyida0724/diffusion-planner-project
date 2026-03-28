@@ -18,6 +18,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
+from src.methods.diffusion_planner.diffusion.losses import masked_mse
+from src.methods.diffusion_planner.diffusion.scheduler import NoiseSchedule, q_sample
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -141,6 +144,122 @@ def train_loop(
         latest.symlink_to(os.path.basename(ckpt_path))
     except Exception:
         # fallback: copy
+        import shutil
+
+        shutil.copy2(ckpt_path, latest)
+
+    return exp_dir
+
+
+def train_loop_diffusion_eps(
+    *,
+    cfg: TrainConfig,
+    model: torch.nn.Module,
+    train_loader: DataLoader,
+    schedule_cfg: NoiseSchedule = NoiseSchedule(),
+    max_grad_norm: Optional[float] = 1.0,
+) -> Path:
+    """Train an eps-pred diffusion model.
+
+    Expected model signature:
+        eps_hat = model(x, y_t, t)
+
+    Where:
+        x: [B, x_dim]
+        y_t: [B, T, 3]
+        t: [B]
+
+    Loss:
+        MSE(eps_hat, eps) (optionally masked)
+
+    This is a minimal training loop meant for smoke tests.
+    """
+
+    seed_everything(cfg.seed)
+
+    device = torch.device(cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu")
+    model = model.to(device)
+
+    exp_dir = Path(cfg.out_root) / cfg.exp_name
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    (exp_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    schedule = schedule_cfg.make(device=device)
+
+    model.train()
+    t0 = time.time()
+    step = 0
+    loader_it = iter(train_loader)
+
+    while step < cfg.steps:
+        try:
+            batch = next(loader_it)
+        except StopIteration:
+            loader_it = iter(train_loader)
+            batch = next(loader_it)
+
+        x = batch["x"].to(device=device, dtype=torch.float32)
+        y0 = batch["y"].to(device=device, dtype=torch.float32)
+        mask = batch.get("mask")
+        if mask is not None:
+            mask = mask.to(device=device)
+
+        assert x.ndim == 2
+        assert y0.ndim == 3 and y0.shape[-1] == 3
+
+        _assert_finite(x, "x")
+        _assert_finite(y0, "y0")
+
+        B = x.shape[0]
+        t = torch.randint(low=0, high=schedule.num_steps, size=(B,), device=device, dtype=torch.int64)
+        eps = torch.randn_like(y0)
+        y_t = q_sample(schedule=schedule, x0=y0, t=t, noise=eps)
+
+        eps_hat = model(x, y_t, t)
+        assert eps_hat.shape == eps.shape
+        _assert_finite(eps_hat, "eps_hat")
+
+        loss = masked_mse(eps_hat, eps, mask=mask)
+        _assert_finite(loss, "loss")
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        if max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+        opt.step()
+
+        if (step % cfg.log_every) == 0 or step == cfg.steps - 1:
+            dt = time.time() - t0
+            msg = f"step {step:05d} | loss {loss.item():.6f} | {dt:.1f}s"
+            print(msg, flush=True)
+            with (exp_dir / "train.log").open("a") as f:
+                f.write(msg + "\n")
+
+        if (step % cfg.ckpt_every) == 0 or step == cfg.steps - 1:
+            ckpt_path = exp_dir / f"checkpoint_step_{step:06d}.pt"
+            torch.save(
+                {
+                    "step": step,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": opt.state_dict(),
+                    "cfg": asdict(cfg),
+                },
+                ckpt_path,
+            )
+
+        step += 1
+
+    latest = exp_dir / "checkpoint_latest.pt"
+    try:
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(os.path.basename(ckpt_path))
+    except Exception:
         import shutil
 
         shutil.copy2(ckpt_path, latest)

@@ -166,10 +166,53 @@ exports_local/boston50w_prod/sliceXX_N12_<ts>/
 - 必要预处理：读 manifest → 过滤/分桶/重采样 → 构建 train/val index。
 - 可选预处理：cache index、统计 mean/std、把 NPZ 转换为更友好的格式（zarr/webdataset）。
 
-### 5.4 启动方式（先给骨架；等训练代码落地后补最终命令）
+### 5.4 启动方式（我们的最小训练入口）
+
+训练入口：`scripts/train/diffusion_planner/train.py`
+
+支持两种数据指定方式：
+1) 直接传 slice/shards/shard 路径（可以多个）：`--train-roots ...`
+2) 传 `boston50w_prod` 根目录 + 指定 train/val slices：`--train-roots <boston50w_prod> --train-slices ...`（val 同理）
+
+#### 5.4.1 Sanity run（CPU 或单卡）
+
+**从单个 slice 开始：**
+```bash
+python scripts/train/diffusion_planner/train.py \
+  --train-roots exports_local/boston50w_prod/slice02_N12_20260326_105143 \
+  --exp-name smoke_diffusion_eps \
+  --mode diffusion_eps \
+  --max-samples 2048 \
+  --steps 200 --batch-size 32 --device cpu
+```
+
+**从 boston50w_prod 根目录选择 slices：**
+```bash
+python scripts/train/diffusion_planner/train.py \
+  --train-roots exports_local/boston50w_prod \
+  --train-slices slice01_20260326_093747 slice02_N12_20260326_105143 slice03_N12_20260326_115618 \
+  --exp-name smoke_multi_slice \
+  --mode diffusion_eps \
+  --max-samples 4096 \
+  --steps 200 --batch-size 32
+```
+
+训练输出写到：`outputs/training/<exp_name>/`，并会额外写一份：
+- `data_stats.json`（样本数、hard-skip 比例、每 shard 统计）
+
+#### 5.4.2 回归基线（旧版 MLP，保持可用）
+```bash
+python scripts/train/diffusion_planner/train.py \
+  --train-roots exports_local/boston50w_prod/slice02_N12_20260326_105143 \
+  --exp-name smoke_mlp \
+  --mode mlp \
+  --max-samples 2048 \
+  --steps 200 --batch-size 32
+```
+
 - Sanity run：小数据 + 100–1000 steps（验证 loss/NaN/吞吐）。
-- Full run：多卡 torchrun。
-- Resume：从 checkpoint 恢复。
+- Full run：多卡 torchrun（后续补齐 DDP/val 等）。
+- Resume：从 checkpoint 恢复（后续补齐）。
 
 ---
 
