@@ -129,8 +129,28 @@ fi
 echo "[nuBoard] Using simulation_path: ${SIM_DIR}"
 echo "[nuBoard] Starting on port: ${PORT}"
 
+# nuBoard needs a scenario_builder config to load scenario metadata.
+# Default to the nuPlan mini cache path used by our containers.
+NUPLAN_DATA_ROOT_DEFAULT="/workspace/data/nuplan/data/cache/mini"
+NUPLAN_DATA_ROOT="${NUPLAN_DATA_ROOT:-${NUPLAN_DATA_ROOT_DEFAULT}}"
+
+if [[ ! -d "${NUPLAN_DATA_ROOT}" ]]; then
+  cat >&2 <<EOF
+ERROR: NUPLAN_DATA_ROOT does not exist: ${NUPLAN_DATA_ROOT}
+
+Set it explicitly, e.g.:
+  NUPLAN_DATA_ROOT=/workspace/data/nuplan/data/cache/mini \
+    ./scripts/run_nuboard.sh
+EOF
+  exit 1
+fi
+
+echo "[nuBoard] scenario_builder.data_root=${NUPLAN_DATA_ROOT}"
+
 cd "${NUPLAN_VIZ_ROOT}"
 
 python3 -m nuplan.planning.script.run_nuboard \
+  scenario_builder=nuplan \
+  "scenario_builder.data_root=${NUPLAN_DATA_ROOT}" \
   "simulation_path=[${SIM_DIR}]" \
   "port_number=${PORT}"
