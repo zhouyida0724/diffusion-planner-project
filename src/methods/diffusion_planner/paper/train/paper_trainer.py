@@ -5,13 +5,54 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch.utils.data import DataLoader
 
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
+
+
+def _read_proc_self_io() -> dict[str, int]:
+    """Best-effort process IO counters from /proc/self/io."""
+
+    try:
+        out: dict[str, int] = {}
+        with open("/proc/self/io", "r") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                try:
+                    out[k] = int(v)
+                except Exception:
+                    continue
+        return out
+    except Exception:
+        return {}
+
+
+def _read_rusage() -> dict[str, Any]:
+    """Best-effort CPU usage snapshot."""
+
+    try:
+        import resource
+
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        return {
+            "ru_utime_s": float(getattr(ru, "ru_utime", 0.0)),
+            "ru_stime_s": float(getattr(ru, "ru_stime", 0.0)),
+            "ru_maxrss_kb": int(getattr(ru, "ru_maxrss", 0)),
+            "ru_inblock": int(getattr(ru, "ru_inblock", 0)),
+            "ru_oublock": int(getattr(ru, "ru_oublock", 0)),
+            "ru_nvcsw": int(getattr(ru, "ru_nvcsw", 0)),
+            "ru_nivcsw": int(getattr(ru, "ru_nivcsw", 0)),
+        }
+    except Exception:
+        return {}
 
 
 def _build_joint_trajectories_x0(batch: dict, *, predicted_neighbor_num: int, future_len: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -106,21 +147,48 @@ def train_loop_paper_dit_xstart(
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
 
+    profile_steps = int(getattr(cfg, "profile_steps", 0) or 0)
+    profile_every = int(getattr(cfg, "profile_every", 0) or 0)
+
+    def _do_profile(i: int) -> bool:
+        return profile_steps > 0 and i < profile_steps
+
+    def _do_profile_print(i: int) -> bool:
+        if not _do_profile(i):
+            return False
+        if profile_every <= 0:
+            return True
+        return (i % profile_every) == 0
+
     while step < cfg.steps:
         step_t0 = time.time()
+        breakdown: dict[str, Any] = {}
+
+        # Best-effort host stats (for IO stalls).
+        io0 = _read_proc_self_io() if _do_profile(step) else {}
+        ru0 = _read_rusage() if _do_profile(step) else {}
+
+        # dataloader
+        t_seg = time.perf_counter()
         try:
             batch = next(loader_it)
         except StopIteration:
             loader_it = iter(train_loader)
             batch = next(loader_it)
+        breakdown["dataloader_next_s"] = float(time.perf_counter() - t_seg)
 
         # move tensors
+        t_seg = time.perf_counter()
         batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        breakdown["to_device_s"] = float(time.perf_counter() - t_seg)
 
-        x0_4, current_states = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+        # build + diffusion setup (count as misc, but keep a couple sub-keys for debugging)
+        t_seg = time.perf_counter()
+        x0_4, _current_states = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
         _assert_finite(x0_4, "x0")
+        breakdown["build_x0_s"] = float(time.perf_counter() - t_seg)
 
-        # normalize
+        t_seg = time.perf_counter()
         x0n = model.config.state_normalizer(x0_4)
 
         B = x0n.shape[0]
@@ -129,8 +197,8 @@ def train_loop_paper_dit_xstart(
 
         mean, std = model.sde.marginal_prob(x0n, t)
         xt = mean + std * noise
-        # hard constraint current state
         xt[:, :, 0, :] = x0n[:, :, 0, :]
+        breakdown["misc_setup_s"] = float(time.perf_counter() - t_seg)
 
         inputs = {
             "ego_current_state": batch["ego_current_state"],
@@ -146,22 +214,88 @@ def train_loop_paper_dit_xstart(
             "diffusion_time": t,
         }
 
+        # forward
+        if _do_profile(step):
+            _maybe_sync(device)
+        t_seg = time.perf_counter()
         _, dec_out = model(inputs)
+        if _do_profile(step):
+            _maybe_sync(device)
+        breakdown["forward_s"] = float(time.perf_counter() - t_seg)
+
         pred = dec_out["score"]  # [B,P,1+T,4]
         _assert_finite(pred, "pred")
 
+        # loss
+        if _do_profile(step):
+            _maybe_sync(device)
+        t_seg = time.perf_counter()
         loss = torch.mean((pred - x0n) ** 2)
+        if _do_profile(step):
+            _maybe_sync(device)
+        breakdown["loss_s"] = float(time.perf_counter() - t_seg)
         _assert_finite(loss, "loss")
 
+        # optim
+        if _do_profile(step):
+            _maybe_sync(device)
+        t_seg = time.perf_counter()
         opt.zero_grad(set_to_none=True)
+        breakdown["zero_grad_s"] = float(time.perf_counter() - t_seg)
+
+        if _do_profile(step):
+            _maybe_sync(device)
+        t_seg = time.perf_counter()
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        opt.step()
+        if _do_profile(step):
+            _maybe_sync(device)
+        breakdown["backward_s"] = float(time.perf_counter() - t_seg)
 
+        if _do_profile(step):
+            _maybe_sync(device)
+        t_seg = time.perf_counter()
+        opt.step()
+        if _do_profile(step):
+            _maybe_sync(device)
+        breakdown["optim_step_s"] = float(time.perf_counter() - t_seg)
+
+        # overall step
         _maybe_sync(device)
         step_s = time.time() - step_t0
         perf.on_step_end(step=step, step_s=step_s, loss=float(loss.item()))
+
+        # attach breakdown + host stats to perf record (perf.json)
+        if _do_profile(step) and perf.records:
+            rec = perf.records[-1]
+            rec["breakdown"] = dict(breakdown)
+            rec["rusage"] = dict(ru0) if ru0 else {}
+            rec["proc_io0"] = dict(io0) if io0 else {}
+            io1 = _read_proc_self_io()
+            ru1 = _read_rusage()
+            rec["proc_io1"] = dict(io1) if io1 else {}
+            rec["rusage1"] = dict(ru1) if ru1 else {}
+            try:
+                rec["proc_io_delta"] = {k: int(io1.get(k, 0)) - int(io0.get(k, 0)) for k in set(io0) | set(io1)}
+            except Exception:
+                rec["proc_io_delta"] = {}
+
+            # Print a compact breakdown for diagnosis.
+            if _do_profile_print(step):
+                keys = [
+                    "dataloader_next_s",
+                    "to_device_s",
+                    "build_x0_s",
+                    "misc_setup_s",
+                    "forward_s",
+                    "loss_s",
+                    "zero_grad_s",
+                    "backward_s",
+                    "optim_step_s",
+                ]
+                parts = [f"{k}={breakdown.get(k, float('nan')):.4f}" for k in keys]
+                print("[profile] step %05d | %s" % (step, " | ".join(parts)), flush=True)
 
         if (step % cfg.log_every) == 0 or step == cfg.steps - 1:
             dt = time.time() - t0

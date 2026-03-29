@@ -116,6 +116,20 @@ def parse_args() -> argparse.Namespace:
         help="If >0, run torch.profiler for the first N steps to estimate FLOPs (best-effort).",
     )
 
+    # step-level breakdown profiling (wall-clock timers)
+    p.add_argument(
+        "--profile-steps",
+        type=int,
+        default=0,
+        help="If >0, collect a per-step time breakdown for the first N steps and write it into perf.json.",
+    )
+    p.add_argument(
+        "--profile-every",
+        type=int,
+        default=0,
+        help="If >0, print the breakdown every N steps (only during profiled steps).",
+    )
+
     p.add_argument(
         "--max-samples",
         type=int,
@@ -238,6 +252,8 @@ def main() -> None:
         perf_window=args.perf_window,
         perf_smi_every=args.perf_smi_every,
         profiler_steps=args.profiler_steps,
+        profile_steps=args.profile_steps,
+        profile_every=args.profile_every,
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.

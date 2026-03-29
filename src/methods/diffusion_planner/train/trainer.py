@@ -53,6 +53,10 @@ class TrainConfig:
     perf_smi_every: int = 100
     profiler_steps: int = 0  # 0 disables torch.profiler micro-run
 
+    # step-level breakdown profiling (cheap wall-clock timers; best-effort)
+    profile_steps: int = 0  # if >0, collect per-step breakdown for the first N steps
+    profile_every: int = 0  # if >0, print breakdown every N steps (only when profiling is enabled)
+
 
 def seed_everything(seed: int) -> None:
     import random
