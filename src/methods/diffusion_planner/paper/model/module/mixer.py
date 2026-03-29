@@ -24,7 +24,8 @@ class MixerBlock(nn.Module):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate and drop_path_rate > 0 else nn.Identity()
 
         self.norm2 = nn.LayerNorm(channels_mlp_dim)
-        self.mlp_channels = Mlp(in_features=channels_mlp_dim, hidden_features=channels_mlp_dim * 2, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.0)
+        # NOTE: repo checkpoints use hidden_features == channels_mlp_dim (mlp_ratio=1).
+        self.mlp_channels = Mlp(in_features=channels_mlp_dim, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # token-mixing: (B, T, C) -> (B, C, T) apply MLP over tokens

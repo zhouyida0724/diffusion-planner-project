@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Deque, Optional
 
+import os
 import numpy as np
 import torch
 
@@ -148,6 +149,232 @@ def _build_x_from_history(ego_states: Deque[EgoState], *, history_len: int = 21)
     return x.astype(np.float32)
 
 
+def _safe_obj_id(obj: object) -> str | None:
+    """Best-effort stable id for a tracked object across history frames."""
+    for attr in ("track_token", "token", "track_id", "uuid", "id"):
+        v = getattr(obj, attr, None)
+        if v is None:
+            continue
+        try:
+            if isinstance(v, (bytes, bytearray)):
+                return v.hex()
+            return str(v)
+        except Exception:
+            continue
+    return None
+
+
+def _safe_xy_heading_v_wl_type(
+    obj: object,
+) -> tuple[float | None, float | None, float | None, float | None, float | None, float | None, float | None, np.ndarray]:
+    """Extract (x,y,heading,vx,vy,width,length,type_onehot3) from a nuPlan tracked object."""
+    x = y = heading = vx = vy = width = length = None
+
+    # pose
+    try:
+        c = getattr(obj, "center")
+        x = float(getattr(c, "x"))
+        y = float(getattr(c, "y"))
+        heading = float(getattr(c, "heading"))
+    except Exception:
+        try:
+            box = getattr(obj, "box")
+            c = getattr(box, "center")
+            x = float(getattr(c, "x"))
+            y = float(getattr(c, "y"))
+            heading = float(getattr(c, "heading"))
+        except Exception:
+            pass
+
+    # velocity
+    for attr in ("velocity", "velocity_2d", "predicted_velocity"):
+        try:
+            v = getattr(obj, attr)
+            vx = float(getattr(v, "x"))
+            vy = float(getattr(v, "y"))
+            break
+        except Exception:
+            continue
+
+    # size
+    try:
+        box = getattr(obj, "box")
+        width = float(getattr(box, "width"))
+        length = float(getattr(box, "length"))
+    except Exception:
+        try:
+            width = float(getattr(obj, "width"))
+            length = float(getattr(obj, "length"))
+        except Exception:
+            pass
+
+    # type onehot(3): vehicle, pedestrian, bicycle
+    t = getattr(obj, "tracked_object_type", None)
+    if t is None:
+        t = getattr(obj, "object_type", None)
+    t_name = None
+    try:
+        t_name = str(getattr(t, "name", t))
+    except Exception:
+        t_name = None
+
+    onehot = np.zeros((3,), dtype=np.float32)
+    if t_name:
+        n = str(t_name).upper()
+        if "VEH" in n or "CAR" in n:
+            onehot[0] = 1.0
+        elif "PED" in n:
+            onehot[1] = 1.0
+        elif "BIC" in n or "CYC" in n:
+            onehot[2] = 1.0
+
+    return x, y, heading, vx, vy, width, length, onehot
+
+
+def _build_neighbor_agents_past_from_history(
+    *,
+    history: object,
+    cur_ego: _EgoKinematics,
+    predicted_neighbor_num: int,
+    time_len: int,
+    runtime_debug: bool = False,
+) -> tuple[np.ndarray, int]:
+    """Build neighbor_agents_past: [P, time_len, 11] in current ego frame."""
+
+    Pn = int(predicted_neighbor_num)
+    V = int(time_len)
+    out = np.zeros((Pn, V, 11), dtype=np.float32)
+
+    obs_deque = getattr(history, "observations", None)
+    if not obs_deque:
+        return out, 0
+
+    obs_list = list(obs_deque)
+    if not obs_list:
+        return out, 0
+
+    obs_tail = obs_list[-V:]
+    aligned: list[object | None] = [None] * V
+    offset = V - len(obs_tail)
+    for i, o in enumerate(obs_tail):
+        aligned[offset + i] = o
+
+    last_obs = aligned[-1]
+    if not isinstance(last_obs, DetectionsTracks):
+        if runtime_debug:
+            try:
+                print(f"[DP_RUNTIME_DEBUG] neighbors: last_obs not DetectionsTracks: {type(last_obs)}")
+            except Exception:
+                pass
+        return out, 0
+
+    tracked = getattr(last_obs, "tracked_objects", None)
+    if tracked is None:
+        return out, 0
+
+    candidates: list[object] = []
+    # prefer vehicles
+    try:
+        from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
+
+        try:
+            candidates = list(tracked.get_tracked_objects_of_type(TrackedObjectType.VEHICLE))
+        except Exception:
+            candidates = []
+    except Exception:
+        candidates = []
+
+    if not candidates:
+        for attr in ("tracked_objects", "get_tracked_objects"):
+            try:
+                v = getattr(tracked, attr)
+                candidates = list(v() if callable(v) else v)
+                break
+            except Exception:
+                continue
+
+    if not candidates:
+        return out, 0
+
+    scored: list[tuple[float, str]] = []
+    for obj in candidates:
+        oid = _safe_obj_id(obj)
+        if oid is None:
+            continue
+        x, y, heading, vx, vy, width, length, onehot = _safe_xy_heading_v_wl_type(obj)
+        if x is None or y is None:
+            continue
+        d2 = float((x - cur_ego.x) ** 2 + (y - cur_ego.y) ** 2)
+        scored.append((d2, oid))
+
+    if not scored:
+        return out, 0
+
+    scored.sort(key=lambda t: t[0])
+    chosen_ids = [oid for _, oid in scored[:Pn]]
+
+    frame_maps: list[dict[str, object]] = []
+    for o in aligned:
+        m: dict[str, object] = {}
+        if isinstance(o, DetectionsTracks):
+            tr = getattr(o, "tracked_objects", None)
+            if tr is not None:
+                objs: list[object] = []
+                for attr in ("tracked_objects", "get_tracked_objects"):
+                    try:
+                        v = getattr(tr, attr)
+                        objs = list(v() if callable(v) else v)
+                        break
+                    except Exception:
+                        continue
+                for obj in objs:
+                    oid = _safe_obj_id(obj)
+                    if oid is not None:
+                        m[oid] = obj
+        frame_maps.append(m)
+
+    R = _rot2d(-cur_ego.heading)
+
+    for p, oid in enumerate(chosen_ids):
+        for t in range(V):
+            obj = frame_maps[t].get(oid)
+            if obj is None:
+                continue
+            x, y, heading, vx, vy, width, length, onehot = _safe_xy_heading_v_wl_type(obj)
+            if x is None or y is None or heading is None:
+                continue
+
+            dx_dy = R @ np.array([x - cur_ego.x, y - cur_ego.y], dtype=np.float64)
+            d_heading = _wrap_pi(float(heading) - cur_ego.heading)
+            out[p, t, 0] = float(dx_dy[0])
+            out[p, t, 1] = float(dx_dy[1])
+            out[p, t, 2] = float(np.cos(d_heading))
+            out[p, t, 3] = float(np.sin(d_heading))
+
+            if vx is not None and vy is not None:
+                vv = R @ np.array([vx, vy], dtype=np.float64)
+                out[p, t, 4] = float(vv[0])
+                out[p, t, 5] = float(vv[1])
+
+            out[p, t, 6] = float(width) if width is not None else 0.0
+            out[p, t, 7] = float(length) if length is not None else 0.0
+            out[p, t, 8:11] = onehot
+
+        # constant-hold backfill
+        valid = np.any(out[p, :, :8] != 0.0, axis=1)
+        if not np.any(valid):
+            continue
+        first = int(np.argmax(valid))
+        for t in range(0, first):
+            out[p, t] = out[p, first]
+        for t in range(1, V):
+            if not valid[t]:
+                out[p, t] = out[p, t - 1]
+
+    nonzero = int(np.count_nonzero(out))
+    return out, nonzero
+
+
 class DiffusionPlannerCkpt(AbstractPlanner):
     """nuPlan planner that loads a repo-local checkpoint and predicts a trajectory."""
 
@@ -180,6 +407,11 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._route_roadblock_ids = None
         self._init_done = False
 
+        # Runtime debug (gated by env var)
+        self._runtime_debug = os.getenv("DP_RUNTIME_DEBUG", "0") not in ("", "0", "false", "False")
+        self._runtime_debug_k = int(os.getenv("DP_RUNTIME_DEBUG_K", "5"))
+        self._runtime_debug_ticks = 0
+
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
         self._future_horizon = float(self._future_trajectory_sampling.time_horizon)
@@ -189,12 +421,43 @@ class DiffusionPlannerCkpt(AbstractPlanner):
 
     def _load_checkpoint_or_raise(self) -> None:
         ckpt = torch.load(self._ckpt_path, map_location="cpu")
+        if isinstance(ckpt, dict) and "model_state" not in ckpt and "model_state_dict" in ckpt:
+            ckpt = dict(ckpt)
+            ckpt["model_state"] = ckpt["model_state_dict"]
+
         if not isinstance(ckpt, dict) or "model_state" not in ckpt:
             raise RuntimeError(
                 f"Unsupported ckpt format: expected dict with 'model_state', got keys={list(getattr(ckpt,'keys',lambda:[])())}"
             )
 
         kind = str(ckpt.get("kind", "mlp"))
+        # Heuristic: paper-model checkpoints may omit `kind`.
+        try:
+            sd_keys = list(getattr(ckpt.get("model_state"), "keys", lambda: [])())
+        except Exception:
+            sd_keys = []
+        if kind == "mlp" and any(("encoder.encoder.neighbor_encoder" in k) or ("decoder.decoder.dit" in k) for k in sd_keys):
+            kind = PaperDiffusionPlanner.CKPT_KIND
+
+        # Strip common DDP prefix + patch known key naming drifts.
+        try:
+            sd = ckpt.get("model_state")
+            if isinstance(sd, dict) and any(str(k).startswith("module.") for k in sd.keys()):
+                sd = {str(k)[len("module.") :]: v for k, v in sd.items()}
+            if kind == PaperDiffusionPlanner.CKPT_KIND and isinstance(sd, dict):
+                remapped = {}
+                for k, v in sd.items():
+                    nk = str(k)
+                    nk = nk.replace(".tokens_mlp.", ".mlp_tokens.")
+                    nk = nk.replace(".channels_mlp.", ".mlp_channels.")
+                    nk = nk.replace("route_encoder.Mixer.", "route_encoder.mixer.")
+                    remapped[nk] = v
+                sd = remapped
+            ckpt = dict(ckpt)
+            ckpt["model_state"] = sd
+        except Exception:
+            pass
+
         self._ckpt_kind = kind
 
         if kind == PaperDiffusionPlanner.CKPT_KIND:
@@ -243,6 +506,8 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         if self._device == "cuda":
             x_t = x_t.cuda(non_blocking=True)
 
+        neighbor_agents_past_nonzero_count: int = 0
+
         if self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND:
             assert isinstance(self._model, PaperDiffusionPlanner)
             if not self._init_done or self._map_api is None:
@@ -282,8 +547,54 @@ class DiffusionPlannerCkpt(AbstractPlanner):
 
             ego_current_state = torch.from_numpy(x[:10]).view(1, 10)
 
-            # Neighbors: TODO proper runtime track history; for now keep zeros but NOT zero maps/route.
-            neighbor_agents_past = torch.zeros((B, Pn, time_len, 11), dtype=torch.float32)
+            dbg_should_print = self._runtime_debug and (self._runtime_debug_ticks < self._runtime_debug_k)
+
+            # Neighbors: minimal runtime track history from DetectionsTracks.
+            # Paper model expects `agent_num = 1 + predicted_neighbor_num` and may include ego as slot 0.
+            agent_num = int(getattr(cfg, "agent_num", 1 + Pn))
+            neighbor_all = np.zeros((agent_num, time_len, 11), dtype=np.float32)
+
+            # Fill ego history into slot 0.
+            ego_states = list(current_input.history.ego_states)
+            ego_tail = ego_states[-time_len:]
+            aligned_ego: list[EgoState | None] = [None] * time_len
+            ego_off = time_len - len(ego_tail)
+            for i, s in enumerate(ego_tail):
+                aligned_ego[ego_off + i] = s
+
+            R0 = _rot2d(-cur_k.heading)
+            for t, s in enumerate(aligned_ego):
+                if s is None:
+                    continue
+                k = _ego_kinematics(s)
+                dx_dy = R0 @ np.array([k.x - cur_k.x, k.y - cur_k.y], dtype=np.float64)
+                d_heading = _wrap_pi(k.heading - cur_k.heading)
+                vv = R0 @ np.array([k.vx, k.vy], dtype=np.float64)
+                neighbor_all[0, t, 0] = float(dx_dy[0])
+                neighbor_all[0, t, 1] = float(dx_dy[1])
+                neighbor_all[0, t, 2] = float(np.cos(d_heading))
+                neighbor_all[0, t, 3] = float(np.sin(d_heading))
+                neighbor_all[0, t, 4] = float(vv[0])
+                neighbor_all[0, t, 5] = float(vv[1])
+                neighbor_all[0, t, 6] = 1.8
+                neighbor_all[0, t, 7] = 4.5
+                neighbor_all[0, t, 8] = 1.0
+
+            # Fill tracked neighbor vehicles into slots [1:1+Pn].
+            neighbor_np, neighbor_nz = _build_neighbor_agents_past_from_history(
+                history=current_input.history,
+                cur_ego=cur_k,
+                predicted_neighbor_num=Pn,
+                time_len=time_len,
+                runtime_debug=dbg_should_print,
+            )
+            hi = min(Pn, max(0, agent_num - 1))
+            if hi > 0:
+                neighbor_all[1 : 1 + hi] = neighbor_np[:hi]
+
+            neighbor_agents_past = torch.from_numpy(neighbor_all).view(B, agent_num, time_len, 11)
+            neighbor_agents_past_nonzero_count = int(np.count_nonzero(neighbor_all))
+
             neighbor_agents_future = torch.zeros((B, Pn, future_len, 3), dtype=torch.float32)
             static_objects = torch.zeros((B, int(cfg.static_objects_num), int(cfg.static_objects_state_dim)), dtype=torch.float32)
 
@@ -319,6 +630,26 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             with torch.no_grad():
                 y = self._model(x_t)
             y_np = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+        # --- Runtime debug: conditioning + prediction stats (first K ticks only) ---
+        if self._runtime_debug and (self._runtime_debug_ticks < self._runtime_debug_k):
+            try:
+                xy = y_np[:, :2]
+                dxy = xy[1:] - xy[:-1]
+                seg_lens = np.sqrt((dxy**2).sum(axis=1))
+                path_len = float(seg_lens.sum())
+                start_end = float(np.sqrt(((xy[-1] - xy[0]) ** 2).sum()))
+                print(
+                    "[DP_RUNTIME_DEBUG] tick={tick} neighbor_agents_past_nonzero_count={nap} traj_path_len={pl:.3f} traj_start_end_dist={sed:.3f}".format(
+                        tick=self._runtime_debug_ticks,
+                        nap=int(neighbor_agents_past_nonzero_count),
+                        pl=path_len,
+                        sed=start_end,
+                    )
+                )
+            except Exception:
+                pass
+            self._runtime_debug_ticks += 1
 
         if not np.isfinite(y_np).all():
             raise RuntimeError("Non-finite trajectory prediction (NaN/Inf) from model")
