@@ -200,7 +200,22 @@ python scripts/train/diffusion_planner/train.py \
 训练输出写到：`outputs/training/<exp_name>/`，并会额外写一份：
 - `data_stats.json`（样本数、hard-skip 比例、每 shard 统计）
 
-#### 5.4.2 回归基线（旧版 MLP，保持可用）
+#### 5.4.2 Paper backbone + DPM sampling（DiT x_start，paper_dit_dpm）
+```bash
+python scripts/train/diffusion_planner/train.py \
+  --train-roots exports_local/boston50w_prod/slice02_N12_20260326_105143 \
+  --exp-name smoke_paper_dit_dpm \
+  --mode paper_dit_dpm \
+  --max-samples 512 \
+  --steps 100 --batch-size 2
+```
+
+产物 checkpoint 会包含 metadata：
+- kind=paper_dit_dpm
+- version=1
+- paper_config={...}
+
+#### 5.4.3 回归基线（旧版 MLP，保持可用）
 ```bash
 python scripts/train/diffusion_planner/train.py \
   --train-roots exports_local/boston50w_prod/slice02_N12_20260326_105143 \

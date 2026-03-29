@@ -34,8 +34,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.methods.diffusion_planner.data.npz_dataset import ShardedNpzDataset
+from src.methods.diffusion_planner.data.feature_npz_dataset import ShardedNpzFeatureDataset
 from src.methods.diffusion_planner.models.eps_mlp import EpsMLP
 from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
+from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
+from src.methods.diffusion_planner.paper.train import train_loop_paper_dit_xstart
 from src.methods.diffusion_planner.train.trainer import TrainConfig, train_loop, train_loop_diffusion_eps
 
 
@@ -90,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="diffusion_eps",
-        choices=["mlp", "diffusion_eps"],
+        choices=["mlp", "diffusion_eps", "paper_dit_dpm"],
         help="Training mode. 'mlp' keeps the original regression baseline.",
     )
 
@@ -198,17 +201,29 @@ def main() -> None:
     if not train_roots:
         raise SystemExit("No training roots provided. Use --train-roots (or legacy --data-root).")
 
-    ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
-    print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
-
-    dl = DataLoader(
-        ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
-        drop_last=True,
-    )
+    if args.mode == "paper_dit_dpm":
+        ds = ShardedNpzFeatureDataset(train_roots, max_samples=args.max_samples)
+        print(f"Dataset size: {len(ds)} kept samples | mode=paper_dit_dpm")
+        # NOTE: .npz (ZipFile) can be fragile under multiprocessing; keep it single-worker for now.
+        dl = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
+            drop_last=True,
+        )
+    else:
+        ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
+        print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
+        dl = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
+            drop_last=True,
+        )
 
     cfg = TrainConfig(
         exp_name=args.exp_name,
@@ -233,9 +248,37 @@ def main() -> None:
     if args.mode == "mlp":
         model = SimpleFutureMLP(x_dim=ds.x_dim, T=ds.y_T)
         exp_dir = train_loop(cfg=cfg, model=model, train_loader=dl)
-    else:
+    elif args.mode == "diffusion_eps":
         model = EpsMLP(x_dim=ds.x_dim, T=ds.y_T)
         exp_dir = train_loop_diffusion_eps(cfg=cfg, model=model, train_loader=dl)
+    elif args.mode == "paper_dit_dpm":
+        # Infer feature shapes from dataset to avoid hard-coded mismatches.
+        s0 = ds[0]
+        nb = s0["neighbor_agents_past"]
+        st = s0["static_objects"]
+        ln = s0["lanes"]
+        rt = s0["route_lanes"]
+        ego_f = s0["ego_agent_future"]
+
+        future_len = int(ego_f.shape[0])
+        if future_len == 81:
+            future_len = 80
+
+        paper_cfg = PaperModelConfig(
+            device=args.device,
+            agent_num=int(nb.shape[0]),
+            predicted_neighbor_num=int(nb.shape[0] - 1) if int(nb.shape[0]) > 32 else int(nb.shape[0]),
+            time_len=int(nb.shape[1]),
+            static_objects_num=int(st.shape[0]),
+            lane_num=int(ln.shape[0]),
+            route_num=int(rt.shape[0]),
+            lane_len=int(ln.shape[1]),
+            future_len=future_len,
+        )
+        model = PaperDiffusionPlanner(paper_cfg)
+        exp_dir = train_loop_paper_dit_xstart(cfg=cfg, model=model, train_loader=dl)
+    else:
+        raise SystemExit(f"Unknown mode: {args.mode}")
 
     print(f"Done. Outputs written to: {exp_dir}")
 

@@ -36,6 +36,7 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
+from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
 
 
 @dataclass
@@ -166,7 +167,8 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             if not torch.cuda.is_available():
                 raise RuntimeError("device=cuda requested but torch.cuda.is_available() is False")
 
-        self._model: Optional[SimpleFutureMLP] = None
+        self._model: Optional[torch.nn.Module] = None
+        self._ckpt_kind: str = "mlp"
 
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
@@ -178,12 +180,29 @@ class DiffusionPlannerCkpt(AbstractPlanner):
     def _load_checkpoint_or_raise(self) -> None:
         ckpt = torch.load(self._ckpt_path, map_location="cpu")
         if not isinstance(ckpt, dict) or "model_state" not in ckpt:
-            raise RuntimeError(f"Unsupported ckpt format: expected dict with 'model_state', got keys={list(getattr(ckpt,'keys',lambda:[])())}")
+            raise RuntimeError(
+                f"Unsupported ckpt format: expected dict with 'model_state', got keys={list(getattr(ckpt,'keys',lambda:[])())}"
+            )
 
-        x_dim = 10 + 21 * 3
-        model = SimpleFutureMLP(x_dim=x_dim, T=self._T)
-        model.load_state_dict(ckpt["model_state"], strict=True)
-        model.eval()
+        kind = str(ckpt.get("kind", "mlp"))
+        self._ckpt_kind = kind
+
+        if kind == PaperDiffusionPlanner.CKPT_KIND:
+            paper_cfg_dict = ckpt.get("paper_config") or ckpt.get("paper_cfg") or ckpt.get("paper_model_cfg")
+            if not isinstance(paper_cfg_dict, dict):
+                paper_cfg_dict = {}
+            paper_cfg_dict = dict(paper_cfg_dict)
+            paper_cfg_dict["device"] = self._device
+            paper_cfg = PaperModelConfig(**{k: v for k, v in paper_cfg_dict.items() if k in PaperModelConfig.__annotations__})
+            model = PaperDiffusionPlanner(paper_cfg)
+            model.load_state_dict(ckpt["model_state"], strict=True)
+            model.eval()
+        else:
+            # legacy baseline: SimpleFutureMLP
+            x_dim = 10 + 21 * 3
+            model = SimpleFutureMLP(x_dim=x_dim, T=self._T)
+            model.load_state_dict(ckpt["model_state"], strict=True)
+            model.eval()
 
         if self._device == "cuda":
             model = model.cuda()
@@ -211,10 +230,53 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         if self._device == "cuda":
             x_t = x_t.cuda(non_blocking=True)
 
-        with torch.no_grad():
-            y = self._model(x_t)
+        if self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND:
+            assert isinstance(self._model, PaperDiffusionPlanner)
 
-        y_np = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
+            # Build minimal (mostly-zero) feature dict to keep the full backbone runnable.
+            # This is a smoke-test integration; improving online feature extraction is a next step.
+            cfg = self._model.config
+            B = 1
+            Pn = int(cfg.predicted_neighbor_num)
+            time_len = int(cfg.time_len)
+            future_len = int(cfg.future_len)
+            lane_len = int(cfg.lane_len)
+
+            ego_current_state = torch.from_numpy(x[:10]).view(1, 10)
+
+            neighbor_agents_past = torch.zeros((B, Pn, time_len, 11), dtype=torch.float32)
+            neighbor_agents_future = torch.zeros((B, Pn, future_len, 3), dtype=torch.float32)
+            static_objects = torch.zeros((B, int(cfg.static_objects_num), int(cfg.static_objects_state_dim)), dtype=torch.float32)
+            lanes = torch.zeros((B, int(cfg.lane_num), lane_len, 12), dtype=torch.float32)
+            lanes_speed_limit = torch.zeros((B, int(cfg.lane_num), 1), dtype=torch.float32)
+            lanes_has_speed_limit = torch.zeros((B, int(cfg.lane_num), 1), dtype=torch.float32)
+            route_lanes = torch.zeros((B, int(cfg.route_num), lane_len, 12), dtype=torch.float32)
+
+            inputs = {
+                "ego_current_state": ego_current_state,
+                "neighbor_agents_past": neighbor_agents_past,
+                "neighbor_agents_future": neighbor_agents_future,
+                "ego_agent_future": torch.zeros((B, future_len, 3), dtype=torch.float32),
+                "static_objects": static_objects,
+                "lanes": lanes,
+                "lanes_speed_limit": lanes_speed_limit,
+                "lanes_has_speed_limit": lanes_has_speed_limit,
+                "route_lanes": route_lanes,
+                "route_lanes_speed_limit": torch.zeros((B, int(cfg.route_num), 1), dtype=torch.float32),
+                "route_lanes_has_speed_limit": torch.zeros((B, int(cfg.route_num), 1), dtype=torch.float32),
+            }
+            if self._device == "cuda":
+                inputs = {k: (v.cuda(non_blocking=True) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                y = self._model.sample_trajectory(inputs)  # [T,3]
+
+            y_np = y.detach().cpu().numpy().astype(np.float32)
+        else:
+            with torch.no_grad():
+                y = self._model(x_t)
+            y_np = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
         if not np.isfinite(y_np).all():
             raise RuntimeError("Non-finite trajectory prediction (NaN/Inf) from model")
         if y_np.shape != (self._T, 3):
