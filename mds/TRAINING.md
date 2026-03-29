@@ -201,11 +201,25 @@ python scripts/train/diffusion_planner/train.py \
 - `data_stats.json`（样本数、hard-skip 比例、每 shard 统计）
 
 #### 5.4.2 Paper backbone + DPM sampling（DiT x_start，paper_dit_dpm）
+
+**重要：paper_dit_dpm 训练强制使用 mmap-friendly 的 .npy cache（不再直接读 .npz）。**
+
+1) 先把导出的 shard NPZ 物化成 cache（示例：只做一个 shard）：
 ```bash
-python scripts/train/diffusion_planner/train.py \
+python3 scripts/export/diffusion_planner/pipeline/materialize_training_cache.py \
+  --prod-root exports_local/boston50w_prod \
+  --slices slice02_N12_20260326_105143 \
+  --shards shard_000 \
+  --cache-root outputs/cache/training_arrays
+```
+
+2) 再启动训练（指定同一个 cache-root）：
+```bash
+python3 scripts/train/diffusion_planner/train.py \
   --train-roots exports_local/boston50w_prod/slice02_N12_20260326_105143 \
   --exp-name smoke_paper_dit_dpm \
   --mode paper_dit_dpm \
+  --cache-root outputs/cache/training_arrays \
   --max-samples 512 \
   --steps 100 --batch-size 2
 ```
