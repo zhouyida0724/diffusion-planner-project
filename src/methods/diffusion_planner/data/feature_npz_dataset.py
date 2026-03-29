@@ -155,8 +155,8 @@ class ShardedNpzFeatureDataset(Dataset):
             "lanes_speed_limit": _t("lanes_speed_limit"),
             "lanes_has_speed_limit": _t("lanes_has_speed_limit"),
             "route_lanes": _t("route_lanes"),
-            "route_lanes_speed_limit": _t("route_lanes_speed_limit") if "route_lanes_speed_limit" in z else torch.zeros((1,), dtype=torch.float32),
-            "route_lanes_has_speed_limit": _t("route_lanes_has_speed_limit") if "route_lanes_has_speed_limit" in z else torch.zeros((1,), dtype=torch.float32),
+            "route_lanes_speed_limit": _t("route_lanes_speed_limit") if (cache_dir / "arrays" / "route_lanes_speed_limit.npy").is_file() else torch.zeros((1,), dtype=torch.float32),
+            "route_lanes_has_speed_limit": _t("route_lanes_has_speed_limit") if (cache_dir / "arrays" / "route_lanes_has_speed_limit.npy").is_file() else torch.zeros((1,), dtype=torch.float32),
             "meta": {
                 "sample_id": meta.get("sample_id"),
                 "shard_dir": str(spec.shard_dir),
