@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -137,6 +138,37 @@ def train_loop_paper_dit_xstart(
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    # AMP (stability-first):
+    # - bf16 autocast (preferred): typically stable without GradScaler.
+    # - fp16 autocast: use GradScaler + unscale before clipping.
+    amp_mode = str(getattr(cfg, "amp", "off") or "off").lower()
+    if amp_mode == "off":
+        # Temporary back-compat escape hatch: allow opting into AMP without changing callers.
+        # Prefer wiring a proper CLI flag into scripts/train/diffusion_planner/train.py.
+        env_amp = os.environ.get("DIFFPLANNER_AMP", "").strip().lower()
+        if env_amp:
+            amp_mode = env_amp
+
+    if amp_mode not in {"off", "bf16", "fp16"}:
+        raise ValueError(f"Unknown amp mode: {amp_mode}")
+
+    use_amp = (amp_mode != "off") and (device.type == "cuda") and torch.cuda.is_available()
+    if amp_mode == "bf16":
+        amp_dtype = torch.bfloat16
+        scaler = None
+    elif amp_mode == "fp16":
+        amp_dtype = torch.float16
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    else:
+        amp_dtype = None
+        scaler = None
+
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(use_amp))
+        if device.type == "cuda"
+        else nullcontext()
+    )
+
     perf = _PerfTracker(exp_dir=exp_dir, cfg=cfg, device=device)
 
     model.train()
@@ -218,7 +250,8 @@ def train_loop_paper_dit_xstart(
         if _do_profile(step):
             _maybe_sync(device)
         t_seg = time.perf_counter()
-        _, dec_out = model(inputs)
+        with autocast_ctx:
+            _, dec_out = model(inputs)
         if _do_profile(step):
             _maybe_sync(device)
         breakdown["forward_s"] = float(time.perf_counter() - t_seg)
@@ -230,7 +263,8 @@ def train_loop_paper_dit_xstart(
         if _do_profile(step):
             _maybe_sync(device)
         t_seg = time.perf_counter()
-        loss = torch.mean((pred - x0n) ** 2)
+        with autocast_ctx:
+            loss = torch.mean((pred - x0n) ** 2)
         if _do_profile(step):
             _maybe_sync(device)
         breakdown["loss_s"] = float(time.perf_counter() - t_seg)
@@ -246,9 +280,16 @@ def train_loop_paper_dit_xstart(
         if _do_profile(step):
             _maybe_sync(device)
         t_seg = time.perf_counter()
-        loss.backward()
-        if max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            # unscale before clipping / finite checks
+            scaler.unscale_(opt)
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        else:
+            loss.backward()
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         if _do_profile(step):
             _maybe_sync(device)
         breakdown["backward_s"] = float(time.perf_counter() - t_seg)
@@ -256,7 +297,11 @@ def train_loop_paper_dit_xstart(
         if _do_profile(step):
             _maybe_sync(device)
         t_seg = time.perf_counter()
-        opt.step()
+        if scaler is not None and scaler.is_enabled():
+            scaler.step(opt)
+            scaler.update()
+        else:
+            opt.step()
         if _do_profile(step):
             _maybe_sync(device)
         breakdown["optim_step_s"] = float(time.perf_counter() - t_seg)

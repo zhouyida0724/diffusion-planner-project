@@ -48,6 +48,9 @@ class TrainConfig:
     seed: int = 0
     device: str = "cuda"  # 'cuda' or 'cpu'
 
+    # amp
+    amp: str = "off"  # off|bf16|fp16
+
     # perf
     perf_window: int = 100
     perf_smi_every: int = 100

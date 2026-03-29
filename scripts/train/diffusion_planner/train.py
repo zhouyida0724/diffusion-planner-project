@@ -101,6 +101,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument(
+        "--amp",
+        type=str,
+        default="off",
+        choices=["off", "bf16", "fp16"],
+        help="Mixed precision mode. bf16 preferred; fp16 uses GradScaler. Default: off.",
+    )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
@@ -218,12 +225,11 @@ def main() -> None:
     if args.mode == "paper_dit_dpm":
         ds = ShardedNpzFeatureDataset(train_roots, max_samples=args.max_samples)
         print(f"Dataset size: {len(ds)} kept samples | mode=paper_dit_dpm")
-        # NOTE: .npz (ZipFile) can be fragile under multiprocessing; keep it single-worker for now.
         dl = DataLoader(
             ds,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=args.num_workers,
             pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
             drop_last=True,
         )
@@ -254,6 +260,7 @@ def main() -> None:
         profiler_steps=args.profiler_steps,
         profile_steps=args.profile_steps,
         profile_every=args.profile_every,
+        amp=args.amp,
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.
