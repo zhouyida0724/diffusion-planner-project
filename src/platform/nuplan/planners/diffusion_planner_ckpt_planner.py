@@ -258,7 +258,9 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             # Runtime route/lanes extraction (matches export logic, not a placeholder).
             cur = ego_history[-1]
             cur_k = _ego_kinematics(cur)
-            point = np.array([cur_k.x, cur_k.y], dtype=np.float64)
+            from nuplan.common.actor_state.state_representation import Point2D
+
+            point = Point2D(cur_k.x, cur_k.y)
 
             lanes_np, lanes_avails_np, lanes_speed_np, lanes_has_speed_np = extract_lanes(
                 point=point,

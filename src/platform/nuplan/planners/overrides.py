@@ -34,5 +34,6 @@ def diffusion_planner_overrides(ckpt_path: Optional[str] = None, sampling_steps:
     if ckpt_path:
         args.append(f"planner.diffusion_planner.ckpt_path={ckpt_path}")
     if sampling_steps is not None:
-        args.append(f"planner.diffusion_planner.sampling_steps={int(sampling_steps)}")
+        # Hydra structured configs require `+` when overriding a key not present in the config struct.
+        args.append(f"+planner.diffusion_planner.sampling_steps={int(sampling_steps)}")
     return PlannerOverrides(args=args)
