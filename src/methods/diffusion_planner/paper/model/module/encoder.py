@@ -64,7 +64,8 @@ class Encoder(nn.Module):
         encoding_mask = torch.cat([neighbors_mask, static_mask, lanes_mask], dim=1).view(-1)
 
         encoding_pos_valid = self.pos_emb(encoding_pos[~encoding_mask])
-        encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim), device=encoding_pos_valid.device)
+        # Under autocast, pos_emb can output bf16/fp16; keep the indexed destination in the same dtype.
+        encoding_pos_result = encoding_pos_valid.new_zeros((B * self.token_num, self.hidden_dim))
         encoding_pos_result[~encoding_mask] = encoding_pos_valid
 
         encoding_input = encoding_input + encoding_pos_result.view(B, self.token_num, -1)
@@ -147,7 +148,8 @@ class AgentFusionEncoder(nn.Module):
 
         x = self.emb_project(self.norm(x))
 
-        x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
+        # Under autocast, `x` can be bf16/fp16; keep the indexed destination in the same dtype.
+        x_result = x.new_zeros((B * P, x.shape[-1]))
         x_result[valid_indices] = x
 
         return x_result.view(B, P, -1), mask_p.reshape(B, -1), pos.view(B, P, -1)
@@ -167,7 +169,10 @@ class StaticFusionEncoder(nn.Module):
         pos[..., -3:] = 0.0
         pos[..., -2] = 1.0
 
-        x_result = torch.zeros((B * P, self._hidden_dim), device=x.device)
+        # Under autocast, `x` stays fp32 but the projection output becomes bf16/fp16.
+        # Allocate the indexed destination in the current autocast dtype to avoid dtype-mismatch crashes.
+        dst_dtype = torch.get_autocast_dtype("cuda") if (torch.is_autocast_enabled() and x.is_cuda) else x.dtype
+        x_result = torch.zeros((B * P, self._hidden_dim), device=x.device, dtype=dst_dtype)
         mask_p = torch.sum(torch.ne(x[..., :10], 0), dim=-1).to(x.device) == 0
         valid_indices = ~mask_p.view(-1)
 
@@ -238,12 +243,17 @@ class LaneFusionEncoder(nn.Module):
 
         has_speed_limit_v = has_speed_limit[valid_indices].squeeze(-1) > 0.5
         speed_limit_v = speed_limit[valid_indices].squeeze(-1)
-        speed_limit_embedding = torch.zeros((speed_limit_v.shape[0], self._channel), device=x.device)
+        # Allocate embeddings in the same dtype as `x` (autocast bf16/fp16 safe).
+        speed_limit_embedding = x.new_zeros((speed_limit_v.shape[0], self._channel))
 
         if has_speed_limit_v.sum() > 0:
-            speed_limit_embedding[has_speed_limit_v] = self.speed_limit_emb(speed_limit_v[has_speed_limit_v].unsqueeze(-1))
+            speed_limit_embedding[has_speed_limit_v] = self.speed_limit_emb(
+                speed_limit_v[has_speed_limit_v].unsqueeze(-1)
+            ).to(dtype=speed_limit_embedding.dtype)
         if (~has_speed_limit_v).sum() > 0:
-            speed_limit_embedding[~has_speed_limit_v] = self.unknown_speed_emb.weight.expand((~has_speed_limit_v).sum().item(), -1)
+            speed_limit_embedding[~has_speed_limit_v] = self.unknown_speed_emb.weight.to(dtype=speed_limit_embedding.dtype).expand(
+                (~has_speed_limit_v).sum().item(), -1
+            )
 
         traffic_v = traffic[valid_indices]
         traffic_light_embedding = self.traffic_emb(traffic_v)
@@ -251,7 +261,8 @@ class LaneFusionEncoder(nn.Module):
         x = x + speed_limit_embedding + traffic_light_embedding
         x = self.emb_project(self.norm(x))
 
-        x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
+        # Under autocast, `x` can be bf16/fp16; keep the indexed destination in the same dtype.
+        x_result = x.new_zeros((B * P, x.shape[-1]))
         x_result[valid_indices] = x
 
         return x_result.view(B, P, -1), mask_p.reshape(B, -1), pos.view(B, P, -1)

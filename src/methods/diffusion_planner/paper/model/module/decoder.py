@@ -157,7 +157,8 @@ class RouteEncoder(nn.Module):
         x = torch.mean(x, dim=1)
         x = self.emb_project(self.norm(x))
 
-        x_result = torch.zeros((B, x.shape[-1]), device=x.device)
+        # Under autocast, `x` can be bf16/fp16; keep destination dtype consistent for indexed assignment.
+        x_result = x.new_zeros((B, x.shape[-1]))
         x_result[valid_indices] = x
         return x_result.view(B, -1)
 
@@ -209,7 +210,7 @@ class DiT(nn.Module):
             [self.agent_embedding.weight[0][None, :], self.agent_embedding.weight[1][None, :].expand(P - 1, -1)],
             dim=0,
         )
-        x_embedding = x_embedding[None, :, :].expand(B, -1, -1)
+        x_embedding = x_embedding[None, :, :].expand(B, -1, -1).to(dtype=x.dtype)
         x = x + x_embedding
 
         route_encoding = self.route_encoder(route_lanes)
