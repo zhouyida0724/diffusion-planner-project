@@ -123,6 +123,13 @@ def parse_args() -> argparse.Namespace:
         help="If >0, run torch.profiler for the first N steps to estimate FLOPs (best-effort).",
     )
 
+    p.add_argument(
+        "--cache-root",
+        type=str,
+        default="outputs/cache/training_arrays",
+        help="Training cache root (mmap-friendly arrays). Used by paper_dit_dpm dataset.",
+    )
+
     # step-level breakdown profiling (wall-clock timers)
     p.add_argument(
         "--profile-steps",
@@ -223,7 +230,11 @@ def main() -> None:
         raise SystemExit("No training roots provided. Use --train-roots (or legacy --data-root).")
 
     if args.mode == "paper_dit_dpm":
-        ds = ShardedNpzFeatureDataset(train_roots, max_samples=args.max_samples)
+        ds = ShardedNpzFeatureDataset(
+            train_roots,
+            max_samples=args.max_samples,
+            cache_root=args.cache_root,
+        )
         print(f"Dataset size: {len(ds)} kept samples | mode=paper_dit_dpm")
         dl = DataLoader(
             ds,

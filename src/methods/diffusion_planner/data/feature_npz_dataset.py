@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .npz_dataset import ShardSpec, discover_shards, _NpzCache
+from .npz_dataset import ShardSpec, discover_shards
 
 
 class ShardedNpzFeatureDataset(Dataset):
@@ -40,11 +40,15 @@ class ShardedNpzFeatureDataset(Dataset):
         data_root: str | Path,
         *,
         max_samples: Optional[int] = None,
+        cache_root: str | Path = "outputs/cache/training_arrays",
         cache_max_open: int = 4,
     ):
         self.data_root = data_root
+        self.cache_root = Path(cache_root)
         self.shards: list[ShardSpec] = discover_shards(data_root)
-        self._cache = _NpzCache(max_open=cache_max_open)
+
+        # NOTE: paper training MUST NOT fall back to compressed npz.
+        # We only read from mmap-friendly arrays prepared by materialize_training_cache.py.
 
         self._index: List[Tuple[int, int, Dict[str, Any]]] = []
 
@@ -79,23 +83,31 @@ class ShardedNpzFeatureDataset(Dataset):
             "hard_skip_ratio": float(total_hard_skip / max(total_manifest, 1)),
         }
 
-        # Basic key check on first sample.
+        # Cache key check on first sample.
         s_idx0, row0, _ = self._index[0]
-        with np.load(self.shards[s_idx0].npz_path, allow_pickle=False) as z:
-            for k in [
-                "ego_current_state",
-                "neighbor_agents_past",
-                "ego_agent_future",
-                "neighbor_agents_future",
-                "static_objects",
-                "lanes",
-                "lanes_speed_limit",
-                "lanes_has_speed_limit",
-                "route_lanes",
-            ]:
-                if k not in z:
-                    raise KeyError(f"NPZ missing key '{k}'. Available keys: {list(z.keys())}")
-            _ = z["ego_current_state"][row0]
+        spec0 = self.shards[s_idx0]
+        cache_dir = self._cache_dir_for_shard(spec0)
+        required = [
+            "ego_current_state",
+            "neighbor_agents_past",
+            "ego_agent_future",
+            "neighbor_agents_future",
+            "static_objects",
+            "lanes",
+            "lanes_speed_limit",
+            "lanes_has_speed_limit",
+            "route_lanes",
+        ]
+        for k in required:
+            if not (cache_dir / "arrays" / f"{k}.npy").is_file():
+                raise FileNotFoundError(
+                    f"Missing cache file: {cache_dir / 'arrays' / (k + '.npy')}\n"
+                    f"Please materialize cache first, e.g.:\n"
+                    f"  python3 scripts/export/diffusion_planner/pipeline/materialize_training_cache.py "
+                    f"--prod-root exports_local/boston50w_prod --cache-root {self.cache_root}" 
+                )
+        # simple read test
+        _ = np.load(cache_dir / "arrays" / "ego_current_state.npy", mmap_mode="r")[row0]
 
     def __len__(self) -> int:
         return len(self._index)
@@ -103,15 +115,32 @@ class ShardedNpzFeatureDataset(Dataset):
     def get_data_stats(self) -> Dict[str, Any]:
         return dict(self.data_stats)
 
+    def _cache_dir_for_shard(self, spec: ShardSpec) -> Path:
+        """Map a shard spec to its cache directory."""
+        # Example spec.shard_dir:
+        #   exports_local/boston50w_prod/slice05.../shards/shard_000
+        # Cache layout:
+        #   <cache_root>/boston50w_prod/<slice_dir>/shard_000/
+        parts = list(Path(spec.shard_dir).parts)
+        # find boston50w_prod in path
+        if "boston50w_prod" in parts:
+            i = parts.index("boston50w_prod")
+            slice_dir = parts[i + 1]
+            shard_name = parts[-1]
+            return self.cache_root / "boston50w_prod" / slice_dir / shard_name
+        # generic fallback: use shard dir name only
+        return self.cache_root / "unknown" / parts[-1]
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         shard_idx, row_idx, meta = self._index[idx]
         spec = self.shards[shard_idx]
-        z = self._cache.get(spec.npz_path)
+        cache_dir = self._cache_dir_for_shard(spec)
 
         def _t(name: str) -> torch.Tensor:
-            arr = z[name][row_idx]
+            p = cache_dir / "arrays" / f"{name}.npy"
+            arr = np.load(p, mmap_mode="r")[row_idx]
             arr = np.asarray(arr, dtype=np.float32)
-            ten = torch.from_numpy(arr)
+            ten = torch.from_numpy(arr.copy())  # copy out of read-only mmap
             if not torch.isfinite(ten).all():
                 raise RuntimeError(f"{name} contains NaN/Inf at idx={idx} shard={spec.shard_dir}")
             return ten
