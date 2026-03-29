@@ -107,9 +107,9 @@ class PaperDiffusionPlanner(nn.Module):
         """Run DPM sampling and return ego trajectory [T,3] (x,y,heading)."""
 
         self.eval()
-        # allow overriding steps via config; the underlying sampler is inside decoder forward.
-        # We expose a knob by temporarily monkeypatching; simplest minimal approach.
-        # If you need more control, plumb params into Decoder.
+        inputs = dict(inputs)
+        inputs["diffusion_steps"] = int(diffusion_steps)
+
         enc = self.encoder(inputs)
         # run decoder in eval mode
         was_training = self.decoder.training

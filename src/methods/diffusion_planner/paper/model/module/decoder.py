@@ -83,6 +83,7 @@ class Decoder(nn.Module):
             xt2[:, :, 0, :] = current_states
             return xt2.reshape(B, P, -1)
 
+        diffusion_steps = int(inputs.get("diffusion_steps", 10))
         x0 = dpm_sampler(
             self.dit,
             xT,
@@ -91,6 +92,7 @@ class Decoder(nn.Module):
                 "route_lanes": route_lanes,
                 "neighbor_current_mask": neighbor_current_mask,
             },
+            diffusion_steps=diffusion_steps,
             dpm_solver_params={"correcting_xt_fn": initial_state_constraint},
             model_wrapper_params={
                 "classifier_fn": self._guidance_fn,

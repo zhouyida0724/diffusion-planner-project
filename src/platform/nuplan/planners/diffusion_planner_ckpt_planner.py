@@ -38,6 +38,9 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
 
+# Runtime feature extraction utilities (reuse export logic)
+from src.platform.nuplan.features.extract_single_frame import extract_lanes, extract_route_lanes
+
 
 @dataclass
 class _EgoKinematics:
@@ -156,6 +159,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         config: object | None = None,  # accepted for hydra compatibility (unused)
         device: str = "cpu",
         enable_ema: bool = True,  # accepted for hydra compatibility (unused)
+        sampling_steps: int = 10,
         **_: object,
     ):
         self._ckpt_path = str(ckpt_path)
@@ -169,6 +173,12 @@ class DiffusionPlannerCkpt(AbstractPlanner):
 
         self._model: Optional[torch.nn.Module] = None
         self._ckpt_kind: str = "mlp"
+        self._sampling_steps = int(sampling_steps)
+
+        # for runtime feature extraction
+        self._map_api = None
+        self._route_roadblock_ids = None
+        self._init_done = False
 
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
@@ -210,7 +220,10 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._model = model
 
     def initialize(self, initialization: PlannerInitialization) -> None:
-        # nothing else required
+        # Save map + route for runtime feature extraction.
+        self._map_api = initialization.map_api
+        self._route_roadblock_ids = initialization.route_roadblock_ids
+        self._init_done = True
         return
 
     def name(self) -> str:
@@ -232,9 +245,9 @@ class DiffusionPlannerCkpt(AbstractPlanner):
 
         if self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND:
             assert isinstance(self._model, PaperDiffusionPlanner)
+            if not self._init_done or self._map_api is None:
+                raise RuntimeError("Planner.initialize() was not called or map_api missing")
 
-            # Build minimal (mostly-zero) feature dict to keep the full backbone runnable.
-            # This is a smoke-test integration; improving online feature extraction is a next step.
             cfg = self._model.config
             B = 1
             Pn = int(cfg.predicted_neighbor_num)
@@ -242,15 +255,43 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             future_len = int(cfg.future_len)
             lane_len = int(cfg.lane_len)
 
+            # Runtime route/lanes extraction (matches export logic, not a placeholder).
+            cur = ego_history[-1]
+            cur_k = _ego_kinematics(cur)
+            point = np.array([cur_k.x, cur_k.y], dtype=np.float64)
+
+            lanes_np, lanes_avails_np, lanes_speed_np, lanes_has_speed_np = extract_lanes(
+                point=point,
+                map_api=self._map_api,
+                radius=150,
+                max_lanes=int(cfg.lane_num),
+                ego_heading=cur_k.heading,
+                traffic_light_data=None,
+            )
+            route_lanes_np, route_lanes_avails_np, route_speed_np, route_has_speed_np = extract_route_lanes(
+                point=point,
+                map_api=self._map_api,
+                radius=150,
+                max_route_lanes=int(cfg.route_num),
+                ego_heading=cur_k.heading,
+                traffic_light_data=None,
+                route_roadblock_ids=list(self._route_roadblock_ids) if self._route_roadblock_ids else None,
+            )
+
             ego_current_state = torch.from_numpy(x[:10]).view(1, 10)
 
+            # Neighbors: TODO proper runtime track history; for now keep zeros but NOT zero maps/route.
             neighbor_agents_past = torch.zeros((B, Pn, time_len, 11), dtype=torch.float32)
             neighbor_agents_future = torch.zeros((B, Pn, future_len, 3), dtype=torch.float32)
             static_objects = torch.zeros((B, int(cfg.static_objects_num), int(cfg.static_objects_state_dim)), dtype=torch.float32)
-            lanes = torch.zeros((B, int(cfg.lane_num), lane_len, 12), dtype=torch.float32)
-            lanes_speed_limit = torch.zeros((B, int(cfg.lane_num), 1), dtype=torch.float32)
-            lanes_has_speed_limit = torch.zeros((B, int(cfg.lane_num), 1), dtype=torch.float32)
-            route_lanes = torch.zeros((B, int(cfg.route_num), lane_len, 12), dtype=torch.float32)
+
+            lanes = torch.from_numpy(lanes_np).view(1, int(cfg.lane_num), lane_len, 12)
+            lanes_speed_limit = torch.from_numpy(lanes_speed_np).view(1, int(cfg.lane_num), 1)
+            lanes_has_speed_limit = torch.from_numpy(lanes_has_speed_np).view(1, int(cfg.lane_num), 1)
+
+            route_lanes = torch.from_numpy(route_lanes_np).view(1, int(cfg.route_num), lane_len, 12)
+            route_lanes_speed_limit = torch.from_numpy(route_speed_np).view(1, int(cfg.route_num), 1)
+            route_lanes_has_speed_limit = torch.from_numpy(route_has_speed_np).view(1, int(cfg.route_num), 1)
 
             inputs = {
                 "ego_current_state": ego_current_state,
@@ -262,14 +303,14 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                 "lanes_speed_limit": lanes_speed_limit,
                 "lanes_has_speed_limit": lanes_has_speed_limit,
                 "route_lanes": route_lanes,
-                "route_lanes_speed_limit": torch.zeros((B, int(cfg.route_num), 1), dtype=torch.float32),
-                "route_lanes_has_speed_limit": torch.zeros((B, int(cfg.route_num), 1), dtype=torch.float32),
+                "route_lanes_speed_limit": route_lanes_speed_limit,
+                "route_lanes_has_speed_limit": route_lanes_has_speed_limit,
             }
             if self._device == "cuda":
                 inputs = {k: (v.cuda(non_blocking=True) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
             with torch.no_grad():
-                y = self._model.sample_trajectory(inputs)  # [T,3]
+                y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
 
             y_np = y.detach().cpu().numpy().astype(np.float32)
         else:
