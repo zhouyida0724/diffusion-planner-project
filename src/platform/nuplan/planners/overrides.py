@@ -18,7 +18,7 @@ def idm_planner_overrides() -> PlannerOverrides:
     return PlannerOverrides(args=["planner=idm_planner"])
 
 
-def diffusion_planner_overrides(ckpt_path: Optional[str] = None) -> PlannerOverrides:
+def diffusion_planner_overrides(ckpt_path: Optional[str] = None, sampling_steps: Optional[int] = None) -> PlannerOverrides:
     """Select diffusion_planner and point its _target_ to our repo-local planner.
 
     We intentionally do NOT modify vendor code under `nuplan-visualization/`.
@@ -33,4 +33,6 @@ def diffusion_planner_overrides(ckpt_path: Optional[str] = None) -> PlannerOverr
 
     if ckpt_path:
         args.append(f"planner.diffusion_planner.ckpt_path={ckpt_path}")
+    if sampling_steps is not None:
+        args.append(f"planner.diffusion_planner.sampling_steps={int(sampling_steps)}")
     return PlannerOverrides(args=args)

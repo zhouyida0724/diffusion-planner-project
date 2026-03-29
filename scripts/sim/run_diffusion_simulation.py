@@ -50,6 +50,12 @@ def main() -> None:
             "outputs/training/<exp>/checkpoint_*.pt."
         ),
     )
+    parser.add_argument(
+        "--sampling-steps",
+        type=int,
+        default=10,
+        help="Diffusion sampling steps used by the planner (paper_dit_dpm). Default: 10.",
+    )
     args = parser.parse_args()
 
     # Ensure both nuPlan vendor code and our repo code are importable in the simulation subprocess.
@@ -72,7 +78,7 @@ def main() -> None:
                 repo_root = Path(__file__).resolve().parents[2]
                 p = (repo_root / p).resolve()
             ckpt = str(p)
-        planner_overrides = diffusion_planner_overrides(ckpt).args
+        planner_overrides = diffusion_planner_overrides(ckpt_path=ckpt, sampling_steps=args.sampling_steps).args
 
     if args.scenarios_file:
         tokens = []
