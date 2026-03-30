@@ -159,8 +159,18 @@ class Decoder(nn.Module):
                 pass
             _DEBUG_SAMPLER_TICKS += 1
 
-        x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
-        return {"prediction": x0}
+        # x0 currently is normalized in [B, P, (1+T), 4] (includes current state at index 0).
+        x0_view = x0.reshape(B, P, -1, 4)
+        x0_norm_fut = x0_view[:, :, 1:]
+        x0_inv_fut = self._state_normalizer.inverse(x0_view)[:, :, 1:]
+
+        out = {"prediction": x0_inv_fut}
+
+        # Optional: expose normalized prediction for downstream debug.
+        # Gated by DP_NORM_DEBUG=1 to avoid extra tensor plumbing by default.
+        if os.getenv("DP_NORM_DEBUG", "0") not in ("", "0", "false", "False"):
+            out["prediction_norm"] = x0_norm_fut
+        return out
 
 
 class RouteEncoder(nn.Module):

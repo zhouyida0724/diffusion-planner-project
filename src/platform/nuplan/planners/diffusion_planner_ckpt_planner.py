@@ -424,6 +424,12 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._traj_debug_k = int(os.getenv("DP_TRAJ_DEBUG_K", str(self._runtime_debug_k if self._runtime_debug_k > 0 else 3)))
         self._traj_debug_ticks = 0
 
+        # Normalization debug: prove whether the planner is consuming normalized or inverse-normalized (meters) trajectory.
+        # Enable with DP_NORM_DEBUG=1. Limit prints with DP_NORM_DEBUG_K (default: DP_RUNTIME_DEBUG_K or 5).
+        self._norm_debug = os.getenv("DP_NORM_DEBUG", "0") not in ("", "0", "false", "False")
+        self._norm_debug_k = int(os.getenv("DP_NORM_DEBUG_K", str(self._runtime_debug_k if self._runtime_debug_k > 0 else 5)))
+        self._norm_debug_ticks = 0
+
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
         self._future_horizon = float(self._future_trajectory_sampling.time_horizon)
@@ -560,6 +566,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             ego_current_state = torch.from_numpy(x[:10]).view(1, 10)
 
             dbg_should_print = self._runtime_debug and (self._runtime_debug_ticks < self._runtime_debug_k)
+            norm_dbg_should_print = self._norm_debug and (self._norm_debug_ticks < self._norm_debug_k)
 
             # Neighbors: minimal runtime track history from DetectionsTracks.
             # Paper model expects `agent_num = 1 + predicted_neighbor_num` and may include ego as slot 0.
@@ -634,18 +641,24 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             if self._device == "cuda":
                 inputs = {k: (v.cuda(non_blocking=True) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
-            # Optional sampler debug: expose raw (x,y,cos,sin) before heading conversion.
+            # Optional sampler/norm debug: expose raw (x,y,cos,sin) before heading conversion.
+            # NOTE: decoder returns inverse-normalized (meters) by default.
             ego_x0 = ego_y0 = ego_cos0 = ego_sin0 = None
+            ego_pred_norm = None  # normalized-space prediction if DP_NORM_DEBUG=1 and decoder exposes it
 
             with torch.no_grad():
-                if self._debug_sampler:
+                if norm_dbg_should_print or self._debug_sampler:
                     # Run full forward pass to access decoder prediction [B,P,T,4].
                     self._model.eval()
                     _enc, dec = self._model(inputs)
                     pred = dec.get("prediction")
                     if pred is None:
                         raise RuntimeError("Paper model decoder did not return prediction")
-                    ego = pred[:, 0]  # [B,T,4]
+
+                    if norm_dbg_should_print:
+                        ego_pred_norm = dec.get("prediction_norm")
+
+                    ego = pred[:, 0]  # [B,T,4] in meters
                     ego_x0 = ego[..., 0]
                     ego_y0 = ego[..., 1]
                     ego_cos0 = ego[..., 2]
@@ -656,6 +669,89 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                     y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
 
             y_np = y.detach().cpu().numpy().astype(np.float32)
+
+            # --- Normalization debug: compare normalized-space vs inverse-normalized (meters) predictions ---
+            if norm_dbg_should_print:
+                try:
+                    assert isinstance(self._model, PaperDiffusionPlanner)
+                    sn = self._model.config.state_normalizer
+
+                    # pred in meters (inverse-normalized)
+                    inv4 = torch.stack([ego_x0[0], ego_y0[0], ego_cos0[0], ego_sin0[0]], dim=-1)  # [T,4]
+                    inv4_n = sn(inv4)  # [T,4] (re-normalized)
+
+                    # pred in normalized space (if decoder exposed it)
+                    norm4 = None
+                    if ego_pred_norm is not None:
+                        try:
+                            norm4 = ego_pred_norm[0, 0]  # [T,4]
+                        except Exception:
+                            norm4 = None
+
+                    # stats helpers
+                    def _np_stats(a: np.ndarray) -> str:
+                        return "mean={:.4f} std={:.4f} min={:.4f} max={:.4f}".format(float(a.mean()), float(a.std()), float(a.min()), float(a.max()))
+
+                    inv_xy = y_np[:, :2]
+                    inv_dxy = inv_xy[1:] - inv_xy[:-1]
+                    inv_seg = np.sqrt((inv_dxy**2).sum(axis=1))
+                    inv_path_len = float(inv_seg.sum())
+
+                    norm_xy = inv4_n[:, :2].detach().cpu().numpy()
+                    if norm4 is not None:
+                        norm_xy = norm4[:, :2].detach().cpu().numpy()
+
+                    norm_dxy = norm_xy[1:] - norm_xy[:-1]
+                    norm_seg = np.sqrt((norm_dxy**2).sum(axis=1))
+                    norm_path_len = float(norm_seg.sum())
+
+                    parts = [
+                        f"tick={self._norm_debug_ticks}",
+                        f"sampling_steps={int(self._sampling_steps)}",
+                        f"meters_end=({float(inv_xy[-1,0]):.3f},{float(inv_xy[-1,1]):.3f})",
+                        f"meters_path_len={inv_path_len:.3f}",
+                        f"norm_end=({float(norm_xy[-1,0]):.3f},{float(norm_xy[-1,1]):.3f})",
+                        f"norm_path_len={norm_path_len:.3f}",
+                    ]
+
+                    # Show equivalence: normalize(inverse(x0_norm)) == x0_norm
+                    try:
+                        if norm4 is not None:
+                            diff = (inv4_n - norm4).abs()
+                            parts += [
+                                "renorm_vs_norm_max_abs={:.6f}".format(float(diff.max().detach().cpu())),
+                                "renorm_vs_norm_mean_abs={:.6f}".format(float(diff.mean().detach().cpu())),
+                            ]
+                        else:
+                            parts.append("prediction_norm_missing=1")
+                    except Exception:
+                        pass
+
+                    # Per-dimension stats (meters and normalized).
+                    try:
+                        inv4_np = inv4.detach().cpu().numpy()
+                        inv4n_np = inv4_n.detach().cpu().numpy()
+                        parts += [
+                            "meters_x:" + _np_stats(inv4_np[:, 0]),
+                            "meters_y:" + _np_stats(inv4_np[:, 1]),
+                            "meters_cos:" + _np_stats(inv4_np[:, 2]),
+                            "meters_sin:" + _np_stats(inv4_np[:, 3]),
+                            "renorm_x:" + _np_stats(inv4n_np[:, 0]),
+                            "renorm_y:" + _np_stats(inv4n_np[:, 1]),
+                        ]
+                        if norm4 is not None:
+                            norm4_np = norm4.detach().cpu().numpy()
+                            parts += [
+                                "norm_x:" + _np_stats(norm4_np[:, 0]),
+                                "norm_y:" + _np_stats(norm4_np[:, 1]),
+                            ]
+                    except Exception:
+                        pass
+
+                    print("[DP_NORM_DEBUG] " + " ".join(parts))
+                except Exception:
+                    pass
+                self._norm_debug_ticks += 1
         else:
             with torch.no_grad():
                 y = self._model(x_t)
