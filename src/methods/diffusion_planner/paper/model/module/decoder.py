@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
+
+# Gated debug for diffusion sampler dynamics (kept lightweight)
+_DEBUG_SAMPLER_TICKS = 0
 
 from ..diffusion_utils.sampling import dpm_sampler
 from ..diffusion_utils.sde import SDE, VPSDE_linear
@@ -73,10 +78,8 @@ class Decoder(nn.Module):
             return {"score": out.reshape(B, P, -1, 4)}
 
         # inference sampling: start from noisy trajectory but keep t=0 state constrained
-        xT = torch.cat(
-            [current_states[:, :, None], torch.randn(B, P, self._future_len, 4, device=current_states.device) * 0.5],
-            dim=2,
-        ).reshape(B, P, -1)
+        noise = torch.randn(B, P, self._future_len, 4, device=current_states.device) * 0.5
+        xT = torch.cat([current_states[:, :, None], noise], dim=2).reshape(B, P, -1)
 
         def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step: int):
             xt2 = xt.reshape(B, P, -1, 4)
@@ -84,6 +87,32 @@ class Decoder(nn.Module):
             return xt2.reshape(B, P, -1)
 
         diffusion_steps = int(inputs.get("diffusion_steps", 10))
+
+        # Optional sampler debug: prints a few statistics for the initial noise xT and solved x0.
+        # Enable with: DIFFPLANNER_DEBUG_SAMPLER=1 (or DP_RUNTIME_DEBUG=1).
+        global _DEBUG_SAMPLER_TICKS
+        _dbg_sampler = os.getenv("DP_RUNTIME_DEBUG", "0") not in ("", "0", "false", "False") or (
+            os.getenv("DIFFPLANNER_DEBUG_SAMPLER", "0") not in ("", "0", "false", "False")
+        )
+        _dbg_k = int(os.getenv("DP_RUNTIME_DEBUG_K", os.getenv("DIFFPLANNER_DEBUG_K", "5")))
+        if _dbg_sampler and (_DEBUG_SAMPLER_TICKS < _dbg_k):
+            try:
+                xT_view = xT.reshape(B, P, -1, 4)
+                xT_fut = xT_view[:, :, 1:]
+                # show whether noise is varying
+                noise_sample = noise.reshape(-1)[:6].detach().cpu().float().tolist()
+                print(
+                    "[DP_SAMPLER_DEBUG] tick={} steps={} xT_future_mean={:.4f} xT_future_std={:.4f} noise0={}".format(
+                        _DEBUG_SAMPLER_TICKS,
+                        diffusion_steps,
+                        float(xT_fut.mean().detach().cpu()),
+                        float(xT_fut.std().detach().cpu()),
+                        [round(float(v), 4) for v in noise_sample],
+                    )
+                )
+            except Exception:
+                pass
+
         x0 = dpm_sampler(
             self.dit,
             xT,
@@ -111,6 +140,24 @@ class Decoder(nn.Module):
                 "guidance_type": "classifier" if self._guidance_fn is not None else "uncond",
             },
         )
+
+        if _dbg_sampler and (_DEBUG_SAMPLER_TICKS < _dbg_k):
+            try:
+                x0_view = x0.reshape(B, P, -1, 4)
+                x0_fut = x0_view[:, :, 1:]
+                x0_inv = self._state_normalizer.inverse(x0_view)[:, :, 1:]
+                print(
+                    "[DP_SAMPLER_DEBUG] tick={} x0_future_mean={:.4f} x0_future_std={:.4f} inv_future_mean={:.4f} inv_future_std={:.4f}".format(
+                        _DEBUG_SAMPLER_TICKS,
+                        float(x0_fut.mean().detach().cpu()),
+                        float(x0_fut.std().detach().cpu()),
+                        float(x0_inv.mean().detach().cpu()),
+                        float(x0_inv.std().detach().cpu()),
+                    )
+                )
+            except Exception:
+                pass
+            _DEBUG_SAMPLER_TICKS += 1
 
         x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
         return {"prediction": x0}

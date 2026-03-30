@@ -408,9 +408,15 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._init_done = False
 
         # Runtime debug (gated by env var)
+        # Back-compat: DP_RUNTIME_DEBUG=1 enables all debug.
+        # New flags:
+        #  - DIFFPLANNER_DEBUG_COND=1: conditioning tensor stats
+        #  - DIFFPLANNER_DEBUG_SAMPLER=1: diffusion sampler xT/x0 stats
         self._runtime_debug = os.getenv("DP_RUNTIME_DEBUG", "0") not in ("", "0", "false", "False")
-        self._runtime_debug_k = int(os.getenv("DP_RUNTIME_DEBUG_K", "5"))
+        self._runtime_debug_k = int(os.getenv("DP_RUNTIME_DEBUG_K", os.getenv("DIFFPLANNER_DEBUG_K", "5")))
         self._runtime_debug_ticks = 0
+        self._debug_cond = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_COND", "0") not in ("", "0", "false", "False"))
+        self._debug_sampler = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_SAMPLER", "0") not in ("", "0", "false", "False"))
 
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
@@ -631,22 +637,50 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                 y = self._model(x_t)
             y_np = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
-        # --- Runtime debug: conditioning + prediction stats (first K ticks only) ---
-        if self._runtime_debug and (self._runtime_debug_ticks < self._runtime_debug_k):
+        # --- Runtime debug (first K ticks only, gated by env vars) ---
+        if (self._runtime_debug or self._debug_cond or self._debug_sampler) and (self._runtime_debug_ticks < self._runtime_debug_k):
             try:
                 xy = y_np[:, :2]
                 dxy = xy[1:] - xy[:-1]
                 seg_lens = np.sqrt((dxy**2).sum(axis=1))
                 path_len = float(seg_lens.sum())
                 start_end = float(np.sqrt(((xy[-1] - xy[0]) ** 2).sum()))
-                print(
-                    "[DP_RUNTIME_DEBUG] tick={tick} neighbor_agents_past_nonzero_count={nap} traj_path_len={pl:.3f} traj_start_end_dist={sed:.3f}".format(
-                        tick=self._runtime_debug_ticks,
-                        nap=int(neighbor_agents_past_nonzero_count),
-                        pl=path_len,
-                        sed=start_end,
-                    )
-                )
+
+                parts = [
+                    f"tick={self._runtime_debug_ticks}",
+                    f"sampling_steps={int(self._sampling_steps)}",
+                    f"neighbor_agents_past_nonzero_count={int(neighbor_agents_past_nonzero_count)}",
+                    f"traj_path_len={path_len:.3f}",
+                    f"traj_start_end_dist={start_end:.3f}",
+                ]
+
+                if self._debug_cond and (self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND):
+                    # numpy features (lanes/route_lanes)
+                    try:
+                        parts += [
+                            f"lanes_shape={tuple(lanes_np.shape)}",
+                            f"lanes_nz={int(np.count_nonzero(lanes_np))}",
+                            f"lanes_avails_sum={int(np.count_nonzero(lanes_avails_np))}",
+                            f"route_lanes_shape={tuple(route_lanes_np.shape)}",
+                            f"route_lanes_nz={int(np.count_nonzero(route_lanes_np))}",
+                            f"route_lanes_avails_sum={int(np.count_nonzero(route_lanes_avails_np))}",
+                            f"route_roadblock_ids_len={0 if (self._route_roadblock_ids is None) else len(list(self._route_roadblock_ids))}",
+                        ]
+                    except Exception:
+                        pass
+
+                    # torch tensors (dynamic context)
+                    try:
+                        parts += [
+                            f"ego_current_state_first4={ego_current_state.reshape(-1)[:4].detach().cpu().numpy().round(4).tolist()}",
+                            f"neighbor_agents_future_nz={int(torch.count_nonzero(neighbor_agents_future).item())}",
+                            f"ego_agent_future_nz={int(torch.count_nonzero(inputs['ego_agent_future']).item())}",
+                            f"static_objects_nz={int(torch.count_nonzero(static_objects).item())}",
+                        ]
+                    except Exception:
+                        pass
+
+                print("[DP_DEBUG] " + " ".join(parts))
             except Exception:
                 pass
             self._runtime_debug_ticks += 1
