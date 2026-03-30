@@ -418,6 +418,12 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._debug_cond = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_COND", "0") not in ("", "0", "false", "False"))
         self._debug_sampler = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_SAMPLER", "0") not in ("", "0", "false", "False"))
 
+        # Trajectory debug: print ego-frame trajectory stats/points before world transform.
+        # Enable with DP_TRAJ_DEBUG=1. Limit prints with DP_TRAJ_DEBUG_K (default: DP_RUNTIME_DEBUG_K or 3).
+        self._traj_debug = os.getenv("DP_TRAJ_DEBUG", "0") not in ("", "0", "false", "False")
+        self._traj_debug_k = int(os.getenv("DP_TRAJ_DEBUG_K", str(self._runtime_debug_k if self._runtime_debug_k > 0 else 3)))
+        self._traj_debug_ticks = 0
+
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
         self._future_horizon = float(self._future_trajectory_sampling.time_horizon)
@@ -654,6 +660,80 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             with torch.no_grad():
                 y = self._model(x_t)
             y_np = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+        # --- Trajectory debug (ego frame, before transform_predictions_to_states) ---
+        if self._traj_debug and (self._traj_debug_ticks < self._traj_debug_k):
+            try:
+                xy = y_np[:, :2]
+                dxy = xy[1:] - xy[:-1]
+                seg_lens = np.sqrt((dxy**2).sum(axis=1))
+                path_len = float(seg_lens.sum())
+                start_end = float(np.sqrt(((xy[-1] - xy[0]) ** 2).sum()))
+
+                x_min, x_max = float(xy[:, 0].min()), float(xy[:, 0].max())
+                y_min, y_max = float(xy[:, 1].min()), float(xy[:, 1].max())
+
+                pred5 = np.round(y_np[:5], 3).tolist()
+
+                parts = [
+                    f"tick={self._traj_debug_ticks}",
+                    f"sampling_steps={int(self._sampling_steps)}",
+                    f"pred5={pred5}",
+                    f"x_minmax=[{x_min:.3f},{x_max:.3f}]",
+                    f"y_minmax=[{y_min:.3f},{y_max:.3f}]",
+                    f"traj_path_len={path_len:.3f}",
+                    f"traj_start_end_dist={start_end:.3f}",
+                ]
+
+                # Include lanes/route stats when available (paper model path).
+                try:
+                    parts += [
+                        f"lanes_sum={float(np.sum(lanes_np)):.3f}",
+                        f"lanes_nz={int(np.count_nonzero(lanes_np))}",
+                        f"route_lanes_sum={float(np.sum(route_lanes_np)):.3f}",
+                        f"route_lanes_nz={int(np.count_nonzero(route_lanes_np))}",
+                    ]
+                except Exception:
+                    pass
+
+                # Optional: print GT future (if present in PlannerInput) in ego frame.
+                try:
+                    gt_states = None
+                    for attr in (
+                        "ego_future",
+                        "ego_future_states",
+                        "future_ego_states",
+                        "future_ego_trajectory",
+                        "ego_future_trajectory",
+                    ):
+                        gt_states = getattr(current_input, attr, None)
+                        if gt_states is not None:
+                            break
+
+                    if gt_states is not None:
+                        gt_list = list(gt_states)
+                        if len(gt_list) > 0:
+                            cur = ego_history[-1]
+                            cur_k2 = _ego_kinematics(cur)
+                            R = _rot2d(-cur_k2.heading)
+                            gt_rel = []
+                            for s in gt_list[: min(5, len(gt_list))]:
+                                try:
+                                    k = _ego_kinematics(s)
+                                    dx_dy = R @ np.array([k.x - cur_k2.x, k.y - cur_k2.y], dtype=np.float64)
+                                    d_heading = _wrap_pi(k.heading - cur_k2.heading)
+                                    gt_rel.append([float(dx_dy[0]), float(dx_dy[1]), float(d_heading)])
+                                except Exception:
+                                    break
+                            if gt_rel:
+                                parts.append(f"gt5_ego={np.round(np.array(gt_rel), 3).tolist()}")
+                except Exception:
+                    pass
+
+                print("[DP_TRAJ_DEBUG] " + " ".join(parts))
+            except Exception:
+                pass
+            self._traj_debug_ticks += 1
 
         # --- Runtime debug (first K ticks only, gated by env vars) ---
         if (self._runtime_debug or self._debug_cond or self._debug_sampler) and (self._runtime_debug_ticks < self._runtime_debug_k):
