@@ -37,8 +37,8 @@ class ShardSpec:
     manifest_path: Path
 
 
-def _discover_shards(data_root: Path) -> List[ShardSpec]:
-    """Discover shard directories.
+def _discover_shards_one(data_root: Path) -> List[ShardSpec]:
+    """Discover shard directories under a single root.
 
     Accepts either:
       - a slice directory containing `shards/`
@@ -71,6 +71,38 @@ def _discover_shards(data_root: Path) -> List[ShardSpec]:
             f"No shards found under {data_root}. Expected shard_*/data.npz + manifest.jsonl"
         )
     return out
+
+
+def discover_shards(data_roots: List[str | Path] | str | Path) -> List[ShardSpec]:
+    """Discover shards from one or many roots.
+
+    This is a convenience wrapper used by the training entrypoint.
+
+    Args:
+        data_roots: either a single path or a list of paths. Each path can be:
+          - slice dir
+          - shards/ dir
+          - shard_*/ dir
+
+    Returns:
+        List[ShardSpec] sorted by shard_dir.
+    """
+
+    if isinstance(data_roots, (str, Path)):
+        roots = [data_roots]
+    else:
+        roots = list(data_roots)
+
+    specs: List[ShardSpec] = []
+    for r in roots:
+        specs.extend(_discover_shards_one(Path(r)))
+
+    # Deduplicate by absolute shard_dir
+    uniq: Dict[Path, ShardSpec] = {}
+    for s in specs:
+        uniq[s.shard_dir.resolve()] = s
+
+    return [uniq[k] for k in sorted(uniq.keys())]
 
 
 class _NpzCache:
@@ -127,28 +159,61 @@ class ShardedNpzDataset(Dataset):
         max_samples: Optional[int] = None,
         cache_max_open: int = 4,
     ):
-        self.data_root = Path(data_root)
-        self.shards = _discover_shards(self.data_root)
+        self.data_root = data_root
+        self.shards = discover_shards(data_root)
         self._cache = _NpzCache(max_open=cache_max_open)
 
         # Build global index: list[(shard_idx, row_idx_in_npz, manifest_obj)]
         self._index: List[Tuple[int, int, Dict[str, Any]]] = []
+
+        # Stats while scanning manifests
+        per_shard: Dict[str, Dict[str, int]] = {}
+        total_manifest = 0
+        total_hard_skip = 0
+
         for s_idx, spec in enumerate(self.shards):
+            shard_key = str(spec.shard_dir)
+            per_shard[shard_key] = {
+                "manifest_lines": 0,
+                "hard_skip": 0,
+                "kept": 0,
+                "kept_used": 0,
+            }
+
             row = 0
             with spec.manifest_path.open("r") as f:
                 for line in f:
+                    per_shard[shard_key]["manifest_lines"] += 1
+                    total_manifest += 1
                     obj = json.loads(line)
                     if obj.get("qc_hard_skip", False):
+                        per_shard[shard_key]["hard_skip"] += 1
+                        total_hard_skip += 1
                         continue
+
+                    per_shard[shard_key]["kept"] += 1
                     self._index.append((s_idx, row, obj))
                     row += 1
+                    per_shard[shard_key]["kept_used"] += 1
+
                     if max_samples is not None and len(self._index) >= max_samples:
                         break
+
             if max_samples is not None and len(self._index) >= max_samples:
                 break
 
         if not self._index:
-            raise RuntimeError(f"No kept samples found under {self.data_root}")
+            raise RuntimeError(f"No kept samples found under {data_root}")
+
+        self.data_stats = {
+            "max_samples": max_samples,
+            "num_shards": len(self.shards),
+            "manifest_lines": int(total_manifest),
+            "hard_skip": int(total_hard_skip),
+            "kept_used": int(len(self._index)),
+            "hard_skip_ratio": float(total_hard_skip / max(total_manifest, 1)),
+            "per_shard": per_shard,
+        }
 
         # Validate shapes from first sample.
         # Important: do NOT keep an NPZ file handle open here.
@@ -166,6 +231,11 @@ class ShardedNpzDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self._index)
+
+    def get_data_stats(self) -> Dict[str, Any]:
+        """Return JSON-serializable dataset stats (manifest counts, skips, etc.)."""
+
+        return dict(self.data_stats)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         shard_idx, row_idx, meta = self._index[idx]

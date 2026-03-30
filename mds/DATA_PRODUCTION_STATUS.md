@@ -51,7 +51,7 @@
 ### Production (Boston 50w planned, sliced)
 - Generated Boston plan with 500k planned samples: `plans/plan_v0.1_stride8_scene5000_cap100_train_boston_20260324_2254/`.
 - Production strategy: split into **5 slices × 100k planned**; run each slice with `num_shards=8/12`, `db_grouped`, `BFS_MAX_TIME_S=0.5`.
-- **Slice01 (N=8)**: `exports/boston50w_prod/slice01_20260326_093747/`
+- **Slice01 (N=8)**: `exports_local/boston50w_prod/slice01_20260326_093747/`
   - planned=100000, kept=79613, hard_skipped=20387
   - elapsed_max≈4181s, fps_kept≈19.04, size≈5.2G
 - **Slice02 (N=12)**: `exports_local/boston50w_prod/slice02_N12_20260326_105143/` (exports/ is root-owned)
