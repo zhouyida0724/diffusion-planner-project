@@ -628,8 +628,26 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             if self._device == "cuda":
                 inputs = {k: (v.cuda(non_blocking=True) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
+            # Optional sampler debug: expose raw (x,y,cos,sin) before heading conversion.
+            ego_x0 = ego_y0 = ego_cos0 = ego_sin0 = None
+
             with torch.no_grad():
-                y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
+                if self._debug_sampler:
+                    # Run full forward pass to access decoder prediction [B,P,T,4].
+                    self._model.eval()
+                    _enc, dec = self._model(inputs)
+                    pred = dec.get("prediction")
+                    if pred is None:
+                        raise RuntimeError("Paper model decoder did not return prediction")
+                    ego = pred[:, 0]  # [B,T,4]
+                    ego_x0 = ego[..., 0]
+                    ego_y0 = ego[..., 1]
+                    ego_cos0 = ego[..., 2]
+                    ego_sin0 = ego[..., 3]
+                    ego_heading = torch.atan2(ego_sin0, ego_cos0)
+                    y = torch.stack([ego_x0[0], ego_y0[0], ego_heading[0]], dim=-1)  # [T,3]
+                else:
+                    y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
 
             y_np = y.detach().cpu().numpy().astype(np.float32)
         else:
@@ -654,16 +672,34 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                     f"traj_start_end_dist={start_end:.3f}",
                 ]
 
+                if self._debug_sampler and (self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND) and (ego_x0 is not None):
+                    try:
+                        # ego_x0 etc are [B,T]
+                        x0 = ego_x0[0].detach().cpu().numpy()
+                        y0 = ego_y0[0].detach().cpu().numpy()
+                        cos0 = ego_cos0[0].detach().cpu().numpy()
+                        sin0 = ego_sin0[0].detach().cpu().numpy()
+                        norm = (cos0 ** 2 + sin0 ** 2) ** 0.5
+                        parts += [
+                            f"x0_x_minmax=[{float(x0.min()):.3f},{float(x0.max()):.3f}]",
+                            f"x0_y_minmax=[{float(y0.min()):.3f},{float(y0.max()):.3f}]",
+                            f"x0_cossin_norm_minmax=[{float(norm.min()):.3f},{float(norm.max()):.3f}]",
+                        ]
+                    except Exception:
+                        pass
+
                 if self._debug_cond and (self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND):
                     # numpy features (lanes/route_lanes)
                     try:
                         parts += [
                             f"lanes_shape={tuple(lanes_np.shape)}",
+                            f"lanes_sum={float(np.sum(lanes_np)):.3f}",
                             f"lanes_nz={int(np.count_nonzero(lanes_np))}",
-                            f"lanes_avails_sum={int(np.count_nonzero(lanes_avails_np))}",
+                            f"lanes_avails_sum={float(np.sum(lanes_avails_np)):.3f}",
                             f"route_lanes_shape={tuple(route_lanes_np.shape)}",
+                            f"route_lanes_sum={float(np.sum(route_lanes_np)):.3f}",
                             f"route_lanes_nz={int(np.count_nonzero(route_lanes_np))}",
-                            f"route_lanes_avails_sum={int(np.count_nonzero(route_lanes_avails_np))}",
+                            f"route_lanes_avails_sum={float(np.sum(route_lanes_avails_np)):.3f}",
                             f"route_roadblock_ids_len={0 if (self._route_roadblock_ids is None) else len(list(self._route_roadblock_ids))}",
                         ]
                     except Exception:
