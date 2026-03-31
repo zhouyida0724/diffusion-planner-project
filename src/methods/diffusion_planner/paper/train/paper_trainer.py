@@ -161,12 +161,51 @@ def _compute_neighbor_masks(
     return neighbor_mask_full, neighbors_future_valid
 
 
+def _ade_fde_at_horizons(
+    pred_xy: torch.Tensor,
+    gt_xy: torch.Tensor,
+    horizon_idxs: list[int],
+) -> dict[str, float]:
+    """Compute ADE/FDE at several horizons.
+
+    Args:
+      pred_xy: [B,T,2]
+      gt_xy:   [B,T,2]
+      horizon_idxs: 0-based indices into T (inclusive horizon).
+
+    Returns flat dict with keys like ade_1s, fde_1s.
+    """
+
+    assert pred_xy.ndim == 3 and gt_xy.ndim == 3
+    assert pred_xy.shape == gt_xy.shape
+
+    B, T, _ = pred_xy.shape
+    d = torch.linalg.norm(pred_xy - gt_xy, dim=-1)  # [B,T]
+
+    out: dict[str, float] = {}
+    for h in horizon_idxs:
+        hh = int(h)
+        if hh < 0 or hh >= T:
+            continue
+        ade = d[:, : hh + 1].mean()
+        fde = d[:, hh].mean()
+        # Map idx->seconds assuming 10Hz (idx 9 => 1s).
+        sec = (hh + 1) / 10.0
+        tag = f"{sec:g}s".replace(".", "p")
+        out[f"ade_{tag}"] = float(ade.detach().cpu().item())
+        out[f"fde_{tag}"] = float(fde.detach().cpu().item())
+
+    return out
+
+
 def train_loop_paper_dit_xstart(
     *,
     cfg: TrainConfig,
     model: PaperDiffusionPlanner,
     train_loader: DataLoader,
     max_grad_norm: Optional[float] = 1.0,
+    fast_val_loader: Optional[DataLoader] = None,
+    fast_val_every: int = 0,
 ) -> Path:
     """Train paper DiT with x_start objective under VP-SDE.
 
@@ -226,6 +265,122 @@ def train_loop_paper_dit_xstart(
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
 
+    # -----------------
+    # fast validation
+    # -----------------
+    fast_val_every = int(fast_val_every or 0)
+    fast_val_path = exp_dir / "fast_val.jsonl"
+
+    def _run_fast_val(step_i: int) -> None:
+        if fast_val_loader is None or fast_val_every <= 0:
+            return
+
+        model.train()  # keep train-mode per request
+        t_eval0 = time.time()
+
+        horizon_idxs = [9, 29, 49, 79]
+        alpha_planning_loss = float(getattr(cfg, "alpha_planning_loss", 1.0) or 1.0)
+
+        n_total = 0
+        sum_metrics: dict[str, float] = {}
+
+        with torch.no_grad():
+            for batch in fast_val_loader:
+                batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+                x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                x0n = model.config.state_normalizer(x0_4)
+
+                neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                    batch,
+                    predicted_neighbor_num=Pn,
+                    future_len=Tf,
+                )
+
+                x0n_masked = x0n.clone()
+                x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+
+                B = int(x0n_masked.shape[0])
+                t = torch.zeros((B,), device=device, dtype=torch.float32)
+
+                inputs = {
+                    "ego_current_state": batch["ego_current_state"],
+                    "neighbor_agents_past": batch["neighbor_agents_past"],
+                    "static_objects": batch["static_objects"],
+                    "lanes": batch["lanes"],
+                    "lanes_speed_limit": batch["lanes_speed_limit"],
+                    "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                    "route_lanes": batch["route_lanes"],
+                    "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                    "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                    "sampled_trajectories": x0n_masked,
+                    "diffusion_time": t,
+                }
+
+                with autocast_ctx:
+                    _, dec_out = model(inputs)
+                pred = dec_out["score"]  # [B,P,1+T,4]
+
+                # --- val loss proxy (future-only, official masking) ---
+                pred_fut = pred[:, :, 1:, :]
+                gt_fut = x0n_masked[:, :, 1:, :]
+                dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
+                ego_loss = dpm_loss[:, 0, :].mean()
+                nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
+
+                # --- ADE/FDE on ego (x,y) ---
+                # denormalize and take ego future
+                pred_x0 = model.config.state_normalizer.inverse(pred) if hasattr(model.config.state_normalizer, "inverse") else None
+                if pred_x0 is None:
+                    # Fallback: if inverse not available, compute on normalized space (still monotonic-ish).
+                    pred_ego_xy = pred[:, 0, 1:, :2]
+                else:
+                    pred_ego_xy = pred_x0[:, 0, 1:, :2]
+
+                gt_ego_future = batch["ego_agent_future"]
+                if gt_ego_future.shape[-2] == Tf + 1:
+                    gt_ego_future = gt_ego_future[:, 1:, :]
+                gt_ego_xy = gt_ego_future[..., :2]
+
+                ade_fde = _ade_fde_at_horizons(pred_ego_xy, gt_ego_xy, horizon_idxs)
+
+                metrics_batch: dict[str, float] = {
+                    "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()),
+                }
+                metrics_batch.update(ade_fde)
+
+                n_total += B
+                for k, v in metrics_batch.items():
+                    sum_metrics[k] = sum_metrics.get(k, 0.0) + float(v) * B
+
+        if n_total <= 0:
+            return
+
+        metrics = {k: (v / n_total) for k, v in sum_metrics.items()}
+        metrics["step"] = int(step_i)
+        metrics["n"] = int(n_total)
+        metrics["wall_s"] = float(time.time() - t_eval0)
+        metrics["ts"] = time.time()
+
+        # stdout
+        parts = [f"{k}={metrics[k]:.6f}" for k in sorted(metrics.keys()) if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
+        print(f"[fast-val] step {step_i:05d} | n={n_total} | " + " | ".join(parts), flush=True)
+
+        # jsonl
+        with fast_val_path.open("a") as f:
+            f.write(json.dumps(metrics) + "\n")
+
+        # optionally attach to perf record
+        if perf.records and int(perf.records[-1].get("step", -1)) == int(step_i):
+            perf.records[-1]["fast_val"] = dict(metrics)
+            perf.write_perf_json()
+
+    # initial fast-val at step 0
+    if fast_val_loader is not None and fast_val_every > 0:
+        _run_fast_val(0)
+
     profile_steps = int(getattr(cfg, "profile_steps", 0) or 0)
     profile_every = int(getattr(cfg, "profile_every", 0) or 0)
 
@@ -240,6 +395,9 @@ def train_loop_paper_dit_xstart(
         return (i % profile_every) == 0
 
     while step < cfg.steps:
+        if fast_val_loader is not None and fast_val_every > 0 and (step % fast_val_every) == 0 and step != 0:
+            _run_fast_val(step)
+
         step_t0 = time.time()
         breakdown: dict[str, Any] = {}
 
@@ -446,6 +604,10 @@ def train_loop_paper_dit_xstart(
             torch.save(payload, ckpt_path)
 
         step += 1
+
+    # final fast-val at step=cfg.steps
+    if fast_val_loader is not None and fast_val_every > 0:
+        _run_fast_val(int(cfg.steps))
 
     latest = exp_dir / "checkpoint_latest.pt"
     try:
