@@ -101,6 +101,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=2)
+
+    # paper_dit_dpm loss weights
+    p.add_argument(
+        "--alpha-planning-loss",
+        type=float,
+        default=1.0,
+        help="Weight on neighbor prediction loss for paper_dit_dpm (total = ego + alpha * neighbor).",
+    )
     p.add_argument(
         "--amp",
         type=str,
@@ -272,6 +280,7 @@ def main() -> None:
         profile_steps=args.profile_steps,
         profile_every=args.profile_every,
         amp=args.amp,
+        alpha_planning_loss=args.alpha_planning_loss,
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.

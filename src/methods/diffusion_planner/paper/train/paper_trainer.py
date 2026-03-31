@@ -114,6 +114,53 @@ def _build_joint_trajectories_x0(batch: dict, *, predicted_neighbor_num: int, fu
     return x0, current_states
 
 
+def _compute_neighbor_masks(
+    batch: dict,
+    *,
+    predicted_neighbor_num: int,
+    future_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute neighbor masks matching the official Diffusion-Planner loss.
+
+    Returns:
+      neighbor_mask_full: [B,Pn,1+T] bool (True means invalid -> should be zeroed)
+      neighbors_future_valid: [B,Pn,T] bool (True means valid future step)
+
+    Mask rule: a neighbor timestep is invalid if all coords are exactly 0.
+    """
+
+    neighbor_past = batch["neighbor_agents_past"]
+    neighbor_future = batch["neighbor_agents_future"]
+
+    # Decide if past/future arrays include ego row.
+    if neighbor_past.shape[1] == predicted_neighbor_num + 1:
+        neighbors_current = neighbor_past[:, 1 : 1 + predicted_neighbor_num, -1, :4]
+        neighbors_future_raw = (
+            neighbor_future[:, 1 : 1 + predicted_neighbor_num]
+            if neighbor_future.shape[1] == predicted_neighbor_num + 1
+            else neighbor_future[:, :predicted_neighbor_num]
+        )
+    else:
+        neighbors_current = neighbor_past[:, :predicted_neighbor_num, -1, :4]
+        neighbors_future_raw = neighbor_future[:, :predicted_neighbor_num]
+
+    # Some exports include current as first timestep in *_future.
+    if neighbors_future_raw.shape[-2] == future_len + 1:
+        neighbors_future_raw = neighbors_future_raw[..., 1:, :]
+    elif neighbors_future_raw.shape[-2] != future_len:
+        raise RuntimeError(
+            f"neighbor_agents_future has unexpected T={neighbors_future_raw.shape[-2]} (expected {future_len} or {future_len+1})"
+        )
+
+    # invalid if all zeros
+    neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0.0), dim=-1) == 0
+    neighbor_future_mask = torch.sum(torch.ne(neighbors_future_raw, 0.0), dim=-1) == 0  # [B,Pn,T]
+
+    neighbor_mask_full = torch.cat([neighbor_current_mask.unsqueeze(-1), neighbor_future_mask], dim=-1)  # [B,Pn,1+T]
+    neighbors_future_valid = ~neighbor_future_mask
+    return neighbor_mask_full, neighbors_future_valid
+
+
 def train_loop_paper_dit_xstart(
     *,
     cfg: TrainConfig,
@@ -221,15 +268,28 @@ def train_loop_paper_dit_xstart(
         breakdown["build_x0_s"] = float(time.perf_counter() - t_seg)
 
         t_seg = time.perf_counter()
-        x0n = model.config.state_normalizer(x0_4)
+        x0n = model.config.state_normalizer(x0_4)  # [B,P,1+T,4]
 
-        B = x0n.shape[0]
+        # Neighbor invalid masks (official behavior):
+        # - mask current if neighbor_current is all zeros
+        # - mask future steps if neighbor_future is all zeros
+        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+            batch,
+            predicted_neighbor_num=Pn,
+            future_len=Tf,
+        )
+
+        x0n_masked = x0n.clone()
+        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+
+        B = x0n_masked.shape[0]
         t = torch.rand((B,), device=device, dtype=torch.float32)
-        noise = torch.randn_like(x0n)
 
-        mean, std = model.sde.marginal_prob(x0n, t)
-        xt = mean + std * noise
-        xt[:, :, 0, :] = x0n[:, :, 0, :]
+        # Noise only the future (t=1..T); keep current fixed.
+        noise_fut = torch.randn_like(x0n_masked[:, :, 1:, :])
+        mean, std = model.sde.marginal_prob(x0n_masked[:, :, 1:, :], t)
+        xt_fut = mean + std * noise_fut
+        xt = torch.cat([x0n_masked[:, :, :1, :], xt_fut], dim=2)
         breakdown["misc_setup_s"] = float(time.perf_counter() - t_seg)
 
         inputs = {
@@ -263,11 +323,30 @@ def train_loop_paper_dit_xstart(
         if _do_profile(step):
             _maybe_sync(device)
         t_seg = time.perf_counter()
+        alpha_planning_loss = float(getattr(cfg, "alpha_planning_loss", 1.0) or 1.0)
         with autocast_ctx:
-            loss = torch.mean((pred - x0n) ** 2)
+            # Official Diffusion-Planner (x_start) behavior:
+            # - supervise only future timesteps (exclude current)
+            # - ignore invalid neighbor futures via mask
+            pred_fut = pred[:, :, 1:, :]  # [B,P,T,4]
+            gt_fut = x0n_masked[:, :, 1:, :]  # [B,P,T,4]
+
+            dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
+
+            ego_planning_loss = dpm_loss[:, 0, :].mean()
+
+            nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+            if nb_elems.numel() > 0:
+                neighbor_prediction_loss = nb_elems.mean()
+            else:
+                neighbor_prediction_loss = torch.tensor(0.0, device=dpm_loss.device)
+
+            loss = ego_planning_loss + alpha_planning_loss * neighbor_prediction_loss
         if _do_profile(step):
             _maybe_sync(device)
         breakdown["loss_s"] = float(time.perf_counter() - t_seg)
+        breakdown["ego_planning_loss"] = float(ego_planning_loss.detach().float().item())
+        breakdown["neighbor_prediction_loss"] = float(neighbor_prediction_loss.detach().float().item())
         _assert_finite(loss, "loss")
 
         # optim
