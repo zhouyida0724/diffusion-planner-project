@@ -345,23 +345,31 @@ def _build_neighbor_agents_past_from_history(
                 continue
 
             dx_dy = R @ np.array([x - cur_ego.x, y - cur_ego.y], dtype=np.float64)
-            d_heading = _wrap_pi(float(heading) - cur_ego.heading)
+            # NOTE: match offline exporter: use ABSOLUTE heading for cos/sin (not delta-to-ego).
             out[p, t, 0] = float(dx_dy[0])
             out[p, t, 1] = float(dx_dy[1])
-            out[p, t, 2] = float(np.cos(d_heading))
-            out[p, t, 3] = float(np.sin(d_heading))
+            out[p, t, 2] = float(np.cos(float(heading)))
+            out[p, t, 3] = float(np.sin(float(heading)))
 
             if vx is not None and vy is not None:
                 vv = R @ np.array([vx, vy], dtype=np.float64)
                 out[p, t, 4] = float(vv[0])
                 out[p, t, 5] = float(vv[1])
 
-            out[p, t, 6] = float(width) if width is not None else 0.0
-            out[p, t, 7] = float(length) if length is not None else 0.0
-            out[p, t, 8:11] = onehot
+            # NOTE: match offline exporter 11-dim layout:
+            # [dx,dy,cos(heading_abs),sin(heading_abs),v_local_x,v_local_y,acc_x,acc_y,width,length,type_scalar]
+            # Runtime tracked objects do not provide reliable accelerations -> set to 0.
+            out[p, t, 6] = 0.0
+            out[p, t, 7] = 0.0
+            out[p, t, 8] = float(width) if width is not None else 0.0
+            out[p, t, 9] = float(length) if length is not None else 0.0
+            # type scalar (we treat vehicles as 1.0; other types as 0.0)
+            type_scalar = 1.0 if (onehot is not None and float(onehot[0]) > 0.5) else 0.0
+            out[p, t, 10] = float(type_scalar)
 
         # constant-hold backfill
-        valid = np.any(out[p, :, :8] != 0.0, axis=1)
+        # consider position/heading/velocity for validity (exclude size/type slots)
+        valid = np.any(out[p, :, :6] != 0.0, axis=1)
         if not np.any(valid):
             continue
         first = int(np.argmax(valid))
@@ -587,17 +595,23 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                     continue
                 k = _ego_kinematics(s)
                 dx_dy = R0 @ np.array([k.x - cur_k.x, k.y - cur_k.y], dtype=np.float64)
-                d_heading = _wrap_pi(k.heading - cur_k.heading)
                 vv = R0 @ np.array([k.vx, k.vy], dtype=np.float64)
+                aa = R0 @ np.array([k.ax, k.ay], dtype=np.float64)
+
                 neighbor_all[0, t, 0] = float(dx_dy[0])
                 neighbor_all[0, t, 1] = float(dx_dy[1])
-                neighbor_all[0, t, 2] = float(np.cos(d_heading))
-                neighbor_all[0, t, 3] = float(np.sin(d_heading))
+                # NOTE: match offline exporter: ABSOLUTE heading cos/sin (not delta-to-ego)
+                neighbor_all[0, t, 2] = float(np.cos(k.heading))
+                neighbor_all[0, t, 3] = float(np.sin(k.heading))
                 neighbor_all[0, t, 4] = float(vv[0])
                 neighbor_all[0, t, 5] = float(vv[1])
-                neighbor_all[0, t, 6] = 1.8
-                neighbor_all[0, t, 7] = 4.5
-                neighbor_all[0, t, 8] = 1.0
+                # accel in ego-local
+                neighbor_all[0, t, 6] = float(aa[0])
+                neighbor_all[0, t, 7] = float(aa[1])
+                # size + type scalar
+                neighbor_all[0, t, 8] = 1.8
+                neighbor_all[0, t, 9] = 4.5
+                neighbor_all[0, t, 10] = 1.0
 
             # Fill tracked neighbor vehicles into slots [1:1+Pn].
             neighbor_np, neighbor_nz = _build_neighbor_agents_past_from_history(

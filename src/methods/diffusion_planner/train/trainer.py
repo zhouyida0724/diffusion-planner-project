@@ -51,6 +51,9 @@ class TrainConfig:
     # amp
     amp: str = "off"  # off|bf16|fp16
 
+    # loss weights (paper_dit_dpm)
+    alpha_planning_loss: float = 1.0
+
     # perf
     perf_window: int = 100
     perf_smi_every: int = 100

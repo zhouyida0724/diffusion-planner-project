@@ -101,6 +101,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=2)
+
+    # paper_dit_dpm loss weights
+    p.add_argument(
+        "--alpha-planning-loss",
+        type=float,
+        default=1.0,
+        help="Weight on neighbor prediction loss for paper_dit_dpm (total = ego + alpha * neighbor).",
+    )
     p.add_argument(
         "--amp",
         type=str,
@@ -143,6 +151,31 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="If >0, print the breakdown every N steps (only during profiled steps).",
     )
+
+    # fast validation (paper_dit_dpm only)
+    p.add_argument(
+        "--fast-val-roots",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional roots for fast validation (same conventions as --train-roots).",
+    )
+    p.add_argument(
+        "--fast-val-slices",
+        type=str,
+        nargs="+",
+        default=["slice05"],
+        help="When a fast-val-root points to boston50w_prod, pick these slice directory names. Default: slice05",
+    )
+    p.add_argument("--fast-val-every", type=int, default=500, help="Run fast validation every N steps (0 disables).")
+    p.add_argument(
+        "--fast-val-max-samples",
+        type=int,
+        default=2048,
+        help="Max number of samples used for fast validation (deterministic prefix).",
+    )
+    p.add_argument("--fast-val-batch-size", type=int, default=64)
+    p.add_argument("--fast-val-num-workers", type=int, default=2)
 
     p.add_argument(
         "--max-samples",
@@ -229,6 +262,8 @@ def main() -> None:
     if not train_roots:
         raise SystemExit("No training roots provided. Use --train-roots (or legacy --data-root).")
 
+    fast_val_loader = None
+
     if args.mode == "paper_dit_dpm":
         ds = ShardedNpzFeatureDataset(
             train_roots,
@@ -244,6 +279,29 @@ def main() -> None:
             pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
             drop_last=True,
         )
+
+        # Optional fast validation loader (deterministic prefix subset).
+        if int(getattr(args, "fast_val_every", 0) or 0) > 0 and (args.fast_val_roots is not None):
+            fv_roots = _expand_roots(args.fast_val_roots or [], args.fast_val_slices)
+            if fv_roots:
+                fv_ds = ShardedNpzFeatureDataset(
+                    fv_roots,
+                    max_samples=int(args.fast_val_max_samples),
+                    cache_root=args.cache_root,
+                )
+                fast_val_loader = DataLoader(
+                    fv_ds,
+                    batch_size=int(args.fast_val_batch_size),
+                    shuffle=False,
+                    num_workers=int(args.fast_val_num_workers),
+                    pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
+                    drop_last=False,
+                )
+                print(f"Fast-val dataset size: {len(fv_ds)} kept samples | every={int(args.fast_val_every)}")
+            else:
+                print("[fast-val] No fast-val roots expanded; fast validation disabled.")
+        elif int(getattr(args, "fast_val_every", 0) or 0) > 0:
+            print("[fast-val] --fast-val-every set but --fast-val-roots not provided; fast validation disabled.")
     else:
         ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
         print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
@@ -272,6 +330,7 @@ def main() -> None:
         profile_steps=args.profile_steps,
         profile_every=args.profile_every,
         amp=args.amp,
+        alpha_planning_loss=args.alpha_planning_loss,
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.
@@ -310,7 +369,13 @@ def main() -> None:
             future_len=future_len,
         )
         model = PaperDiffusionPlanner(paper_cfg)
-        exp_dir = train_loop_paper_dit_xstart(cfg=cfg, model=model, train_loader=dl)
+        exp_dir = train_loop_paper_dit_xstart(
+            cfg=cfg,
+            model=model,
+            train_loader=dl,
+            fast_val_loader=fast_val_loader,
+            fast_val_every=int(getattr(args, "fast_val_every", 0) or 0),
+        )
     else:
         raise SystemExit(f"Unknown mode: {args.mode}")
 
