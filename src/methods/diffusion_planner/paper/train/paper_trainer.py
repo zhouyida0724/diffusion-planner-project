@@ -4,6 +4,11 @@ import json
 import os
 import time
 from contextlib import nullcontext
+
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:  # pragma: no cover
+    SummaryWriter = None  # type: ignore
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -257,6 +262,16 @@ def train_loop_paper_dit_xstart(
 
     perf = _PerfTracker(exp_dir=exp_dir, cfg=cfg, device=device)
 
+    # TensorBoard (optional)
+    writer = None
+    if bool(getattr(cfg, "tensorboard", False)):
+        if SummaryWriter is None:
+            print("[tb] SummaryWriter unavailable (torch.utils.tensorboard not installed); skipping TensorBoard logs.", flush=True)
+        else:
+            tb_dir = getattr(cfg, "tb_dir", None) or str(exp_dir / "tb")
+            writer = SummaryWriter(log_dir=tb_dir)
+            print(f"[tb] writing TensorBoard logs to: {tb_dir}", flush=True)
+
     model.train()
     t0 = time.time()
     step = 0
@@ -367,6 +382,14 @@ def train_loop_paper_dit_xstart(
         # stdout
         parts = [f"{k}={metrics[k]:.6f}" for k in sorted(metrics.keys()) if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
         print(f"[fast-val] step {step_i:05d} | n={n_total} | " + " | ".join(parts), flush=True)
+
+        # tensorboard
+        if writer is not None:
+            writer.add_scalar("fast_val/val_loss_proxy", metrics.get("val_loss_proxy", float("nan")), int(step_i))
+            for k, v in metrics.items():
+                if k.startswith("ade_") or k.startswith("fde_"):
+                    writer.add_scalar(f"fast_val/{k}", float(v), int(step_i))
+            writer.flush()
 
         # jsonl
         with fast_val_path.open("a") as f:
@@ -592,6 +615,13 @@ def train_loop_paper_dit_xstart(
                 f.write(msg + "\n")
             perf.write_perf_json()
 
+            # tensorboard
+            if writer is not None:
+                writer.add_scalar("train/loss", float(loss.item()), int(step))
+                writer.add_scalar("train/step_s", float(last.get("step_s", 0.0)), int(step))
+                writer.add_scalar("train/samples_s", float(last.get("samples_s", 0.0)), int(step))
+                writer.flush()
+
         if (step % cfg.ckpt_every) == 0 or step == cfg.steps - 1:
             ckpt_path = exp_dir / f"checkpoint_step_{step:06d}.pt"
             payload = {
@@ -620,4 +650,8 @@ def train_loop_paper_dit_xstart(
         shutil.copy2(ckpt_path, latest)
 
     perf.write_perf_json()
+
+    if writer is not None:
+        writer.close()
+
     return exp_dir
