@@ -13,6 +13,32 @@ from typing import Optional
 import numpy as np
 
 
+def _ensure_pillow_resampling_compat() -> None:
+    """Provide PIL.Image.Resampling fallback for older Pillow releases."""
+
+    try:
+        from PIL import Image
+    except Exception:
+        return
+
+    if getattr(Image, "Resampling", None) is not None:
+        return
+
+    lanczos = getattr(Image, "LANCZOS", None)
+    bicubic = getattr(Image, "BICUBIC", None)
+    antialias = getattr(Image, "ANTIALIAS", None)
+    bilinear = getattr(Image, "BILINEAR", None)
+    nearest = getattr(Image, "NEAREST", None)
+
+    class _CompatResampling:
+        NEAREST = nearest if nearest is not None else 0
+        BILINEAR = bilinear if bilinear is not None else (nearest if nearest is not None else 0)
+        BICUBIC = bicubic if bicubic is not None else (bilinear if bilinear is not None else (nearest if nearest is not None else 0))
+        LANCZOS = lanczos if lanczos is not None else (bicubic if bicubic is not None else (antialias if antialias is not None else (bilinear if bilinear is not None else (nearest if nearest is not None else 0))))
+
+    Image.Resampling = _CompatResampling
+
+
 def angle_difference_radians(angle1_rad: float, angle2_rad: float) -> float:
     """Return the smallest absolute difference between two angles (radians)."""
     diff = abs(angle1_rad - angle2_rad)
@@ -33,6 +59,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
 
     # Heavy imports live inside the function so this module can be imported in
     # headless contexts without eagerly configuring matplotlib backends.
+    _ensure_pillow_resampling_compat()
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
     from matplotlib.patches import FancyArrowPatch

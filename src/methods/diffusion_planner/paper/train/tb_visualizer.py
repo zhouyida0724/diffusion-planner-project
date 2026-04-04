@@ -18,6 +18,38 @@ import numpy as np
 import torch
 
 
+def _ensure_pillow_resampling_compat() -> None:
+    """Provide PIL.Image.Resampling fallback for older Pillow releases.
+
+    Some TensorBoard image paths expect ``Image.Resampling`` to exist, but older
+    Pillow versions only expose module-level constants like ``Image.LANCZOS`` or
+    ``Image.ANTIALIAS``. Best-effort monkey-patch a tiny compatibility shim so
+    TB image logging keeps working without warnings.
+    """
+
+    try:
+        from PIL import Image
+    except Exception:
+        return
+
+    if getattr(Image, "Resampling", None) is not None:
+        return
+
+    lanczos = getattr(Image, "LANCZOS", None)
+    bicubic = getattr(Image, "BICUBIC", None)
+    antialias = getattr(Image, "ANTIALIAS", None)
+    bilinear = getattr(Image, "BILINEAR", None)
+    nearest = getattr(Image, "NEAREST", None)
+
+    class _CompatResampling:
+        NEAREST = nearest if nearest is not None else 0
+        BILINEAR = bilinear if bilinear is not None else (nearest if nearest is not None else 0)
+        BICUBIC = bicubic if bicubic is not None else (bilinear if bilinear is not None else (nearest if nearest is not None else 0))
+        LANCZOS = lanczos if lanczos is not None else (bicubic if bicubic is not None else (antialias if antialias is not None else (bilinear if bilinear is not None else (nearest if nearest is not None else 0))))
+
+    Image.Resampling = _CompatResampling
+
+
 def _to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().float().numpy()
@@ -32,6 +64,7 @@ def angle_difference_radians(angle1_rad: float, angle2_rad: float) -> float:
 
 
 def _safe_import_matplotlib():
+    _ensure_pillow_resampling_compat()
     try:
         import matplotlib
 

@@ -160,7 +160,7 @@ def main() -> None:
         data_root = data_root / args.slice
 
     device = torch.device("cpu")
-    payload = torch.load(ckpt_path, map_location="cpu")
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     step = int(payload.get("step", -1))
 
     paper_cfg = _paper_cfg_from_ckpt(payload)
