@@ -40,7 +40,7 @@ class TrainConfig:
     out_root: str = "outputs/training"
     steps: int = 200
     batch_size: int = 32
-    lr: float = 1e-3
+    lr: float = 1e-4
     weight_decay: float = 0.0
     num_workers: int = 2
     log_every: int = 10
@@ -53,6 +53,10 @@ class TrainConfig:
 
     # loss weights (paper_dit_dpm)
     alpha_planning_loss: float = 1.0
+
+    # tensorboard (optional)
+    tensorboard: bool = False
+    tb_dir: str | None = None
 
     # perf
     perf_window: int = 100

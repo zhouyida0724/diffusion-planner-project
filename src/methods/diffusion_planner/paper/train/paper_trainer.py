@@ -4,6 +4,11 @@ import json
 import os
 import time
 from contextlib import nullcontext
+
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:  # pragma: no cover
+    SummaryWriter = None  # type: ignore
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -296,6 +301,16 @@ def train_loop_paper_dit_xstart(
 
     perf = _PerfTracker(exp_dir=exp_dir, cfg=cfg, device=device)
 
+    # TensorBoard (optional)
+    writer = None
+    if bool(getattr(cfg, "tensorboard", False)):
+        if SummaryWriter is None:
+            print("[tb] SummaryWriter unavailable (torch.utils.tensorboard not installed); skipping TensorBoard logs.", flush=True)
+        else:
+            tb_dir = getattr(cfg, "tb_dir", None) or str(exp_dir / "tb")
+            writer = SummaryWriter(log_dir=tb_dir)
+            print(f"[tb] writing TensorBoard logs to: {tb_dir}", flush=True)
+
     model.train()
     t0 = time.time()
     step = 0
@@ -410,10 +425,11 @@ def train_loop_paper_dit_xstart(
         # tensorboard
         if tb is not None:
             try:
-                tb.add_scalar("fast_val/val_loss_proxy", float(metrics.get("val_loss_proxy", 0.0)), int(step_i))
+                tb.add_scalar("fast_val/val_loss_proxy", float(metrics.get("val_loss_proxy", float("nan"))), int(step_i))
                 for k, v in metrics.items():
-                    if k.startswith(("ade_", "fde_")):
+                    if k.startswith("ade_") or k.startswith("fde_"):
                         tb.add_scalar(f"fast_val/{k}", float(v), int(step_i))
+                tb.flush()
             except Exception:
                 pass
 

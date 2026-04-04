@@ -172,7 +172,7 @@ class StaticFusionEncoder(nn.Module):
         # Under autocast, `x` stays fp32 but the projection output becomes bf16/fp16.
         # Allocate the indexed destination in the current autocast dtype to avoid dtype-mismatch crashes.
         if torch.is_autocast_enabled() and x.is_cuda:
-            # torch.get_autocast_dtype("cuda") is only available in newer PyTorch.
+            # torch.get_autocast_dtype('cuda') is only available in newer PyTorch.
             if hasattr(torch, "get_autocast_dtype"):
                 dst_dtype = torch.get_autocast_dtype("cuda")
             elif hasattr(torch, "get_autocast_gpu_dtype"):

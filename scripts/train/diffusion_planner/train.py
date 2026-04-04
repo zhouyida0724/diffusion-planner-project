@@ -152,6 +152,19 @@ def parse_args() -> argparse.Namespace:
         help="If >0, print the breakdown every N steps (only during profiled steps).",
     )
 
+    # tensorboard (optional)
+    p.add_argument(
+        "--tensorboard",
+        action="store_true",
+        help="Write TensorBoard event files under outputs/training/<exp>/tb (paper_dit_dpm only).",
+    )
+    p.add_argument(
+        "--tb-dir",
+        type=str,
+        default=None,
+        help="TensorBoard log dir (default: outputs/training/<exp>/tb).",
+    )
+
     # fast validation (paper_dit_dpm only)
     p.add_argument(
         "--fast-val-roots",
@@ -350,6 +363,10 @@ def main() -> None:
         profile_every=args.profile_every,
         amp=args.amp,
         alpha_planning_loss=args.alpha_planning_loss,
+        # tensorboard (scalar + image logging)
+        tensorboard=bool(getattr(args, "tensorboard", False)) or bool(args.tb_enable),
+        tb_dir=getattr(args, "tb_dir", None),
+        # richer image logging (paper_dit_dpm)
         tb_enable=bool(args.tb_enable),
         tb_every=int(args.tb_every),
         tb_num_samples=int(args.tb_num_samples),
