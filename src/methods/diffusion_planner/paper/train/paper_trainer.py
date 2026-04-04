@@ -11,6 +11,12 @@ from typing import Any, Optional
 import torch
 from torch.utils.data import DataLoader
 
+# Optional TensorBoard logging
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:  # pragma: no cover
+    SummaryWriter = None  # type: ignore
+
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
 
@@ -222,6 +228,15 @@ def train_loop_paper_dit_xstart(
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
+    tb = None
+    if SummaryWriter is not None:
+        try:
+            tb = SummaryWriter(log_dir=str(exp_dir / "tb"))
+            tb.add_text("meta/exp_name", str(cfg.exp_name), 0)
+            tb.add_text("meta/mode", "paper_dit_dpm", 0)
+        except Exception:
+            tb = None
+
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     # AMP (stability-first):
@@ -367,6 +382,16 @@ def train_loop_paper_dit_xstart(
         # stdout
         parts = [f"{k}={metrics[k]:.6f}" for k in sorted(metrics.keys()) if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
         print(f"[fast-val] step {step_i:05d} | n={n_total} | " + " | ".join(parts), flush=True)
+
+        # tensorboard
+        if tb is not None:
+            try:
+                tb.add_scalar("fast_val/val_loss_proxy", float(metrics.get("val_loss_proxy", 0.0)), int(step_i))
+                for k, v in metrics.items():
+                    if k.startswith(("ade_", "fde_")):
+                        tb.add_scalar(f"fast_val/{k}", float(v), int(step_i))
+            except Exception:
+                pass
 
         # jsonl
         with fast_val_path.open("a") as f:
@@ -592,6 +617,17 @@ def train_loop_paper_dit_xstart(
                 f.write(msg + "\n")
             perf.write_perf_json()
 
+            if tb is not None:
+                try:
+                    tb.add_scalar("train/loss", float(loss.detach().float().cpu().item()), int(step))
+                    tb.add_scalar("train/ego_planning_loss", float(ego_planning_loss.detach().float().cpu().item()), int(step))
+                    tb.add_scalar("train/neighbor_prediction_loss", float(neighbor_prediction_loss.detach().float().cpu().item()), int(step))
+                    tb.add_scalar("perf/step_s", float(last.get("step_s", 0.0)), int(step))
+                    tb.add_scalar("perf/samples_s", float(last.get("samples_s", 0.0)), int(step))
+                    tb.add_scalar("opt/lr", float(opt.param_groups[0].get("lr", cfg.lr)), int(step))
+                except Exception:
+                    pass
+
         if (step % cfg.ckpt_every) == 0 or step == cfg.steps - 1:
             ckpt_path = exp_dir / f"checkpoint_step_{step:06d}.pt"
             payload = {
@@ -620,4 +656,12 @@ def train_loop_paper_dit_xstart(
         shutil.copy2(ckpt_path, latest)
 
     perf.write_perf_json()
+
+    if tb is not None:
+        try:
+            tb.flush()
+            tb.close()
+        except Exception:
+            pass
+
     return exp_dir
