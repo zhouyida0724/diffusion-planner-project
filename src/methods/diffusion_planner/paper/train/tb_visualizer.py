@@ -107,10 +107,10 @@ def render_npz_style_scene(
             right_y = lanes[lane_idx, :, 1] + lanes[lane_idx, :, 7]
             m_left = (left_x != 0) | (left_y != 0)
             m_right = (right_x != 0) | (right_y != 0)
-            ax.plot(left_x[m_left], left_y[m_left], "b--", linewidth=1, alpha=0.35)
-            ax.plot(right_x[m_right], right_y[m_right], "r--", linewidth=1, alpha=0.35)
+            ax.plot(left_x[m_left], left_y[m_left], "b--", linewidth=1, alpha=0.5)
+            ax.plot(right_x[m_right], right_y[m_right], "r--", linewidth=1, alpha=0.5)
 
-        # Route lanes
+        # Route lanes (with simple direction arrows)
         for rlane_idx in range(route_lanes.shape[0]):
             lane_x = route_lanes[rlane_idx, :, 0]
             lane_y = route_lanes[rlane_idx, :, 1]
@@ -122,7 +122,23 @@ def render_npz_style_scene(
                 valid = (lane_x != 0) | (lane_y != 0)
             if not np.any(valid):
                 continue
-            ax.plot(lane_x[valid], lane_y[valid], "-", color="#FFFF99", alpha=0.9, linewidth=2)
+            x_coords = lane_x[valid]
+            y_coords = lane_y[valid]
+            ax.plot(x_coords, y_coords, "-", color="#FFFF99", alpha=0.9, linewidth=2)
+
+            # ~5 arrows per lane
+            if x_coords.shape[0] >= 2:
+                arrow_interval = max(1, int(x_coords.shape[0] // 5))
+                for i in range(0, int(x_coords.shape[0]) - 1, arrow_interval):
+                    dx = float(x_coords[i + 1] - x_coords[i])
+                    dy = float(y_coords[i + 1] - y_coords[i])
+                    if (dx * dx + dy * dy) ** 0.5 > 1e-2:
+                        ax.annotate(
+                            "",
+                            xy=(float(x_coords[i + 1]), float(y_coords[i + 1])),
+                            xytext=(float(x_coords[i]), float(y_coords[i])),
+                            arrowprops=dict(arrowstyle="->", color="#FFD700", lw=1.2, alpha=0.9),
+                        )
 
         # Ego marker at origin
         arrow = FancyArrowPatch(
@@ -138,37 +154,67 @@ def render_npz_style_scene(
         ego_circle = patches.Circle((0, 0), radius=1.5, facecolor="red", edgecolor="darkred", linewidth=2)
         ax.add_patch(ego_circle)
 
-        # Ego GT + pred
-        ax.plot(ego_future[:, 0], ego_future[:, 1], "g-", linewidth=2.5, alpha=0.85, label="ego_gt")
+        # Ego GT + pred (match visualize_npz.py style: GT blue, pred orange)
+        ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8, label="ego_gt")
         if ego_future_xy is not None:
             pred_xy = _to_numpy(ego_future_xy)
-            ax.plot(pred_xy[:, 0], pred_xy[:, 1], color="orange", linewidth=2.0, alpha=0.95, label="ego_pred")
+            ax.plot(pred_xy[:, 0], pred_xy[:, 1], color="orange", linewidth=3, alpha=0.9, label="ego_pred")
 
-        # Neighbor past/future (light)
+        # Neighbor past trajectories (more visible, with ids)
+        agent_id = 0
         for agent_idx in range(neighbor_past.shape[0]):
             curr_x = float(neighbor_past[agent_idx, -1, 0])
             curr_y = float(neighbor_past[agent_idx, -1, 1])
             past = neighbor_past[agent_idx, :, :2]
             if abs(curr_x) < 0.1 and abs(curr_y) < 0.1:
                 continue
+            if abs(curr_x) > 50 or abs(curr_y) > 50:
+                continue
             valid_mask = (past[:, 0] != 0) | (past[:, 1] != 0)
             if not np.any(valid_mask):
                 continue
-            ax.plot(past[valid_mask, 0], past[valid_mask, 1], "b-", linewidth=1.5, alpha=0.55)
-            ax.plot(curr_x, curr_y, "o", markersize=5, color="blue", alpha=0.85)
+            ax.annotate(str(agent_id), (curr_x, curr_y), fontsize=9, fontweight="bold", color="red", xytext=(4, 4), textcoords="offset points")
+            agent_id += 1
+            ax.plot(past[valid_mask, 0], past[valid_mask, 1], "b-", linewidth=2.5, alpha=0.75)
+            ax.plot(curr_x, curr_y, "o", markersize=6, color="blue", alpha=0.9)
 
+            # Best-effort bounding box for vehicles/pedestrians (width/length from last two dims if present)
+            try:
+                if neighbor_past.shape[-1] >= 10:
+                    cos_h = float(neighbor_past[agent_idx, -1, 2])
+                    sin_h = float(neighbor_past[agent_idx, -1, 3])
+                    heading = float(np.arctan2(sin_h, cos_h))
+                    width = float(neighbor_past[agent_idx, -1, -3])
+                    length = float(neighbor_past[agent_idx, -1, -2])
+                    if width > 0.1 and length > 0.1:
+                        rect = patches.Rectangle(
+                            (curr_x - length / 2, curr_y - width / 2),
+                            length,
+                            width,
+                            angle=np.degrees(heading),
+                            rotation_point="center",
+                            fill=False,
+                            linewidth=1.5,
+                            edgecolor="cyan",
+                            alpha=0.8,
+                        )
+                        ax.add_patch(rect)
+            except Exception:
+                pass
+
+        # Neighbor future trajectories
         if neighbor_future is not None:
             for agent_idx in range(neighbor_future.shape[0]):
                 future = neighbor_future[agent_idx, :, :2]
                 valid_mask = (future[:, 0] != 0) | (future[:, 1] != 0)
                 if np.any(valid_mask):
-                    ax.plot(future[valid_mask, 0], future[valid_mask, 1], "g-", linewidth=1.2, alpha=0.35)
+                    ax.plot(future[valid_mask, 0], future[valid_mask, 1], "g-", linewidth=2.5, alpha=0.55)
 
-        # Static objects (points)
+        # Static objects (points) — many nuPlan exports currently have these as all-zeros.
         if static_objects is not None and static_objects.ndim == 2 and static_objects.shape[-1] >= 2:
             valid = np.any(np.abs(static_objects[:, :2]) > 1e-6, axis=1)
             if np.any(valid):
-                ax.scatter(static_objects[valid, 0], static_objects[valid, 1], s=20, c="black", alpha=0.5, marker="x", label="static")
+                ax.scatter(static_objects[valid, 0], static_objects[valid, 1], s=40, c="black", alpha=0.65, marker="x", label="static")
 
         ax.legend(loc="upper right")
         fig.tight_layout()
