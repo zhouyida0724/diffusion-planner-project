@@ -116,18 +116,37 @@ class ShardedNpzFeatureDataset(Dataset):
         return dict(self.data_stats)
 
     def _cache_dir_for_shard(self, spec: ShardSpec) -> Path:
-        """Map a shard spec to its cache directory."""
-        # Example spec.shard_dir:
-        #   exports_local/boston50w_prod/slice05.../shards/shard_000
-        # Cache layout:
-        #   <cache_root>/boston50w_prod/<slice_dir>/shard_000/
+        """Map a shard spec to its cache directory.
+
+        We keep cache layout stable and collision-free across datasets.
+
+        Supported sources:
+          - exports_local/boston50w_prod/<slice_dir>/shards/shard_XXX
+            -> <cache_root>/boston50w_prod/<slice_dir>/shard_XXX
+
+          - exports_local/boston200k_new/p0..p4/shard_XXX
+            -> <cache_root>/train_data_boston150w/p0..p4/shard_XXX
+            (we materialize 200k caches under train_data_boston150w to avoid
+             name collisions like shard_000 across partitions).
+        """
+
         parts = list(Path(spec.shard_dir).parts)
-        # find boston50w_prod in path
+
+        # Boston 50w prod slices
         if "boston50w_prod" in parts:
             i = parts.index("boston50w_prod")
             slice_dir = parts[i + 1]
             shard_name = parts[-1]
             return self.cache_root / "boston50w_prod" / slice_dir / shard_name
+
+        # Boston 200k partitions (p0..p4)
+        if "boston200k_new" in parts:
+            i = parts.index("boston200k_new")
+            # expected: .../boston200k_new/p0/shard_000
+            part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
+            shard_name = parts[-1]
+            return self.cache_root / "train_data_boston150w" / part_dir / shard_name
+
         # generic fallback: use shard dir name only
         return self.cache_root / "unknown" / parts[-1]
 
