@@ -221,16 +221,38 @@ def render_npz_style_scene(
                     neighbor_heading = angle_difference_radians(ego_heading, float(np.arctan2(sin_h, cos_h)))
 
                     if agent_type == "Vehicle":
-                        rect = patches.Rectangle(
-                            (curr_x - length / 2, curr_y - width / 2),
-                            length,
-                            width,
-                            angle=math.degrees(neighbor_heading),
-                            facecolor=color,
-                            edgecolor="black",
-                            linewidth=1,
-                            alpha=0.35,
-                        )
+                        # Matplotlib rotates rectangles around the lower-left corner by default,
+                        # which makes the box appear offset from the (curr_x,curr_y) center point.
+                        # Rotate around center when possible; fall back to a manual transform.
+                        try:
+                            rect = patches.Rectangle(
+                                (curr_x - length / 2, curr_y - width / 2),
+                                length,
+                                width,
+                                angle=math.degrees(neighbor_heading),
+                                rotation_point="center",
+                                facecolor=color,
+                                edgecolor="black",
+                                linewidth=1,
+                                alpha=0.35,
+                            )
+                        except TypeError:
+                            rect = patches.Rectangle(
+                                (curr_x - length / 2, curr_y - width / 2),
+                                length,
+                                width,
+                                angle=0.0,
+                                facecolor=color,
+                                edgecolor="black",
+                                linewidth=1,
+                                alpha=0.35,
+                            )
+                            try:
+                                import matplotlib.transforms as transforms
+
+                                rect.set_transform(transforms.Affine2D().rotate_around(curr_x, curr_y, neighbor_heading) + ax.transData)
+                            except Exception:
+                                pass
                         ax.add_patch(rect)
                     elif agent_type == "Pedestrian":
                         radius = max(width, length) / 2
@@ -415,16 +437,36 @@ def render_xy_scatter_with_context(
                     neighbor_heading = angle_difference_radians(ego_heading, float(np.arctan2(sin_h, cos_h)))
 
                     if agent_type == "Vehicle":
-                        rect = patches.Rectangle(
-                            (curr_x - length / 2, curr_y - width / 2),
-                            length,
-                            width,
-                            angle=math.degrees(neighbor_heading),
-                            facecolor=color,
-                            edgecolor="black",
-                            linewidth=1,
-                            alpha=0.25,
-                        )
+                        # Rotate around center so the box stays centered on (curr_x,curr_y).
+                        try:
+                            rect = patches.Rectangle(
+                                (curr_x - length / 2, curr_y - width / 2),
+                                length,
+                                width,
+                                angle=math.degrees(neighbor_heading),
+                                rotation_point="center",
+                                facecolor=color,
+                                edgecolor="black",
+                                linewidth=1,
+                                alpha=0.25,
+                            )
+                        except TypeError:
+                            rect = patches.Rectangle(
+                                (curr_x - length / 2, curr_y - width / 2),
+                                length,
+                                width,
+                                angle=0.0,
+                                facecolor=color,
+                                edgecolor="black",
+                                linewidth=1,
+                                alpha=0.25,
+                            )
+                            try:
+                                import matplotlib.transforms as transforms
+
+                                rect.set_transform(transforms.Affine2D().rotate_around(curr_x, curr_y, neighbor_heading) + ax.transData)
+                            except Exception:
+                                pass
                         ax.add_patch(rect)
                     elif agent_type == "Pedestrian":
                         radius = max(width, length) / 2
