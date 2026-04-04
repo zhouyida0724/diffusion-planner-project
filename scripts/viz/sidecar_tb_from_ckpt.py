@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from src.methods.diffusion_planner.paper.model.diffusion_utils import dpm_solver_pytorch as dpm
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
