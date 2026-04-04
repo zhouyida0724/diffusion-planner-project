@@ -24,8 +24,17 @@ from src.methods.diffusion_planner.paper.train.tb_visualizer import render_npz_s
 
 
 def _t_to_tag(t: float) -> str:
-    # 1.0 -> 1p00, 0.01 -> 0p01
-    return f"{float(t):.2f}".replace(".", "p")
+    """Stable tag for time value.
+
+    Keep higher precision near 0 so t=0.001 doesn't collapse to 0.00.
+    """
+
+    t = float(t)
+    if t < 0.01:
+        s = f"{t:.3f}"
+    else:
+        s = f"{t:.2f}"
+    return s.replace(".", "p")
 
 
 def _paper_cfg_from_ckpt(payload: dict[str, Any]) -> PaperModelConfig:
