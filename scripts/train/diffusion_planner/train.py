@@ -186,8 +186,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--tb-enable", action="store_true", help="Enable TensorBoard logging (default: off).")
     p.add_argument("--tb-every", type=int, default=0, help="Log TensorBoard images/scalars every N steps (0 disables image logging).")
-    p.add_argument("--tb-num-samples", type=int, default=1, help="Number of samples to visualize per TB logging step.")
-    p.add_argument("--tb-denoise-k", type=int, default=6, help="Number of denoise scatter panels to render per sample.")
+    p.add_argument("--tb-num-samples", type=int, default=1, help="Number of random samples to visualize per TB logging step.")
+    p.add_argument("--tb-denoise-k", type=int, default=10, help="Number of denoise panels to render per sample (for xt/x0_pred).")
+    p.add_argument("--tb-image-size", type=int, default=800, help="Best-effort render size for TB images.")
 
     return p.parse_args()
 
@@ -340,6 +341,7 @@ def main() -> None:
         tb_every=int(args.tb_every),
         tb_num_samples=int(args.tb_num_samples),
         tb_denoise_k=int(args.tb_denoise_k),
+        tb_image_size=int(args.tb_image_size),
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.

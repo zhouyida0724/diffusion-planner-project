@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
 
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
-from .tb_visualizer import render_denoise_scatter, render_npz_style_scene
+from .tb_visualizer import render_npz_style_scene, render_xy_scatter
 
 
 def _read_proc_self_io() -> dict[str, int]:
@@ -233,7 +233,8 @@ def train_loop_paper_dit_xstart(
     tb_enable = bool(getattr(cfg, "tb_enable", False))
     tb_every = int(getattr(cfg, "tb_every", 0) or 0)
     tb_num_samples = max(1, int(getattr(cfg, "tb_num_samples", 1) or 1))
-    tb_denoise_k = max(1, int(getattr(cfg, "tb_denoise_k", 6) or 1))
+    tb_denoise_k = max(1, int(getattr(cfg, "tb_denoise_k", 10) or 1))
+    tb_image_size = int(getattr(cfg, "tb_image_size", 800) or 800)
     tb_warned_disabled = False
     if tb_enable and SummaryWriter is not None:
         try:
@@ -643,8 +644,17 @@ def train_loop_paper_dit_xstart(
             model_was_training = model.training
             try:
                 model.eval()
-                num_vis = min(tb_num_samples, int(batch["ego_current_state"].shape[0]))
-                for sample_idx in range(num_vis):
+
+                B_vis = int(batch["ego_current_state"].shape[0])
+                num_vis = min(tb_num_samples, B_vis)
+
+                # Pick random samples from the current batch (deterministic-ish per step).
+                g = torch.Generator(device="cpu")
+                g.manual_seed(int(cfg.seed) + int(step) * 10007)
+                vis_idxs = torch.randperm(B_vis, generator=g)[:num_vis].tolist()
+
+                for sample_idx in vis_idxs:
+                    # --- scene image (npz-style) ---
                     infer_inputs = {
                         "ego_current_state": batch["ego_current_state"][sample_idx : sample_idx + 1],
                         "neighbor_agents_past": batch["neighbor_agents_past"][sample_idx : sample_idx + 1],
@@ -656,23 +666,123 @@ def train_loop_paper_dit_xstart(
                         "route_lanes_speed_limit": batch.get("route_lanes_speed_limit")[sample_idx : sample_idx + 1] if torch.is_tensor(batch.get("route_lanes_speed_limit")) else batch.get("route_lanes_speed_limit"),
                         "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit")[sample_idx : sample_idx + 1] if torch.is_tensor(batch.get("route_lanes_has_speed_limit")) else batch.get("route_lanes_has_speed_limit"),
                     }
-                    pred_xy = model.sample_trajectory(infer_inputs, diffusion_steps=max(tb_denoise_k, 4))[:, :2]
-                    scene_img = render_npz_style_scene(batch, sample_idx=sample_idx, ego_future_xy=pred_xy, title=f"step={step} sample={sample_idx}")
-                    if scene_img is not None:
-                        tb.add_image(f"viz/scene/sample_{sample_idx}", torch.from_numpy(scene_img).permute(2, 0, 1), int(step))
-                    denoise_img = render_denoise_scatter(
-                        model,
+
+                    # Best-effort inference trajectory for overlay.
+                    pred_xy = None
+                    try:
+                        pred_xy = model.sample_trajectory(infer_inputs, diffusion_steps=max(tb_denoise_k, 4))[:, :2]
+                    except Exception:
+                        pred_xy = None
+
+                    scene_img = render_npz_style_scene(
                         batch,
                         sample_idx=sample_idx,
-                        num_panels=tb_denoise_k,
-                        predicted_neighbor_num=Pn,
-                        future_len=Tf,
-                        device=device,
-                        build_joint_trajectories_x0=_build_joint_trajectories_x0,
-                        compute_neighbor_masks=_compute_neighbor_masks,
+                        ego_future_xy=pred_xy,
+                        title=f"step={step} sample={sample_idx}",
+                        image_size=tb_image_size,
                     )
-                    if denoise_img is not None:
-                        tb.add_image(f"viz/denoise_scatter/sample_{sample_idx}", torch.from_numpy(denoise_img).permute(2, 0, 1), int(step))
+                    if scene_img is not None:
+                        tb.add_image(
+                            f"viz/scene/sample_{sample_idx}",
+                            torch.from_numpy(scene_img).permute(2, 0, 1),
+                            int(step),
+                        )
+
+                    # --- denoise scatter (xt + x0_pred), logged as multiple images ---
+                    # Build a B=1 batch for faster visualization compute.
+                    batch1: dict[str, Any] = {}
+                    for k, v in batch.items():
+                        if torch.is_tensor(v) and v.shape[0] == B_vis:
+                            batch1[k] = v[sample_idx : sample_idx + 1]
+                        else:
+                            batch1[k] = v
+
+                    with torch.no_grad():
+                        x0_4_1, _ = _build_joint_trajectories_x0(batch1, predicted_neighbor_num=Pn, future_len=Tf)
+                        x0n_1 = model.config.state_normalizer(x0_4_1)
+                        neighbor_mask_full_1, _ = _compute_neighbor_masks(batch1, predicted_neighbor_num=Pn, future_len=Tf)
+                        x0n_masked_1 = x0n_1.clone()
+                        x0n_masked_1[:, 1:, :, :][neighbor_mask_full_1] = 0.0
+
+                        # Fixed noise is nice-to-have for smoother convergence visuals, but torch 2.1
+                        # doesn't support passing a per-call Generator to randn_like on all devices.
+                        # Use a fresh random noise tensor here (still shows convergence clearly).
+                        base_noise = torch.randn_like(x0n_masked_1[:, :, 1:, :])
+
+                        t_values = torch.linspace(0.95, 0.05, steps=tb_denoise_k, device=device, dtype=torch.float32)
+
+                        # Precompute encoder outputs once for this sample.
+                        enc_inputs_vis = {
+                            "ego_current_state": batch1["ego_current_state"],
+                            "neighbor_agents_past": batch1["neighbor_agents_past"],
+                            "static_objects": batch1["static_objects"],
+                            "lanes": batch1["lanes"],
+                            "lanes_speed_limit": batch1["lanes_speed_limit"],
+                            "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
+                            "route_lanes": batch1["route_lanes"],
+                            "route_lanes_speed_limit": batch1.get("route_lanes_speed_limit"),
+                            "route_lanes_has_speed_limit": batch1.get("route_lanes_has_speed_limit"),
+                        }
+                        enc_vis = model.encoder(enc_inputs_vis)
+
+                        for i, t_scalar in enumerate(t_values):
+                            t_vis = torch.full((1,), float(t_scalar.item()), device=device, dtype=torch.float32)
+                            mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
+                            xt_fut = mean + std * base_noise
+                            xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
+
+                            # Build neighbor current mask (same as Decoder.forward training branch)
+                            neighbors_past_1 = batch1["neighbor_agents_past"]
+                            if neighbors_past_1.shape[1] == Pn + 1:
+                                neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
+                            else:
+                                neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
+                            neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
+
+                            with autocast_ctx:
+                                out_flat = model.decoder.decoder.dit(
+                                    xt_vis.reshape(1, 1 + Pn, -1),
+                                    t_vis,
+                                    enc_vis["encoding"],
+                                    batch1["route_lanes"],
+                                    neighbor_current_mask_1,
+                                )
+                            x0_pred_vis = out_flat.reshape(1, 1 + Pn, -1, 4)  # normalized x0
+
+                            xt_inv = model.config.state_normalizer.inverse(xt_vis)
+                            x0_pred_inv = model.config.state_normalizer.inverse(x0_pred_vis)
+
+                            xt_xy = xt_inv[0, 0, 1:, :2]
+                            x0_pred_xy = x0_pred_inv[0, 0, 1:, :2]
+
+                            xt_img = render_xy_scatter(
+                                xt_xy,
+                                title=f"xt | step={step} sample={sample_idx} panel={i:02d} t={float(t_scalar.item()):.2f}",
+                                image_size=tb_image_size,
+                                marker="x",
+                                alpha=0.8,
+                            )
+                            if xt_img is not None:
+                                tb.add_image(
+                                    f"denoise/xt/sample_{sample_idx}/panel_{i:02d}",
+                                    torch.from_numpy(xt_img).permute(2, 0, 1),
+                                    int(step),
+                                )
+
+                            x0_img = render_xy_scatter(
+                                x0_pred_xy,
+                                title=f"x0_pred | step={step} sample={sample_idx} panel={i:02d} t={float(t_scalar.item()):.2f}",
+                                image_size=tb_image_size,
+                                marker=".",
+                                alpha=0.95,
+                            )
+                            if x0_img is not None:
+                                tb.add_image(
+                                    f"denoise/x0_pred/sample_{sample_idx}/panel_{i:02d}",
+                                    torch.from_numpy(x0_img).permute(2, 0, 1),
+                                    int(step),
+                                )
+
                 tb.flush()
             except Exception as e:
                 if not tb_warned_disabled:

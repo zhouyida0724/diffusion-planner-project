@@ -68,6 +68,7 @@ class TrainConfig:
     tb_every: int = 0
     tb_num_samples: int = 1
     tb_denoise_k: int = 6
+    tb_image_size: int = 800  # rendered image width/height (px-ish), best-effort
 
 
 def seed_everything(seed: int) -> None:
