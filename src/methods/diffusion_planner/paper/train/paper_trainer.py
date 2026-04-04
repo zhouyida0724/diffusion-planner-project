@@ -19,7 +19,18 @@ except Exception:  # pragma: no cover
 
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
+from src.methods.diffusion_planner.paper.model.diffusion_utils import dpm_solver_pytorch as dpm
 from .tb_visualizer import render_npz_style_scene, render_xy_scatter, render_xy_scatter_with_context
+
+
+def _t_to_tag(t: float) -> str:
+    # stable string for TB tags (avoid '.'; keep precision near 0)
+    t = float(t)
+    if t < 0.01:
+        s = f"{t:.3f}"
+    else:
+        s = f"{t:.2f}"
+    return s.replace(".", "p")
 
 
 def _read_proc_self_io() -> dict[str, int]:
@@ -234,6 +245,8 @@ def train_loop_paper_dit_xstart(
     tb_every = int(getattr(cfg, "tb_every", 0) or 0)
     tb_num_samples = max(1, int(getattr(cfg, "tb_num_samples", 1) or 1))
     tb_denoise_k = max(1, int(getattr(cfg, "tb_denoise_k", 10) or 1))
+    tb_denoise_mode = str(getattr(cfg, "tb_denoise_mode", "t_sweep") or "t_sweep")
+    tb_sampler_steps = max(1, int(getattr(cfg, "tb_sampler_steps", tb_denoise_k) or tb_denoise_k))
     tb_image_size = int(getattr(cfg, "tb_image_size", 800) or 800)
     tb_warned_disabled = False
     if tb_enable and SummaryWriter is not None:
@@ -711,6 +724,7 @@ def train_loop_paper_dit_xstart(
 
                         # Include an explicit t=1.0 panel (max noise) and go close to 0 for the final panel.
                         t_values = torch.linspace(1.0, 0.01, steps=tb_denoise_k, device=device, dtype=torch.float32)
+                        t_values_forward = torch.linspace(0.01, 1.0, steps=tb_denoise_k, device=device, dtype=torch.float32)
 
                         # Precompute encoder outputs once for this sample.
                         enc_inputs_vis = {
@@ -726,67 +740,186 @@ def train_loop_paper_dit_xstart(
                         }
                         enc_vis = model.encoder(enc_inputs_vis)
 
-                        for i, t_scalar in enumerate(t_values):
-                            t_vis = torch.full((1,), float(t_scalar.item()), device=device, dtype=torch.float32)
-                            mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
-                            xt_fut = mean + std * base_noise
-                            xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
+                        # Build neighbor current mask (same as Decoder.forward training branch)
+                        neighbors_past_1 = batch1["neighbor_agents_past"]
+                        if neighbors_past_1.shape[1] == Pn + 1:
+                            neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
+                        else:
+                            neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
+                        neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
 
-                            # Build neighbor current mask (same as Decoder.forward training branch)
-                            neighbors_past_1 = batch1["neighbor_agents_past"]
-                            if neighbors_past_1.shape[1] == Pn + 1:
-                                neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
-                            else:
-                                neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
-                            neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
+                        # ------------------------------
+                        # (A) t-sweep panels (training-style)
+                        # ------------------------------
+                        if tb_denoise_mode in ["t_sweep", "all"]:
+                            for i, t_scalar in enumerate(t_values):
+                                t_val = float(t_scalar.item())
+                                t_vis = torch.full((1,), t_val, device=device, dtype=torch.float32)
+                                mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
+                                xt_fut = mean + std * base_noise
+                                xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
 
-                            with autocast_ctx:
-                                out_flat = model.decoder.decoder.dit(
-                                    xt_vis.reshape(1, 1 + Pn, -1),
-                                    t_vis,
-                                    enc_vis["encoding"],
-                                    batch1["route_lanes"],
-                                    neighbor_current_mask_1,
+                                with autocast_ctx:
+                                    out_flat = model.decoder.decoder.dit(
+                                        xt_vis.reshape(1, 1 + Pn, -1),
+                                        t_vis,
+                                        enc_vis["encoding"],
+                                        batch1["route_lanes"],
+                                        neighbor_current_mask_1,
+                                    )
+                                x0_pred_vis = out_flat.reshape(1, 1 + Pn, -1, 4)  # normalized x0
+
+                                xt_inv = model.config.state_normalizer.inverse(xt_vis)
+                                x0_pred_inv = model.config.state_normalizer.inverse(x0_pred_vis)
+
+                                xt_xy = xt_inv[0, 0, 1:, :2]
+                                x0_pred_xy = x0_pred_inv[0, 0, 1:, :2]
+
+                                xt_img = render_xy_scatter_with_context(
+                                    batch1,
+                                    sample_idx=0,
+                                    xy=xt_xy,
+                                    title=f"xt | step={step} sample={sample_idx} panel={i:02d} t={t_val:.2f}",
+                                    image_size=tb_image_size,
+                                    marker="x",
+                                    alpha=0.85,
                                 )
-                            x0_pred_vis = out_flat.reshape(1, 1 + Pn, -1, 4)  # normalized x0
+                                if xt_img is not None:
+                                    tb.add_image(
+                                        f"denoise/xt/sample_{sample_idx}/panel_{i:02d}",
+                                        torch.from_numpy(xt_img).permute(2, 0, 1),
+                                        int(step),
+                                    )
 
-                            xt_inv = model.config.state_normalizer.inverse(xt_vis)
-                            x0_pred_inv = model.config.state_normalizer.inverse(x0_pred_vis)
+                                x0_img = render_xy_scatter_with_context(
+                                    batch1,
+                                    sample_idx=0,
+                                    xy=x0_pred_xy,
+                                    title=f"x0_pred | step={step} sample={sample_idx} panel={i:02d} t={t_val:.2f}",
+                                    image_size=tb_image_size,
+                                    marker=".",
+                                    alpha=0.95,
+                                )
+                                if x0_img is not None:
+                                    tb.add_image(
+                                        f"denoise/x0_pred/sample_{sample_idx}/panel_{i:02d}",
+                                        torch.from_numpy(x0_img).permute(2, 0, 1),
+                                        int(step),
+                                    )
 
-                            xt_xy = xt_inv[0, 0, 1:, :2]
-                            x0_pred_xy = x0_pred_inv[0, 0, 1:, :2]
+                        # ------------------------------
+                        # (B) forward-noise panels (q(x_t | x0), low->high noise)
+                        # ------------------------------
+                        if tb_denoise_mode in ["forward_noise", "all"]:
+                            for i, t_scalar in enumerate(t_values_forward):
+                                t_val = float(t_scalar.item())
+                                t_tag = _t_to_tag(t_val)
+                                t_vis = torch.full((1,), t_val, device=device, dtype=torch.float32)
+                                mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
+                                xt_fut = mean + std * base_noise
+                                xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
 
-                            xt_img = render_xy_scatter_with_context(
-                                batch1,
-                                sample_idx=0,
-                                xy=xt_xy,
-                                title=f"xt | step={step} sample={sample_idx} panel={i:02d} t={float(t_scalar.item()):.2f}",
-                                image_size=tb_image_size,
-                                marker="x",
-                                alpha=0.85,
-                            )
-                            if xt_img is not None:
-                                tb.add_image(
-                                    f"denoise/xt/sample_{sample_idx}/panel_{i:02d}",
-                                    torch.from_numpy(xt_img).permute(2, 0, 1),
-                                    int(step),
+                                xt_inv = model.config.state_normalizer.inverse(xt_vis)
+                                xt_xy = xt_inv[0, 0, 1:, :2]
+
+                                xt_img = render_xy_scatter_with_context(
+                                    batch1,
+                                    sample_idx=0,
+                                    xy=xt_xy,
+                                    title=f"forward-noise xt | step={step} sample={sample_idx} panel={i:02d}/{len(t_values_forward)-1} t={t_val:.2f}",
+                                    image_size=tb_image_size,
+                                    marker="x",
+                                    alpha=0.85,
+                                )
+                                if xt_img is not None:
+                                    tb.add_image(
+                                        f"forward_noise/xt/sample_{sample_idx}/panel_{i:02d}_t_{t_tag}",
+                                        torch.from_numpy(xt_img).permute(2, 0, 1),
+                                        int(step),
+                                    )
+
+                        # ------------------------------
+                        # (C) sampler intermediates (true iterative denoising)
+                        # ------------------------------
+                        if tb_denoise_mode in ["sampler", "all"]:
+                            try:
+                                current_states_norm = x0n_masked_1[:, :, 0, :]
+                                P = int(current_states_norm.shape[1])
+                                future_noise = torch.randn((1, P, Tf, 4), device=device, dtype=torch.float32) * 0.5
+                                xT = torch.cat([current_states_norm[:, :, None, :], future_noise], dim=2).reshape(1, P, -1)
+
+                                def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step_i: int):
+                                    xt2 = xt.reshape(1, P, Tf + 1, 4)
+                                    xt2[:, :, 0, :] = current_states_norm
+                                    return xt2.reshape(1, P, -1)
+
+                                noise_schedule = dpm.NoiseScheduleVP(schedule="linear")
+                                model_fn = dpm.model_wrapper(
+                                    model.decoder.decoder.dit,
+                                    noise_schedule,
+                                    model_type=model.decoder.decoder.dit.model_type,
+                                    model_kwargs={
+                                        "cross_c": enc_vis["encoding"],
+                                        "route_lanes": batch1["route_lanes"],
+                                        "neighbor_current_mask": neighbor_current_mask_1,
+                                    },
+                                    guidance_type="uncond",
+                                )
+                                dpm_solver = dpm.DPM_Solver(
+                                    model_fn,
+                                    noise_schedule,
+                                    algorithm_type="dpmsolver++",
+                                    correcting_xt_fn=initial_state_constraint,
                                 )
 
-                            x0_img = render_xy_scatter_with_context(
-                                batch1,
-                                sample_idx=0,
-                                xy=x0_pred_xy,
-                                title=f"x0_pred | step={step} sample={sample_idx} panel={i:02d} t={float(t_scalar.item()):.2f}",
-                                image_size=tb_image_size,
-                                marker=".",
-                                alpha=0.95,
-                            )
-                            if x0_img is not None:
-                                tb.add_image(
-                                    f"denoise/x0_pred/sample_{sample_idx}/panel_{i:02d}",
-                                    torch.from_numpy(x0_img).permute(2, 0, 1),
-                                    int(step),
+                                x0_flat, inter = dpm_solver.sample(
+                                    xT,
+                                    steps=tb_sampler_steps,
+                                    order=2,
+                                    skip_type="logSNR",
+                                    method="multistep",
+                                    denoise_to_zero=True,
+                                    return_intermediate=True,
                                 )
+
+                                t0 = 1.0 / float(noise_schedule.total_N)
+                                timesteps = dpm_solver.get_time_steps(
+                                    skip_type="logSNR",
+                                    t_T=float(noise_schedule.T),
+                                    t_0=float(t0),
+                                    N=tb_sampler_steps,
+                                    device=device,
+                                )
+                                t_labels = [float(timesteps[0].item())]
+                                for j in range(1, int(timesteps.shape[0])):
+                                    t_labels.append(float(timesteps[j].item()))
+                                if len(inter) == len(t_labels) + 1:
+                                    t_labels.append(float(t0))
+
+                                for i, xt_flat in enumerate(inter):
+                                    t_i = t_labels[i] if i < len(t_labels) else float("nan")
+                                    t_tag = _t_to_tag(t_i) if t_i == t_i else "nan"
+                                    xt_view = xt_flat.reshape(1, P, Tf + 1, 4)
+                                    xt_inv = model.config.state_normalizer.inverse(xt_view)
+                                    xt_xy = xt_inv[0, 0, 1:, :2]
+
+                                    xt_img = render_xy_scatter_with_context(
+                                        batch1,
+                                        sample_idx=0,
+                                        xy=xt_xy,
+                                        title=f"sampler xt | step={step} sample={sample_idx} solver_step={i:02d}/{len(inter)-1} t={t_i:.4f}",
+                                        image_size=tb_image_size,
+                                        marker="x",
+                                        alpha=0.9,
+                                    )
+                                    if xt_img is not None:
+                                        tb.add_image(
+                                            f"sampler/xt/sample_{sample_idx}/solver_{i:02d}_t_{t_tag}",
+                                            torch.from_numpy(xt_img).permute(2, 0, 1),
+                                            int(step),
+                                        )
+                            except Exception as e:
+                                print(f"[tb] sampler-intermediate logging failed: {e}", flush=True)
 
                 tb.flush()
             except Exception as e:
