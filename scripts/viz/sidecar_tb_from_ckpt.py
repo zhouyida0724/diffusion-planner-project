@@ -76,6 +76,42 @@ def _batchify_sample(sample: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _turning_score(sample: dict[str, Any]) -> float:
+    """Heuristic score for "hard" scenes: ego turning + more neighbors.
+
+    Uses only fields available in ShardedNpzFeatureDataset.
+    """
+
+    score = 0.0
+    fut = sample.get("ego_agent_future")
+    if torch.is_tensor(fut) and fut.ndim >= 2 and fut.shape[0] >= 5:
+        xy = fut[:, :2]
+        dxy = xy[1:] - xy[:-1]
+        # avoid zero-length steps
+        keep = (dxy.abs().sum(dim=-1) > 1e-4)
+        dxy = dxy[keep]
+        if dxy.shape[0] >= 3:
+            headings = torch.atan2(dxy[:, 1], dxy[:, 0])
+            # unwrap roughly
+            dh = headings[1:] - headings[:-1]
+            dh = (dh + torch.pi) % (2 * torch.pi) - torch.pi
+            total_turn = float(dh.abs().sum().item())
+            max_turn = float(dh.abs().max().item())
+            score += 2.0 * total_turn + 1.0 * max_turn
+
+        # prefer bigger motion (typically intersections are in motion)
+        disp = float(torch.norm(xy[-1] - xy[0]).item())
+        score += 0.02 * disp
+
+    nb = sample.get("neighbor_agents_past")
+    if torch.is_tensor(nb) and nb.ndim >= 3:
+        cur = nb[:, -1, :4]
+        present = (cur.abs().sum(dim=-1) > 1e-4)
+        score += 0.1 * float(present.sum().item())
+
+    return float(score)
+
+
 @torch.no_grad()
 def main() -> None:
     p = argparse.ArgumentParser(description="Checkpoint sidecar TensorBoard visualizer")
@@ -88,8 +124,31 @@ def main() -> None:
     p.add_argument("--sampler-steps", type=int, default=10, help="Number of DPM-Solver steps for sampler-intermediate visualization")
     p.add_argument("--image-size", type=int, default=800)
     p.add_argument("--sample-idx", type=int, default=0, help="Start sample index")
-    p.add_argument("--num-samples", type=int, default=1, help="How many consecutive samples to visualize (starting at --sample-idx)")
-    p.add_argument("--no-t-sweep", action="store_true", help="Disable the t-sweep (forward-noise) panels")
+    p.add_argument("--num-samples", type=int, default=1, help="How many samples to visualize")
+
+    # sample selection
+    p.add_argument(
+        "--select",
+        type=str,
+        default="sequential",
+        choices=["sequential", "turning"],
+        help="How to choose samples: sequential (sample_idx..), or turning (search a window and pick turning scenes)",
+    )
+    p.add_argument(
+        "--search-window",
+        type=int,
+        default=2000,
+        help="When --select=turning, scan this many samples starting from --sample-idx and pick top-K by score.",
+    )
+
+    # visualizations
+    p.add_argument("--no-t-sweep", action="store_true", help="Disable the t-sweep (x_t/x0_pred across t)")
+    p.add_argument(
+        "--log-forward-noise",
+        action="store_true",
+        help="Also log a forward noising sequence (t asc: low->high) to visualize the add-noise process.",
+    )
+
     p.add_argument("--no-sampler", action="store_true", help="Disable sampler-intermediate panels")
     p.add_argument("--sampler-log-x0pred", action="store_true", help="Also log x0_pred at each sampler intermediate xt")
     args = p.parse_args()
@@ -118,9 +177,26 @@ def main() -> None:
 
     start_idx = int(args.sample_idx)
     num_samples = max(1, int(getattr(args, "num_samples", 1) or 1))
-    end_idx = min(len(ds), start_idx + num_samples)
     if start_idx < 0 or start_idx >= len(ds):
         raise IndexError(f"sample-idx {start_idx} out of range for dataset len={len(ds)}")
+
+    selected_indices: list[int] = []
+    if str(getattr(args, "select", "sequential")) == "turning":
+        win = max(1, int(getattr(args, "search_window", 2000) or 2000))
+        end_scan = min(len(ds), start_idx + win)
+        # scan and pick top-K scores
+        scored: list[tuple[float, int]] = []
+        for idx in range(start_idx, end_scan):
+            try:
+                s = ds[idx]
+                scored.append((_turning_score(s), idx))
+            except Exception:
+                continue
+        scored.sort(key=lambda x: x[0], reverse=True)
+        selected_indices = [idx for _, idx in scored[:num_samples]]
+    else:
+        end_idx = min(len(ds), start_idx + num_samples)
+        selected_indices = list(range(start_idx, end_idx))
 
     Pn = int(paper_cfg.predicted_neighbor_num)
     Tf = int(paper_cfg.future_len)
@@ -130,9 +206,10 @@ def main() -> None:
 
     tb.add_text("meta/ckpt", str(ckpt_path), step)
     tb.add_text("meta/data_root", str(data_root), step)
-    tb.add_text("meta/sample_range", f"[{start_idx}, {end_idx})", step)
+    tb.add_text("meta/selection", str(getattr(args, "select", "sequential")), step)
+    tb.add_text("meta/selected_indices", str(selected_indices), step)
 
-    for sample_idx in range(start_idx, end_idx):
+    for sample_idx in selected_indices:
         sample = ds[sample_idx]
         batch = _batchify_sample(sample)
         batch = _to_device_batch(batch, device)
@@ -164,6 +241,7 @@ def main() -> None:
 
         base_noise = torch.randn_like(x0n_masked[:, :, 1:, :])
         t_values = torch.linspace(1.0, 0.01, steps=max(1, int(args.k)), device=device, dtype=torch.float32)
+        t_values_forward = torch.linspace(0.01, 1.0, steps=max(1, int(args.k)), device=device, dtype=torch.float32)
 
         enc_vis = model.encoder(infer_inputs)
 
@@ -199,12 +277,12 @@ def main() -> None:
             for i, t_scalar in enumerate(t_values):
                 t_val = float(t_scalar.item())
                 t_tag = _t_to_tag(t_val)
-    
+
                 t_vis = torch.full((1,), t_val, device=device, dtype=torch.float32)
                 mean, std = model.sde.marginal_prob(x0n_masked[:, :, 1:, :], t_vis)
                 xt_fut = mean + std * base_noise
                 xt_vis = torch.cat([x0n_masked[:, :, :1, :], xt_fut], dim=2)
-    
+
                 out_flat = model.decoder.decoder.dit(
                     xt_vis.reshape(1, 1 + Pn, -1),
                     t_vis,
@@ -213,17 +291,17 @@ def main() -> None:
                     neighbor_current_mask,
                 )
                 x0_pred_vis = out_flat.reshape(1, 1 + Pn, -1, 4)
-    
+
                 xt_inv = model.config.state_normalizer.inverse(xt_vis)
                 x0_pred_inv = model.config.state_normalizer.inverse(x0_pred_vis)
                 xt_xy = xt_inv[0, 0, 1:, :2]
                 x0_pred_xy = x0_pred_inv[0, 0, 1:, :2]
-    
+
                 xt_img = render_xy_scatter_with_context(
                     batch1,
                     sample_idx=0,
                     xy=xt_xy,
-                    title=f"t-sweep xt | ckpt={step} sample={sample_idx} panel={i:02d}/{len(t_values)-1} t={t_val:.2f}",
+                    title=f"t-sweep xt (hi->lo noise) | ckpt={step} sample={sample_idx} panel={i:02d}/{len(t_values)-1} t={t_val:.2f}",
                     image_size=int(args.image_size),
                     marker="x",
                     alpha=0.85,
@@ -234,7 +312,7 @@ def main() -> None:
                         torch.from_numpy(xt_img).permute(2, 0, 1),
                         step,
                     )
-    
+
                 x0_img = render_xy_scatter_with_context(
                     batch1,
                     sample_idx=0,
@@ -250,7 +328,37 @@ def main() -> None:
                         torch.from_numpy(x0_img).permute(2, 0, 1),
                         step,
                     )
-    
+
+        if bool(getattr(args, "log_forward_noise", False)):
+            # This is NOT sampling; it is q(x_t | x0) forward noising for intuition.
+            for i, t_scalar in enumerate(t_values_forward):
+                t_val = float(t_scalar.item())
+                t_tag = _t_to_tag(t_val)
+
+                t_vis = torch.full((1,), t_val, device=device, dtype=torch.float32)
+                mean, std = model.sde.marginal_prob(x0n_masked[:, :, 1:, :], t_vis)
+                xt_fut = mean + std * base_noise
+                xt_vis = torch.cat([x0n_masked[:, :, :1, :], xt_fut], dim=2)
+
+                xt_inv = model.config.state_normalizer.inverse(xt_vis)
+                xt_xy = xt_inv[0, 0, 1:, :2]
+
+                xt_img = render_xy_scatter_with_context(
+                    batch1,
+                    sample_idx=0,
+                    xy=xt_xy,
+                    title=f"forward-noise xt (lo->hi noise) | ckpt={step} sample={sample_idx} panel={i:02d}/{len(t_values_forward)-1} t={t_val:.2f}",
+                    image_size=int(args.image_size),
+                    marker="x",
+                    alpha=0.85,
+                )
+                if xt_img is not None:
+                    tb.add_image(
+                        f"forward_noise/xt/{prefix}/panel_{i:02d}_t_{t_tag}",
+                        torch.from_numpy(xt_img).permute(2, 0, 1),
+                        step,
+                    )
+
         # ------------------------------
         # Sampler intermediates (true iterative denoising)
         # ------------------------------
