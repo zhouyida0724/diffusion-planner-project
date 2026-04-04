@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover
 
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
-from .tb_visualizer import render_npz_style_scene, render_xy_scatter
+from .tb_visualizer import render_npz_style_scene, render_xy_scatter, render_xy_scatter_with_context
 
 
 def _read_proc_self_io() -> dict[str, int]:
@@ -755,12 +755,14 @@ def train_loop_paper_dit_xstart(
                             xt_xy = xt_inv[0, 0, 1:, :2]
                             x0_pred_xy = x0_pred_inv[0, 0, 1:, :2]
 
-                            xt_img = render_xy_scatter(
-                                xt_xy,
+                            xt_img = render_xy_scatter_with_context(
+                                batch1,
+                                sample_idx=0,
+                                xy=xt_xy,
                                 title=f"xt | step={step} sample={sample_idx} panel={i:02d} t={float(t_scalar.item()):.2f}",
                                 image_size=tb_image_size,
                                 marker="x",
-                                alpha=0.8,
+                                alpha=0.85,
                             )
                             if xt_img is not None:
                                 tb.add_image(
@@ -769,8 +771,10 @@ def train_loop_paper_dit_xstart(
                                     int(step),
                                 )
 
-                            x0_img = render_xy_scatter(
-                                x0_pred_xy,
+                            x0_img = render_xy_scatter_with_context(
+                                batch1,
+                                sample_idx=0,
+                                xy=x0_pred_xy,
                                 title=f"x0_pred | step={step} sample={sample_idx} panel={i:02d} t={float(t_scalar.item()):.2f}",
                                 image_size=tb_image_size,
                                 marker=".",
