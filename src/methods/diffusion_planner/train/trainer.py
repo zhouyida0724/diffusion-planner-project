@@ -63,6 +63,12 @@ class TrainConfig:
     profile_steps: int = 0  # if >0, collect per-step breakdown for the first N steps
     profile_every: int = 0  # if >0, print breakdown every N steps (only when profiling is enabled)
 
+    # tensorboard image logging (default OFF)
+    tb_enable: bool = False
+    tb_every: int = 0
+    tb_num_samples: int = 1
+    tb_denoise_k: int = 6
+
 
 def seed_everything(seed: int) -> None:
     import random

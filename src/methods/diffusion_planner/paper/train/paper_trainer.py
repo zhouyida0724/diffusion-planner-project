@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover
 
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
+from .tb_visualizer import render_denoise_scatter, render_npz_style_scene
 
 
 def _read_proc_self_io() -> dict[str, int]:
@@ -229,13 +230,22 @@ def train_loop_paper_dit_xstart(
     (exp_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
     tb = None
-    if SummaryWriter is not None:
+    tb_enable = bool(getattr(cfg, "tb_enable", False))
+    tb_every = int(getattr(cfg, "tb_every", 0) or 0)
+    tb_num_samples = max(1, int(getattr(cfg, "tb_num_samples", 1) or 1))
+    tb_denoise_k = max(1, int(getattr(cfg, "tb_denoise_k", 6) or 1))
+    tb_warned_disabled = False
+    if tb_enable and SummaryWriter is not None:
         try:
             tb = SummaryWriter(log_dir=str(exp_dir / "tb"))
             tb.add_text("meta/exp_name", str(cfg.exp_name), 0)
             tb.add_text("meta/mode", "paper_dit_dpm", 0)
-        except Exception:
+            tb.add_text("meta/tb_image_logging", f"enabled every={tb_every} samples={tb_num_samples} denoise_k={tb_denoise_k}", 0)
+        except Exception as e:
+            print(f"[tb] disabled: failed to initialize SummaryWriter: {e}", flush=True)
             tb = None
+    elif tb_enable and SummaryWriter is None:
+        print("[tb] disabled: torch.utils.tensorboard is unavailable in this environment", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
@@ -627,6 +637,50 @@ def train_loop_paper_dit_xstart(
                     tb.add_scalar("opt/lr", float(opt.param_groups[0].get("lr", cfg.lr)), int(step))
                 except Exception:
                     pass
+
+        should_log_tb_images = tb is not None and tb_every > 0 and ((step % tb_every) == 0 or step == cfg.steps - 1)
+        if should_log_tb_images:
+            model_was_training = model.training
+            try:
+                model.eval()
+                num_vis = min(tb_num_samples, int(batch["ego_current_state"].shape[0]))
+                for sample_idx in range(num_vis):
+                    infer_inputs = {
+                        "ego_current_state": batch["ego_current_state"][sample_idx : sample_idx + 1],
+                        "neighbor_agents_past": batch["neighbor_agents_past"][sample_idx : sample_idx + 1],
+                        "static_objects": batch["static_objects"][sample_idx : sample_idx + 1],
+                        "lanes": batch["lanes"][sample_idx : sample_idx + 1],
+                        "lanes_speed_limit": batch["lanes_speed_limit"][sample_idx : sample_idx + 1],
+                        "lanes_has_speed_limit": batch["lanes_has_speed_limit"][sample_idx : sample_idx + 1],
+                        "route_lanes": batch["route_lanes"][sample_idx : sample_idx + 1],
+                        "route_lanes_speed_limit": batch.get("route_lanes_speed_limit")[sample_idx : sample_idx + 1] if torch.is_tensor(batch.get("route_lanes_speed_limit")) else batch.get("route_lanes_speed_limit"),
+                        "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit")[sample_idx : sample_idx + 1] if torch.is_tensor(batch.get("route_lanes_has_speed_limit")) else batch.get("route_lanes_has_speed_limit"),
+                    }
+                    pred_xy = model.sample_trajectory(infer_inputs, diffusion_steps=max(tb_denoise_k, 4))[:, :2]
+                    scene_img = render_npz_style_scene(batch, sample_idx=sample_idx, ego_future_xy=pred_xy, title=f"step={step} sample={sample_idx}")
+                    if scene_img is not None:
+                        tb.add_image(f"viz/scene/sample_{sample_idx}", torch.from_numpy(scene_img).permute(2, 0, 1), int(step))
+                    denoise_img = render_denoise_scatter(
+                        model,
+                        batch,
+                        sample_idx=sample_idx,
+                        num_panels=tb_denoise_k,
+                        predicted_neighbor_num=Pn,
+                        future_len=Tf,
+                        device=device,
+                        build_joint_trajectories_x0=_build_joint_trajectories_x0,
+                        compute_neighbor_masks=_compute_neighbor_masks,
+                    )
+                    if denoise_img is not None:
+                        tb.add_image(f"viz/denoise_scatter/sample_{sample_idx}", torch.from_numpy(denoise_img).permute(2, 0, 1), int(step))
+                tb.flush()
+            except Exception as e:
+                if not tb_warned_disabled:
+                    print(f"[tb] image logging warning: {e}", flush=True)
+                    tb_warned_disabled = True
+            finally:
+                if model_was_training:
+                    model.train(True)
 
         if (step % cfg.ckpt_every) == 0 or step == cfg.steps - 1:
             ckpt_path = exp_dir / f"checkpoint_step_{step:06d}.pt"
