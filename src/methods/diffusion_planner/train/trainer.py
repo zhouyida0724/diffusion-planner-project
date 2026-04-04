@@ -67,6 +67,21 @@ class TrainConfig:
     profile_steps: int = 0  # if >0, collect per-step breakdown for the first N steps
     profile_every: int = 0  # if >0, print breakdown every N steps (only when profiling is enabled)
 
+    # tensorboard image logging (default OFF)
+    tb_enable: bool = False
+    tb_every: int = 2000
+    tb_num_samples: int = 1
+    tb_denoise_k: int = 10
+    tb_image_size: int = 800  # rendered image width/height (px-ish), best-effort
+
+    # paper_dit_dpm denoise visualizations
+    # - t_sweep: training-style q(x_t|x0) panels + x0_pred
+    # - forward_noise: q(x_t|x0) panels with t ascending (lo->hi noise)
+    # - sampler: true iterative denoising intermediates via DPM-Solver (return_intermediate)
+    # - all: everything above
+    tb_denoise_mode: str = "t_sweep"  # t_sweep|forward_noise|sampler|all
+    tb_sampler_steps: int = 10
+
 
 def seed_everything(seed: int) -> None:
     import random
