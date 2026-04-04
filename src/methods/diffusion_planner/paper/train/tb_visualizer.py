@@ -13,6 +13,7 @@ All functions return uint8 HWC RGB arrays suitable for SummaryWriter.add_image.
 
 from typing import Any
 
+import math
 import numpy as np
 import torch
 
@@ -21,6 +22,13 @@ def _to_numpy(x: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().float().numpy()
     return np.asarray(x)
+
+
+def angle_difference_radians(angle1_rad: float, angle2_rad: float) -> float:
+    """Return the smallest absolute difference between two angles (radians)."""
+    diff = abs(float(angle1_rad) - float(angle2_rad))
+    normalized_diff = diff % (2 * math.pi)
+    return (2 * math.pi) - normalized_diff if normalized_diff > math.pi else normalized_diff
 
 
 def _safe_import_matplotlib():
@@ -60,6 +68,8 @@ def render_npz_style_scene(
 
     # Pull per-sample arrays (CPU numpy)
     ego_state = _to_numpy(batch["ego_current_state"])[sample_idx]
+    # Kept for box heading visualization parity with src/platform/viz/npz_viz.py
+    ego_heading = float(np.arctan2(ego_state[3], ego_state[2]))
     lanes = _to_numpy(batch["lanes"])[sample_idx]
     route_lanes = _to_numpy(batch["route_lanes"])[sample_idx]
     route_lanes_avails = (
@@ -178,27 +188,66 @@ def render_npz_style_scene(
             ax.plot(past[valid_mask, 0], past[valid_mask, 1], "b-", linewidth=2.5, alpha=0.75)
             ax.plot(curr_x, curr_y, "o", markersize=6, color="blue", alpha=0.9)
 
-            # Best-effort bounding box for vehicles/pedestrians (width/length from last two dims if present)
+            # Bounding box visualization (match npz_viz conventions)
             try:
-                if neighbor_past.shape[-1] >= 10:
+                if neighbor_past.shape[-1] >= 11:
+                    # types
+                    type_v = float(neighbor_past[agent_idx, -1, 8])
+                    type_p = float(neighbor_past[agent_idx, -1, 9])
+                    type_b = float(neighbor_past[agent_idx, -1, 10])
+
+                    if type_v > 0.5:
+                        agent_type = "Vehicle"
+                        color = "blue"
+                    elif type_p > 0.5:
+                        agent_type = "Pedestrian"
+                        color = "orange"
+                    elif type_b > 0.5:
+                        agent_type = "Bicycle"
+                        color = "purple"
+                    else:
+                        agent_type = None
+                        color = "cyan"
+
+                    width = float(neighbor_past[agent_idx, -1, 6])
+                    length = float(neighbor_past[agent_idx, -1, 7])
+                    if width == 0:
+                        width = 2.0
+                    if length == 0:
+                        length = 4.0
+
                     cos_h = float(neighbor_past[agent_idx, -1, 2])
                     sin_h = float(neighbor_past[agent_idx, -1, 3])
-                    heading = float(np.arctan2(sin_h, cos_h))
-                    width = float(neighbor_past[agent_idx, -1, -3])
-                    length = float(neighbor_past[agent_idx, -1, -2])
-                    if width > 0.1 and length > 0.1:
+                    neighbor_heading = angle_difference_radians(ego_heading, float(np.arctan2(sin_h, cos_h)))
+
+                    if agent_type == "Vehicle":
                         rect = patches.Rectangle(
                             (curr_x - length / 2, curr_y - width / 2),
                             length,
                             width,
-                            angle=np.degrees(heading),
-                            rotation_point="center",
-                            fill=False,
-                            linewidth=1.5,
-                            edgecolor="cyan",
-                            alpha=0.8,
+                            angle=math.degrees(neighbor_heading),
+                            facecolor=color,
+                            edgecolor="black",
+                            linewidth=1,
+                            alpha=0.35,
                         )
                         ax.add_patch(rect)
+                    elif agent_type == "Pedestrian":
+                        radius = max(width, length) / 2
+                        circ = patches.Circle((curr_x, curr_y), radius, facecolor=color, edgecolor="black", linewidth=1, alpha=0.35)
+                        ax.add_patch(circ)
+                    elif agent_type == "Bicycle":
+                        diamond = patches.RegularPolygon(
+                            (curr_x, curr_y),
+                            numVertices=4,
+                            radius=max(width, length) / 2,
+                            orientation=neighbor_heading,
+                            facecolor=color,
+                            edgecolor="black",
+                            linewidth=1,
+                            alpha=0.35,
+                        )
+                        ax.add_patch(diamond)
             except Exception:
                 pass
 
@@ -248,6 +297,9 @@ def render_xy_scatter_with_context(
     xy_np = _to_numpy(xy)
     if xy_np.ndim != 2 or xy_np.shape[1] != 2:
         raise ValueError(f"xy must be [T,2], got {xy_np.shape}")
+
+    ego_state = _to_numpy(batch["ego_current_state"])[sample_idx]
+    ego_heading = float(np.arctan2(ego_state[3], ego_state[2]))
 
     lanes = _to_numpy(batch["lanes"])[sample_idx]
     route_lanes = _to_numpy(batch["route_lanes"])[sample_idx]
@@ -330,6 +382,68 @@ def render_xy_scatter_with_context(
                 continue
             ax.plot(past[valid_mask, 0], past[valid_mask, 1], "b-", linewidth=2.0, alpha=0.65)
             ax.plot(curr_x, curr_y, "o", markersize=5, color="blue", alpha=0.85)
+
+            # Optional agent shape overlay (vehicle box / pedestrian circle / bicycle diamond)
+            try:
+                if neighbor_past.shape[-1] >= 11:
+                    type_v = float(neighbor_past[agent_idx, -1, 8])
+                    type_p = float(neighbor_past[agent_idx, -1, 9])
+                    type_b = float(neighbor_past[agent_idx, -1, 10])
+
+                    if type_v > 0.5:
+                        agent_type = "Vehicle"
+                        color = "blue"
+                    elif type_p > 0.5:
+                        agent_type = "Pedestrian"
+                        color = "orange"
+                    elif type_b > 0.5:
+                        agent_type = "Bicycle"
+                        color = "purple"
+                    else:
+                        agent_type = None
+                        color = "cyan"
+
+                    width = float(neighbor_past[agent_idx, -1, 6])
+                    length = float(neighbor_past[agent_idx, -1, 7])
+                    if width == 0:
+                        width = 2.0
+                    if length == 0:
+                        length = 4.0
+
+                    cos_h = float(neighbor_past[agent_idx, -1, 2])
+                    sin_h = float(neighbor_past[agent_idx, -1, 3])
+                    neighbor_heading = angle_difference_radians(ego_heading, float(np.arctan2(sin_h, cos_h)))
+
+                    if agent_type == "Vehicle":
+                        rect = patches.Rectangle(
+                            (curr_x - length / 2, curr_y - width / 2),
+                            length,
+                            width,
+                            angle=math.degrees(neighbor_heading),
+                            facecolor=color,
+                            edgecolor="black",
+                            linewidth=1,
+                            alpha=0.25,
+                        )
+                        ax.add_patch(rect)
+                    elif agent_type == "Pedestrian":
+                        radius = max(width, length) / 2
+                        circ = patches.Circle((curr_x, curr_y), radius, facecolor=color, edgecolor="black", linewidth=1, alpha=0.25)
+                        ax.add_patch(circ)
+                    elif agent_type == "Bicycle":
+                        diamond = patches.RegularPolygon(
+                            (curr_x, curr_y),
+                            numVertices=4,
+                            radius=max(width, length) / 2,
+                            orientation=neighbor_heading,
+                            facecolor=color,
+                            edgecolor="black",
+                            linewidth=1,
+                            alpha=0.25,
+                        )
+                        ax.add_patch(diamond)
+            except Exception:
+                pass
 
         if neighbor_future is not None:
             for agent_idx in range(neighbor_future.shape[0]):

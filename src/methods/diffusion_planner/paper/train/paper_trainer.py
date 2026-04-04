@@ -709,7 +709,8 @@ def train_loop_paper_dit_xstart(
                         # Use a fresh random noise tensor here (still shows convergence clearly).
                         base_noise = torch.randn_like(x0n_masked_1[:, :, 1:, :])
 
-                        t_values = torch.linspace(0.95, 0.05, steps=tb_denoise_k, device=device, dtype=torch.float32)
+                        # Include an explicit t=1.0 panel (max noise) and go close to 0 for the final panel.
+                        t_values = torch.linspace(1.0, 0.01, steps=tb_denoise_k, device=device, dtype=torch.float32)
 
                         # Precompute encoder outputs once for this sample.
                         enc_inputs_vis = {
