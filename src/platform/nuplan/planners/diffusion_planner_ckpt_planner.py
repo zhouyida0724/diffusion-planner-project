@@ -25,10 +25,13 @@ from dataclasses import dataclass
 from typing import Deque, Optional
 
 import os
+import sqlite3
 import numpy as np
 import torch
 
 from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner, PlannerInitialization, PlannerInput
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
@@ -40,7 +43,13 @@ from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
 
 # Runtime feature extraction utilities (reuse export logic)
-from src.platform.nuplan.features.extract_single_frame import extract_lanes, extract_route_lanes
+from src.platform.nuplan.features.extract_single_frame import (
+    extract_lanes,
+    extract_neighbor_agents,
+    extract_route_lanes,
+    extract_static_objects,
+    get_traffic_lights_at_timestamp,
+)
 
 
 @dataclass
@@ -88,6 +97,29 @@ def _ego_kinematics(ego: EgoState) -> _EgoKinematics:
         pass
     try:
         a = ego.dynamic_car_state.rear_axle_acceleration_2d
+        ax = float(a.x)
+        ay = float(a.y)
+    except Exception:
+        pass
+
+    return _EgoKinematics(x=x, y=y, heading=heading, vx=vx, vy=vy, ax=ax, ay=ay)
+
+
+def _ego_center_kinematics(ego: EgoState) -> _EgoKinematics:
+    """Match offline extractor semantics: ego pose/velocity/accel in the vehicle-center frame."""
+    x = float(ego.center.x)
+    y = float(ego.center.y)
+    heading = float(ego.center.heading)
+
+    vx = vy = ax = ay = 0.0
+    try:
+        v = ego.dynamic_car_state.center_velocity_2d
+        vx = float(v.x)
+        vy = float(v.y)
+    except Exception:
+        pass
+    try:
+        a = ego.dynamic_car_state.center_acceleration_2d
         ax = float(a.x)
         ay = float(a.y)
     except Exception:
@@ -147,6 +179,117 @@ def _build_x_from_history(ego_states: Deque[EgoState], *, history_len: int = 21)
     x = np.concatenate([ego_current_state.reshape(-1), past.reshape(-1)], axis=0)
     assert x.shape == (10 + history_len * 3,), f"x shape {x.shape}"
     return x.astype(np.float32)
+
+
+def _build_ego_runtime_features(
+    ego_states: Deque[EgoState],
+    *,
+    history_len: int,
+) -> tuple[np.ndarray, np.ndarray, _EgoKinematics]:
+    """Build ego_current_state [10] and ego_past [history_len, 3] in the exporter layout."""
+    states = list(ego_states)
+    if not states:
+        raise RuntimeError("PlannerInput.history.ego_states is empty")
+
+    current = states[-1]
+    cur_k = _ego_kinematics(current)
+    R = _rot2d(-cur_k.heading)
+    v_local = R @ np.array([cur_k.vx, cur_k.vy], dtype=np.float64)
+
+    ego_current_state = np.array(
+        [
+            0.0,
+            0.0,
+            float(np.cos(cur_k.heading)),
+            float(np.sin(cur_k.heading)),
+            float(v_local[0]),
+            float(v_local[1]),
+            float(cur_k.ax),
+            float(cur_k.ay),
+            1.0,
+            1.0,
+        ],
+        dtype=np.float32,
+    )
+
+    ego_past = np.zeros((history_len, 3), dtype=np.float32)
+    tail = states[-history_len:]
+    offset = history_len - len(tail)
+    for i, state in enumerate(tail):
+        k = _ego_kinematics(state)
+        dx_dy = R @ np.array([k.x - cur_k.x, k.y - cur_k.y], dtype=np.float64)
+        ego_past[offset + i, 0] = float(dx_dy[0])
+        ego_past[offset + i, 1] = float(dx_dy[1])
+        ego_past[offset + i, 2] = _wrap_pi(k.heading - cur_k.heading)
+
+    if len(tail) > 0:
+        ego_past[-1] = 0.0
+
+    return ego_current_state, ego_past, cur_k
+
+
+def _get_ego_box_dims(ego: EgoState) -> tuple[float, float]:
+    width = 1.8
+    length = 4.5
+    try:
+        vp = ego.car_footprint.vehicle_parameters
+        width = float(getattr(vp, "width", width))
+        length = float(getattr(vp, "length", length))
+    except Exception:
+        pass
+    return width, length
+
+
+def _build_ego_neighbor_slot(ego_states: Deque[EgoState], *, time_len: int) -> np.ndarray:
+    """Match offline extractor semantics for neighbor slot 0: ego history in center frame."""
+    states = list(ego_states)
+    if not states:
+        return np.zeros((time_len, 11), dtype=np.float32)
+
+    cur_k = _ego_center_kinematics(states[-1])
+    ego_width, ego_length = _get_ego_box_dims(states[-1])
+    R = _rot2d(-cur_k.heading)
+
+    out = np.zeros((time_len, 11), dtype=np.float32)
+    tail = states[-time_len:]
+    offset = time_len - len(tail)
+    for i, state in enumerate(tail):
+        k = _ego_center_kinematics(state)
+        dx_dy = R @ np.array([k.x - cur_k.x, k.y - cur_k.y], dtype=np.float64)
+        v_local = R @ np.array([k.vx, k.vy], dtype=np.float64)
+        row = offset + i
+        out[row, 0] = float(dx_dy[0])
+        out[row, 1] = float(dx_dy[1])
+        out[row, 2] = float(np.cos(k.heading))
+        out[row, 3] = float(np.sin(k.heading))
+        out[row, 4] = float(v_local[0])
+        out[row, 5] = float(v_local[1])
+        out[row, 6] = float(k.ax)
+        out[row, 7] = float(k.ay)
+        out[row, 8] = float(ego_width)
+        out[row, 9] = float(ego_length)
+        out[row, 10] = 1.0
+
+    return out
+
+
+def _traffic_light_status_name(status: object) -> str:
+    try:
+        name = str(getattr(status, "name"))
+    except Exception:
+        name = str(status)
+    return name.strip().lower()
+
+
+def _traffic_lights_from_planner_input(current_input: PlannerInput) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for tl in list(getattr(current_input, "traffic_light_data", None) or []):
+        try:
+            lane_id = str(getattr(tl, "lane_connector_id"))
+            out[lane_id] = _traffic_light_status_name(getattr(tl, "status"))
+        except Exception:
+            continue
+    return out
 
 
 def _safe_obj_id(obj: object) -> str | None:
@@ -266,14 +409,14 @@ def _build_neighbor_agents_past_from_history(
                 print(f"[DP_RUNTIME_DEBUG] neighbors: last_obs not DetectionsTracks: {type(last_obs)}")
             except Exception:
                 pass
-        return out, 0
+        return out, int(np.count_nonzero(out))
 
     tracked = getattr(last_obs, "tracked_objects", None)
     if tracked is None:
-        return out, 0
+        return out, int(np.count_nonzero(out))
 
     candidates: list[object] = []
-    # prefer vehicles
+    # Prefer vehicles like the pre-PR37 runtime path; fall back to all tracked objects.
     try:
         from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 
@@ -308,7 +451,7 @@ def _build_neighbor_agents_past_from_history(
         scored.append((d2, oid))
 
     if not scored:
-        return out, 0
+        return out, int(np.count_nonzero(out))
 
     scored.sort(key=lambda t: t[0])
     chosen_ids = [oid for _, oid in scored[:Pn]]
@@ -363,9 +506,7 @@ def _build_neighbor_agents_past_from_history(
             out[p, t, 7] = 0.0
             out[p, t, 8] = float(width) if width is not None else 0.0
             out[p, t, 9] = float(length) if length is not None else 0.0
-            # type scalar (we treat vehicles as 1.0; other types as 0.0)
-            type_scalar = 1.0 if (onehot is not None and float(onehot[0]) > 0.5) else 0.0
-            out[p, t, 10] = float(type_scalar)
+            out[p, t, 10] = 1.0
 
         # constant-hold backfill
         # consider position/heading/velocity for validity (exclude size/type slots)
@@ -423,6 +564,11 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._runtime_debug = os.getenv("DP_RUNTIME_DEBUG", "0") not in ("", "0", "false", "False")
         self._runtime_debug_k = int(os.getenv("DP_RUNTIME_DEBUG_K", os.getenv("DIFFPLANNER_DEBUG_K", "5")))
         self._runtime_debug_ticks = 0
+        self._feature_sanity_debug = self._runtime_debug or (
+            os.getenv("DP_RUNTIME_FEATURE_SANITY", "0") not in ("", "0", "false", "False")
+        )
+        self._feature_sanity_k = int(os.getenv("DP_RUNTIME_FEATURE_SANITY_K", str(self._runtime_debug_k or 5)))
+        self._feature_sanity_ticks = 0
         self._debug_cond = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_COND", "0") not in ("", "0", "false", "False"))
         self._debug_sampler = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_SAMPLER", "0") not in ("", "0", "false", "False"))
 
@@ -507,6 +653,144 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             model = model.cuda()
 
         self._model = model
+
+    def _get_feature_conn(self) -> sqlite3.Connection:
+        if self._feature_conn is None:
+            db_path = getattr(self._scenario, "_log_file", None)
+            if not db_path:
+                raise RuntimeError("Scenario does not expose _log_file; cannot reuse offline feature extractor")
+            self._feature_conn = sqlite3.connect(str(db_path))
+            self._feature_conn.row_factory = sqlite3.Row
+        return self._feature_conn
+
+    def _build_paper_runtime_features(self, current_input: PlannerInput, cfg: PaperModelConfig) -> dict[str, np.ndarray]:
+        if self._map_api is None:
+            raise RuntimeError("Planner.initialize() was not called or map_api missing")
+
+        history = current_input.history
+        ego_states = getattr(history, "ego_states", None)
+        if not ego_states:
+            raise RuntimeError("PlannerInput.history.ego_states is empty")
+
+        ego_current_state, ego_past, cur_ego = _build_ego_runtime_features(ego_states, history_len=int(cfg.time_len))
+        timestamp_us = int(getattr(ego_states[-1], "time_us", getattr(current_input.iteration, "time_us", -1)))
+        if timestamp_us < 0:
+            raise RuntimeError("Unable to determine runtime timestamp from ego history or iteration")
+
+        traffic_light_data = _traffic_lights_from_planner_input(current_input)
+        if not traffic_light_data:
+            map_name = getattr(self._map_api, "map_name", None) or getattr(self._map_api, "_map_name", None)
+            traffic_light_data = get_traffic_lights_at_timestamp(self._get_feature_conn(), timestamp_us, map_name)
+
+        point = Point2D(cur_ego.x, cur_ego.y)
+        route_ids = list(self._route_roadblock_ids) if self._route_roadblock_ids else []
+        conn = self._get_feature_conn()
+
+        lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
+            point,
+            self._map_api,
+            radius=100,
+            max_lanes=int(cfg.lane_num),
+            ego_heading=cur_ego.heading,
+            traffic_light_data=traffic_light_data,
+        )
+        route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
+            point,
+            self._map_api,
+            radius=150,
+            max_route_lanes=int(cfg.route_num),
+            ego_heading=cur_ego.heading,
+            traffic_light_data=traffic_light_data,
+            route_roadblock_ids=route_ids,
+        )
+        static_objects = extract_static_objects(conn, timestamp_us, cur_ego.x, cur_ego.y, cur_ego.heading)
+        neighbor_agents_past, _ = _build_neighbor_agents_past_from_history(
+            history=history,
+            cur_ego=cur_ego,
+            predicted_neighbor_num=int(cfg.agent_num),
+            time_len=int(cfg.time_len),
+            runtime_debug=self._runtime_debug,
+        )
+
+        if int(np.count_nonzero(neighbor_agents_past[1:])) == 0:
+            try:
+                db_neighbor_past, _ = extract_neighbor_agents(
+                    conn,
+                    timestamp_us,
+                    cur_ego.x,
+                    cur_ego.y,
+                    cur_ego.heading,
+                )
+                if tuple(db_neighbor_past.shape) == tuple(neighbor_agents_past.shape):
+                    db_neighbor_past[0] = neighbor_agents_past[0]
+                    neighbor_agents_past = db_neighbor_past.astype(np.float32, copy=False)
+            except Exception as e:
+                if self._runtime_debug:
+                    try:
+                        print(f"[DP_RUNTIME_DEBUG] neighbor DB fallback failed: {e}")
+                    except Exception:
+                        pass
+
+        feats = {
+            "ego_current_state": ego_current_state.astype(np.float32, copy=False),
+            "ego_past": ego_past.astype(np.float32, copy=False),
+            "ego_agent_future": np.zeros((int(cfg.future_len), 3), dtype=np.float32),
+            "neighbor_agents_past": neighbor_agents_past.astype(np.float32, copy=False),
+            "neighbor_agents_future": np.zeros((int(cfg.agent_num), int(cfg.future_len), 3), dtype=np.float32),
+            "static_objects": static_objects.astype(np.float32, copy=False),
+            "lanes": lanes.astype(np.float32, copy=False),
+            "lanes_avails": lanes_avails,
+            "route_lanes": route_lanes.astype(np.float32, copy=False),
+            "route_lanes_avails": route_lanes_avails,
+            "lanes_speed_limit": lanes_speed_limit.astype(np.float32, copy=False),
+            "lanes_has_speed_limit": lanes_has_speed_limit.astype(np.float32, copy=False),
+            "route_lanes_speed_limit": route_lanes_speed_limit.astype(np.float32, copy=False),
+            "route_lanes_has_speed_limit": route_lanes_has_speed_limit.astype(np.float32, copy=False),
+        }
+
+        if self._feature_sanity_debug and self._feature_sanity_ticks < self._feature_sanity_k:
+            try:
+                static_nonzero = int(np.count_nonzero(feats["static_objects"]))
+                static_filled = int(np.count_nonzero(np.any(np.abs(feats["static_objects"]) > 1e-8, axis=-1)))
+                neighbor_nonzero = int(np.count_nonzero(feats["neighbor_agents_past"]))
+                neighbor_agents = int(
+                    np.count_nonzero(np.any(np.abs(feats["neighbor_agents_past"][:, :, :10]) > 1e-8, axis=(1, 2)))
+                )
+                lane_count = int(np.count_nonzero(np.any(feats["lanes_avails"], axis=1)))
+                route_lane_count = int(np.count_nonzero(np.any(feats["route_lanes_avails"], axis=1)))
+                print(
+                    "[DP_RUNTIME_FEATURE_SANITY] "
+                    f"tick={self._feature_sanity_ticks} iter={int(current_input.iteration.index)} "
+                    f"time_us={timestamp_us} lane_count={lane_count} route_lane_count={route_lane_count} "
+                    f"static_filled={static_filled} static_nonzero={static_nonzero} "
+                    f"neighbor_agents={neighbor_agents} neighbor_nonzero={neighbor_nonzero}"
+                )
+            except Exception:
+                pass
+            self._feature_sanity_ticks += 1
+
+        expected_shapes = {
+            "ego_current_state": (10,),
+            "ego_past": (int(cfg.time_len), 3),
+            "ego_agent_future": (int(cfg.future_len), 3),
+            "neighbor_agents_past": (int(cfg.agent_num), int(cfg.time_len), 11),
+            "neighbor_agents_future": (int(cfg.agent_num), int(cfg.future_len), 3),
+            "static_objects": (int(cfg.static_objects_num), int(cfg.static_objects_state_dim)),
+            "lanes": (int(cfg.lane_num), int(cfg.lane_len), 12),
+            "lanes_avails": (int(cfg.lane_num), int(cfg.lane_len)),
+            "route_lanes": (int(cfg.route_num), int(cfg.lane_len), 12),
+            "route_lanes_avails": (int(cfg.route_num), int(cfg.lane_len)),
+            "lanes_speed_limit": (int(cfg.lane_num),),
+            "lanes_has_speed_limit": (int(cfg.lane_num),),
+            "route_lanes_speed_limit": (int(cfg.route_num),),
+            "route_lanes_has_speed_limit": (int(cfg.route_num),),
+        }
+        for key, shape in expected_shapes.items():
+            arr = feats.get(key)
+            if arr is None or tuple(arr.shape) != shape:
+                raise RuntimeError(f"Unexpected feature shape for {key}: got {None if arr is None else arr.shape}, expected {shape}")
+
+        return feats
 
     def initialize(self, initialization: PlannerInitialization) -> None:
         # Save map + route for runtime feature extraction.
