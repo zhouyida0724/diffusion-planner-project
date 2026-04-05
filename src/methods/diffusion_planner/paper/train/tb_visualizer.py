@@ -87,6 +87,8 @@ def render_npz_style_scene(
     *,
     sample_idx: int,
     ego_future_xy: torch.Tensor | np.ndarray | None = None,
+    ego_future_overlays: list[dict[str, Any]] | None = None,
+    ego_past_xy: torch.Tensor | np.ndarray | None = None,
     title: str | None = None,
     image_size: int = 800,
 ) -> np.ndarray | None:
@@ -197,11 +199,32 @@ def render_npz_style_scene(
         ego_circle = patches.Circle((0, 0), radius=1.5, facecolor="red", edgecolor="darkred", linewidth=2)
         ax.add_patch(ego_circle)
 
-        # Ego GT + pred (match visualize_npz.py style: GT blue, pred orange)
-        ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8, label="ego_gt")
+        # Ego past / GT future / pred (match visualize_npz.py style: GT blue, pred orange)
+        if ego_past_xy is not None:
+            past_xy = _to_numpy(ego_past_xy)
+            if past_xy.ndim == 2 and past_xy.shape[1] >= 2:
+                ax.plot(past_xy[:, 0], past_xy[:, 1], color="purple", linewidth=2.5, alpha=0.85, label="ego_past")
+                ax.scatter(past_xy[:, 0], past_xy[:, 1], s=18, c="purple", alpha=0.75)
+        if np.any(np.abs(ego_future[:, :2]) > 1e-6):
+            ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8, label="ego_gt")
         if ego_future_xy is not None:
             pred_xy = _to_numpy(ego_future_xy)
             ax.plot(pred_xy[:, 0], pred_xy[:, 1], color="orange", linewidth=3, alpha=0.9, label="ego_pred")
+
+        # Additional ego future overlays (e.g., IDM plan vs diffusion plan)
+        if ego_future_overlays:
+            for ov in ego_future_overlays:
+                try:
+                    xy = _to_numpy(ov.get("xy"))
+                    if xy is None or xy.ndim != 2 or xy.shape[1] < 2:
+                        continue
+                    color = str(ov.get("color", "cyan"))
+                    label = str(ov.get("label", "overlay"))
+                    lw = float(ov.get("lw", 2.5))
+                    alpha = float(ov.get("alpha", 0.9))
+                    ax.plot(xy[:, 0], xy[:, 1], color=color, linewidth=lw, alpha=alpha, label=label)
+                except Exception:
+                    continue
 
         # Neighbor past trajectories (more visible, with ids)
         agent_id = 0
@@ -336,6 +359,7 @@ def render_xy_scatter_with_context(
     image_size: int = 800,
     marker: str = ".",
     alpha: float = 0.95,
+    ego_past_xy: torch.Tensor | np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Render XY scatter over the same NPZ-style scene context (unified coordinates).
 
@@ -532,6 +556,12 @@ def render_xy_scatter_with_context(
             if np.any(valid):
                 ax.scatter(static_objects[valid, 0], static_objects[valid, 1], s=30, c="black", alpha=0.5, marker="x")
 
+        if ego_past_xy is not None:
+            past_xy = _to_numpy(ego_past_xy)
+            if past_xy.ndim == 2 and past_xy.shape[1] >= 2:
+                ax.plot(past_xy[:, 0], past_xy[:, 1], color="purple", linewidth=2.0, alpha=0.8)
+                ax.scatter(past_xy[:, 0], past_xy[:, 1], s=16, c="purple", alpha=0.7)
+
         # Overlay scatter points (denoise trajectory)
         ax.scatter(
             xy_np[:, 0],
@@ -542,6 +572,8 @@ def render_xy_scatter_with_context(
             c=np.linspace(0.1, 1.0, xy_np.shape[0]),
             cmap="viridis",
         )
+        if xy_np.shape[0] >= 2:
+            ax.plot(xy_np[:, 0], xy_np[:, 1], color="orange", linewidth=2.5, alpha=0.7)
 
         ax.set_title(title)
         ax.set_xlabel("X (m)")
