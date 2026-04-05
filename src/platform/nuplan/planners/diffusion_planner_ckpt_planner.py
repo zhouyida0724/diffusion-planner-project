@@ -25,10 +25,12 @@ from dataclasses import dataclass
 from typing import Deque, Optional
 
 import os
+import sqlite3
 import numpy as np
 import torch
 
 from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner, PlannerInitialization, PlannerInput
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
@@ -40,7 +42,7 @@ from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
 
 # Runtime feature extraction utilities (reuse export logic)
-from src.platform.nuplan.features.extract_single_frame import extract_lanes, extract_route_lanes
+from src.platform.nuplan.features.extract_single_frame import extract_features
 
 
 @dataclass
@@ -386,8 +388,11 @@ def _build_neighbor_agents_past_from_history(
 class DiffusionPlannerCkpt(AbstractPlanner):
     """nuPlan planner that loads a repo-local checkpoint and predicts a trajectory."""
 
+    requires_scenario: bool = True
+
     def __init__(
         self,
+        scenario: AbstractScenario,
         ckpt_path: str,
         past_trajectory_sampling: TrajectorySampling,
         future_trajectory_sampling: TrajectorySampling,
@@ -397,6 +402,8 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         sampling_steps: int = 10,
         **_: object,
     ):
+        self._scenario = scenario
+        self._feature_conn: sqlite3.Connection | None = None
         self._ckpt_path = str(ckpt_path)
         self._past_trajectory_sampling = past_trajectory_sampling
         self._future_trajectory_sampling = future_trajectory_sampling
@@ -437,6 +444,13 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._norm_debug = os.getenv("DP_NORM_DEBUG", "0") not in ("", "0", "false", "False")
         self._norm_debug_k = int(os.getenv("DP_NORM_DEBUG_K", str(self._runtime_debug_k if self._runtime_debug_k > 0 else 5)))
         self._norm_debug_ticks = 0
+
+        # Optional debug dump of exact planner inputs / RNG / sampled output for offline replay.
+        self._feature_dump_dir = os.getenv("DP_FEATURE_DUMP_DIR", "").strip()
+        self._feature_dump_max_ticks = int(os.getenv("DP_FEATURE_DUMP_MAX_TICKS", "41" if self._feature_dump_dir else "0"))
+        self._feature_dump_ticks = 0
+        if self._feature_dump_dir:
+            os.makedirs(self._feature_dump_dir, exist_ok=True)
 
         # matches export: 80 @ 10Hz = 8s
         self._T = int(self._future_trajectory_sampling.num_poses)
@@ -508,6 +522,44 @@ class DiffusionPlannerCkpt(AbstractPlanner):
 
         self._model = model
 
+    def _get_feature_conn(self) -> sqlite3.Connection:
+        if self._feature_conn is None:
+            db_path = getattr(self._scenario, "_log_file", None)
+            if not db_path:
+                raise RuntimeError("Scenario does not expose _log_file; cannot reuse offline feature extractor")
+            self._feature_conn = sqlite3.connect(str(db_path))
+            self._feature_conn.row_factory = sqlite3.Row
+        return self._feature_conn
+
+    def _build_paper_runtime_features(self, current_input: PlannerInput, cfg: PaperModelConfig) -> dict[str, np.ndarray]:
+        if self._map_api is None:
+            raise RuntimeError("Planner.initialize() was not called or map_api missing")
+
+        route_ids = list(self._route_roadblock_ids) if self._route_roadblock_ids else []
+        feats = extract_features(
+            self._get_feature_conn(),
+            self._map_api,
+            str(self._scenario.token),
+            int(current_input.iteration.index),
+            debug_log=False,
+            routing_mode="auto",
+            route_roadblock_ids_override=route_ids,
+        )
+
+        expected_shapes = {
+            "ego_current_state": (10,),
+            "neighbor_agents_past": (int(cfg.agent_num), int(cfg.time_len), 11),
+            "static_objects": (int(cfg.static_objects_num), int(cfg.static_objects_state_dim)),
+            "lanes": (int(cfg.lane_num), int(cfg.lane_len), 12),
+            "route_lanes": (int(cfg.route_num), int(cfg.lane_len), 12),
+        }
+        for key, shape in expected_shapes.items():
+            arr = feats.get(key)
+            if arr is None or tuple(arr.shape) != shape:
+                raise RuntimeError(f"Unexpected feature shape for {key}: got {None if arr is None else arr.shape}, expected {shape}")
+
+        return feats
+
     def initialize(self, initialization: PlannerInitialization) -> None:
         # Save map + route for runtime feature extraction.
         self._map_api = initialization.map_api
@@ -542,94 +594,38 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             cfg = self._model.config
             B = 1
             Pn = int(cfg.predicted_neighbor_num)
-            time_len = int(cfg.time_len)
             future_len = int(cfg.future_len)
             lane_len = int(cfg.lane_len)
 
-            # Runtime route/lanes extraction (matches export logic, not a placeholder).
-            cur = ego_history[-1]
-            cur_k = _ego_kinematics(cur)
-            from nuplan.common.actor_state.state_representation import Point2D
+            runtime_feats = self._build_paper_runtime_features(current_input, cfg)
+            lanes_np = runtime_feats["lanes"].astype(np.float32)
+            lanes_avails_np = runtime_feats["lanes_avails"].astype(np.uint8)
+            lanes_speed_np = runtime_feats["lanes_speed_limit"].astype(np.float32)
+            lanes_has_speed_np = runtime_feats["lanes_has_speed_limit"].astype(np.float32)
+            route_lanes_np = runtime_feats["route_lanes"].astype(np.float32)
+            route_lanes_avails_np = runtime_feats["route_lanes_avails"].astype(np.uint8)
+            route_speed_np = runtime_feats["route_lanes_speed_limit"].astype(np.float32)
+            route_has_speed_np = runtime_feats["route_lanes_has_speed_limit"].astype(np.float32)
+            neighbor_all = runtime_feats["neighbor_agents_past"].astype(np.float32)
+            static_objects_np = runtime_feats["static_objects"].astype(np.float32)
+            ego_current_state_np = runtime_feats["ego_current_state"].astype(np.float32)
+            ego_past_np = runtime_feats["ego_past"].astype(np.float32)
+            ego_agent_future_np = runtime_feats["ego_agent_future"].astype(np.float32)
+            neighbor_future_np = runtime_feats["neighbor_agents_future"].astype(np.float32)
 
-            point = Point2D(cur_k.x, cur_k.y)
-
-            lanes_np, lanes_avails_np, lanes_speed_np, lanes_has_speed_np = extract_lanes(
-                point=point,
-                map_api=self._map_api,
-                radius=150,
-                max_lanes=int(cfg.lane_num),
-                ego_heading=cur_k.heading,
-                traffic_light_data=None,
-            )
-            route_lanes_np, route_lanes_avails_np, route_speed_np, route_has_speed_np = extract_route_lanes(
-                point=point,
-                map_api=self._map_api,
-                radius=150,
-                max_route_lanes=int(cfg.route_num),
-                ego_heading=cur_k.heading,
-                traffic_light_data=None,
-                route_roadblock_ids=list(self._route_roadblock_ids) if self._route_roadblock_ids else None,
-            )
-
-            ego_current_state = torch.from_numpy(x[:10]).view(1, 10)
+            x = np.concatenate([ego_current_state_np.reshape(-1), ego_past_np.reshape(-1)], axis=0).astype(np.float32)
+            ego_current_state = torch.from_numpy(ego_current_state_np).view(1, 10)
 
             dbg_should_print = self._runtime_debug and (self._runtime_debug_ticks < self._runtime_debug_k)
             norm_dbg_should_print = self._norm_debug and (self._norm_debug_ticks < self._norm_debug_k)
 
-            # Neighbors: minimal runtime track history from DetectionsTracks.
-            # Paper model expects `agent_num = 1 + predicted_neighbor_num` and may include ego as slot 0.
-            agent_num = int(getattr(cfg, "agent_num", 1 + Pn))
-            neighbor_all = np.zeros((agent_num, time_len, 11), dtype=np.float32)
-
-            # Fill ego history into slot 0.
-            ego_states = list(current_input.history.ego_states)
-            ego_tail = ego_states[-time_len:]
-            aligned_ego: list[EgoState | None] = [None] * time_len
-            ego_off = time_len - len(ego_tail)
-            for i, s in enumerate(ego_tail):
-                aligned_ego[ego_off + i] = s
-
-            R0 = _rot2d(-cur_k.heading)
-            for t, s in enumerate(aligned_ego):
-                if s is None:
-                    continue
-                k = _ego_kinematics(s)
-                dx_dy = R0 @ np.array([k.x - cur_k.x, k.y - cur_k.y], dtype=np.float64)
-                vv = R0 @ np.array([k.vx, k.vy], dtype=np.float64)
-                aa = R0 @ np.array([k.ax, k.ay], dtype=np.float64)
-
-                neighbor_all[0, t, 0] = float(dx_dy[0])
-                neighbor_all[0, t, 1] = float(dx_dy[1])
-                # NOTE: match offline exporter: ABSOLUTE heading cos/sin (not delta-to-ego)
-                neighbor_all[0, t, 2] = float(np.cos(k.heading))
-                neighbor_all[0, t, 3] = float(np.sin(k.heading))
-                neighbor_all[0, t, 4] = float(vv[0])
-                neighbor_all[0, t, 5] = float(vv[1])
-                # accel in ego-local
-                neighbor_all[0, t, 6] = float(aa[0])
-                neighbor_all[0, t, 7] = float(aa[1])
-                # size + type scalar
-                neighbor_all[0, t, 8] = 1.8
-                neighbor_all[0, t, 9] = 4.5
-                neighbor_all[0, t, 10] = 1.0
-
-            # Fill tracked neighbor vehicles into slots [1:1+Pn].
-            neighbor_np, neighbor_nz = _build_neighbor_agents_past_from_history(
-                history=current_input.history,
-                cur_ego=cur_k,
-                predicted_neighbor_num=Pn,
-                time_len=time_len,
-                runtime_debug=dbg_should_print,
-            )
-            hi = min(Pn, max(0, agent_num - 1))
-            if hi > 0:
-                neighbor_all[1 : 1 + hi] = neighbor_np[:hi]
-
-            neighbor_agents_past = torch.from_numpy(neighbor_all).view(B, agent_num, time_len, 11)
+            neighbor_agents_past = torch.from_numpy(neighbor_all).view(B, int(cfg.agent_num), int(cfg.time_len), 11)
             neighbor_agents_past_nonzero_count = int(np.count_nonzero(neighbor_all))
 
-            neighbor_agents_future = torch.zeros((B, Pn, future_len, 3), dtype=torch.float32)
-            static_objects = torch.zeros((B, int(cfg.static_objects_num), int(cfg.static_objects_state_dim)), dtype=torch.float32)
+            neighbor_agents_future = torch.from_numpy(neighbor_future_np[:, :future_len]).view(
+                B, int(cfg.agent_num), future_len, 3
+            )
+            static_objects = torch.from_numpy(static_objects_np).view(B, int(cfg.static_objects_num), int(cfg.static_objects_state_dim))
 
             lanes = torch.from_numpy(lanes_np).view(1, int(cfg.lane_num), lane_len, 12)
             lanes_speed_limit = torch.from_numpy(lanes_speed_np).view(1, int(cfg.lane_num), 1)
@@ -643,7 +639,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                 "ego_current_state": ego_current_state,
                 "neighbor_agents_past": neighbor_agents_past,
                 "neighbor_agents_future": neighbor_agents_future,
-                "ego_agent_future": torch.zeros((B, future_len, 3), dtype=torch.float32),
+                "ego_agent_future": torch.from_numpy(ego_agent_future_np).view(B, future_len, 3),
                 "static_objects": static_objects,
                 "lanes": lanes,
                 "lanes_speed_limit": lanes_speed_limit,
@@ -659,6 +655,12 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             # NOTE: decoder returns inverse-normalized (meters) by default.
             ego_x0 = ego_y0 = ego_cos0 = ego_sin0 = None
             ego_pred_norm = None  # normalized-space prediction if DP_NORM_DEBUG=1 and decoder exposes it
+            torch_rng_state_before = None
+            if self._feature_dump_dir and (self._feature_dump_ticks < self._feature_dump_max_ticks):
+                try:
+                    torch_rng_state_before = torch.get_rng_state().detach().cpu().numpy()
+                except Exception:
+                    torch_rng_state_before = None
 
             with torch.no_grad():
                 if norm_dbg_should_print or self._debug_sampler:
@@ -683,6 +685,57 @@ class DiffusionPlannerCkpt(AbstractPlanner):
                     y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
 
             y_np = y.detach().cpu().numpy().astype(np.float32)
+
+            if self._feature_dump_dir and (self._feature_dump_ticks < self._feature_dump_max_ticks):
+                try:
+                    iteration = getattr(current_input, "iteration", None)
+                    iteration_index = int(getattr(iteration, "index", self._feature_dump_ticks))
+                    iteration_time_us = int(getattr(iteration, "time_us", -1))
+                    dump_path = os.path.join(
+                        self._feature_dump_dir,
+                        f"tick_{self._feature_dump_ticks:03d}_iter_{iteration_index:03d}.npz",
+                    )
+                    neighbor_agents_avails_np = np.any(np.abs(neighbor_all) > 1e-8, axis=-1).astype(np.uint8)
+                    np.savez_compressed(
+                        dump_path,
+                        tick=np.int32(self._feature_dump_ticks),
+                        iteration_index=np.int32(iteration_index),
+                        iteration_time_us=np.int64(iteration_time_us),
+                        sampling_steps=np.int32(self._sampling_steps),
+                        future_horizon=np.float32(self._future_horizon),
+                        step_interval=np.float32(self._step_interval),
+                        history_ego_len=np.int32(len(list(current_input.history.ego_states))),
+                        history_observation_len=np.int32(len(list(current_input.history.observations))),
+                        route_roadblock_ids=np.array(list(self._route_roadblock_ids) if self._route_roadblock_ids else [], dtype=str),
+                        ego_current_state=ego_current_state_np,
+                        x=x.astype(np.float32),
+                        ego_past=ego_past_np,
+                        neighbor_agents_past=neighbor_all,
+                        neighbor_agents_avails=neighbor_agents_avails_np,
+                        neighbor_agents_future=neighbor_future_np,
+                        ego_agent_future=ego_agent_future_np,
+                        static_objects=static_objects_np,
+                        lanes=lanes_np,
+                        lanes_avails=lanes_avails_np,
+                        route_lanes=route_lanes_np,
+                        route_lanes_avails=route_lanes_avails_np,
+                        lanes_speed_limit=lanes_speed_np,
+                        lanes_has_speed_limit=lanes_has_speed_np,
+                        route_lanes_speed_limit=route_speed_np,
+                        route_lanes_has_speed_limit=route_has_speed_np,
+                        closed_loop_y=y_np,
+                        torch_rng_state_before=(
+                            np.array([], dtype=np.uint8)
+                            if torch_rng_state_before is None
+                            else torch_rng_state_before.astype(np.uint8)
+                        ),
+                    )
+                except Exception as e:
+                    try:
+                        print(f"[DP_FEATURE_DUMP_ERROR] tick={self._feature_dump_ticks} err={e}")
+                    except Exception:
+                        pass
+                self._feature_dump_ticks += 1
 
             # --- Normalization debug: compare normalized-space vs inverse-normalized (meters) predictions ---
             if norm_dbg_should_print:
