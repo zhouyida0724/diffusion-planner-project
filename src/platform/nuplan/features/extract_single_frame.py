@@ -440,45 +440,105 @@ def bfs_bridge_route_if_needed(
 # -------------------------------------------------------------------------------------------------
 
 
-def get_target_frame(conn, scenario_token, frame_index):
+def _clamp_index(idx: int, length: int) -> int:
+    if length <= 0:
+        raise IndexError("cannot clamp index into empty sequence")
+    if idx < 0:
+        return 0
+    if idx >= length:
+        return length - 1
+    return int(idx)
+
+
+def resolve_frame_context(conn, scenario_token: str, frame_index: int) -> dict[str, object]:
+    """Resolve the target lidar/ego-pose context for a sample.
+
+    Supports both legacy scene tokens (`scene.token`) and nuPlan simulation scenario
+    tokens (`initial lidar_pc.token`). The latter is what closed-loop simulation uses.
+    """
+
     cursor = conn.cursor()
+    token_bytes = bytes.fromhex(scenario_token)
 
+    # Case 1: legacy/offline exporter token is a scene token.
     try:
-        scenario_token_bytes = bytes.fromhex(scenario_token)
-        cursor.execute("SELECT token FROM scene WHERE token = ?", (scenario_token_bytes,))
-        scenario = cursor.fetchone()
-
-        if scenario:
-            # First get log_token from scene (matching extract_ego_data approach)
-            cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
-            log_token = cursor.fetchone()[0]
-
+        cursor.execute("SELECT token FROM scene WHERE token = ?", (token_bytes,))
+        scene = cursor.fetchone()
+        if scene is not None:
             cursor.execute(
                 """
-                SELECT ep.token, ep.timestamp
-                FROM ego_pose ep
-                WHERE ep.log_token = ?
-                ORDER BY ep.timestamp
-            """,
-                (log_token,),
+                SELECT token, timestamp, ego_pose_token
+                FROM lidar_pc
+                WHERE scene_token = ?
+                ORDER BY timestamp ASC
+                """,
+                (token_bytes,),
             )
-            frames = cursor.fetchall()
-
-            if frame_index < len(frames):
-                target_frame = frames[frame_index]
-                return target_frame[0], target_frame[1], target_frame[0]
+            lidar_rows = cursor.fetchall()
+            if lidar_rows:
+                row = lidar_rows[_clamp_index(int(frame_index), len(lidar_rows))]
+                return {
+                    "center_token": row["ego_pose_token"],
+                    "center_timestamp": int(row["timestamp"]),
+                    "center_lidar_token": row["token"],
+                    "scene_token_hex": scenario_token,
+                    "scenario_token_kind": "scene",
+                }
     except Exception:
         pass
 
+    # Case 2: nuPlan simulation token is the initial lidar_pc token for the scenario.
+    try:
+        cursor.execute(
+            "SELECT token, timestamp, ego_pose_token, scene_token FROM lidar_pc WHERE token = ?",
+            (token_bytes,),
+        )
+        lidar_row = cursor.fetchone()
+        if lidar_row is not None:
+            scene_token_bytes = lidar_row["scene_token"]
+            cursor.execute(
+                """
+                SELECT token, timestamp, ego_pose_token
+                FROM lidar_pc
+                WHERE scene_token = ?
+                ORDER BY timestamp ASC
+                """,
+                (scene_token_bytes,),
+            )
+            lidar_rows = cursor.fetchall()
+            if lidar_rows:
+                start_idx = 0
+                for i, row in enumerate(lidar_rows):
+                    if row["token"] == token_bytes:
+                        start_idx = i
+                        break
+                row = lidar_rows[_clamp_index(start_idx + int(frame_index), len(lidar_rows))]
+                return {
+                    "center_token": row["ego_pose_token"],
+                    "center_timestamp": int(row["timestamp"]),
+                    "center_lidar_token": row["token"],
+                    "scene_token_hex": scene_token_bytes.hex(),
+                    "scenario_token_kind": "lidar_pc",
+                }
+    except Exception:
+        pass
+
+    # Final fallback: preserve legacy behavior (index in full ego_pose log).
     cursor.execute("SELECT token, timestamp FROM ego_pose ORDER BY timestamp")
     all_poses = cursor.fetchall()
+    pose = all_poses[_clamp_index(int(frame_index), len(all_poses))]
+    return {
+        "center_token": pose["token"],
+        "center_timestamp": int(pose["timestamp"]),
+        "center_lidar_token": None,
+        "scene_token_hex": scenario_token,
+        "scenario_token_kind": "fallback_ego_pose",
+    }
 
-    if frame_index < len(all_poses):
-        pose = all_poses[frame_index]
-        return pose["token"], pose["timestamp"], pose["token"]
 
-    pose = all_poses[0]
-    return pose["token"], pose["timestamp"], pose["token"]
+def get_target_frame(conn, scenario_token, frame_index):
+    ctx = resolve_frame_context(conn, scenario_token, frame_index)
+    return ctx["center_token"], ctx["center_timestamp"], ctx["center_lidar_token"]
 
 
 def get_traffic_lights_at_timestamp(conn, timestamp, map_name):
@@ -1205,6 +1265,7 @@ def extract_features(
     *,
     debug_log: bool = True,
     routing_mode: str = "auto",
+    route_roadblock_ids_override: list[str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Pure feature extraction.
 
@@ -1216,12 +1277,15 @@ def extract_features(
 
     timing: dict[str, float] | None = {} if _extract_profile_enabled() else None
 
-    with _timing_ctx(timing, "get_target_frame"):
-        center_token, center_timestamp, _ = get_target_frame(conn, scenario_token_hex, int(frame_index))
+    with _timing_ctx(timing, "resolve_frame_context"):
+        frame_ctx = resolve_frame_context(conn, scenario_token_hex, int(frame_index))
+        center_token = frame_ctx["center_token"]
+        center_timestamp = int(frame_ctx["center_timestamp"])
+        resolved_scene_token_hex = str(frame_ctx["scene_token_hex"])
 
     with _timing_ctx(timing, "extract_ego_data"):
         ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, _, _ = extract_ego_data(
-            conn, center_token, center_timestamp, scenario_token_hex
+            conn, center_token, center_timestamp, resolved_scene_token_hex
         )
 
     with _timing_ctx(timing, "get_traffic_lights_at_timestamp"):
@@ -1242,21 +1306,25 @@ def extract_features(
 
     routing_mode = (routing_mode or "auto").strip().lower()
 
-    with _timing_ctx(timing, "get_raw_route_roadblock_ids"):
-        try:
-            scenario = build_nuplan_scenario_from_db(conn, db_path, scenario_token_hex, map_name)
-            route_roadblock_ids_raw = list(scenario.get_route_roadblock_ids())
-        except Exception:
-            route_roadblock_ids_raw = []
-
-    if routing_mode == "auto":
-        with _timing_ctx(timing, "get_pruned_route_roadblock_ids"):
-            try:
-                route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
-            except Exception:
-                route_roadblock_ids = None
+    if route_roadblock_ids_override is not None:
+        route_roadblock_ids_raw = list(route_roadblock_ids_override)
+        route_roadblock_ids = list(route_roadblock_ids_override)
     else:
-        route_roadblock_ids = list(route_roadblock_ids_raw)
+        with _timing_ctx(timing, "get_raw_route_roadblock_ids"):
+            try:
+                scenario = build_nuplan_scenario_from_db(conn, db_path, resolved_scene_token_hex, map_name)
+                route_roadblock_ids_raw = list(scenario.get_route_roadblock_ids())
+            except Exception:
+                route_roadblock_ids_raw = []
+
+        if routing_mode == "auto":
+            with _timing_ctx(timing, "get_pruned_route_roadblock_ids"):
+                try:
+                    route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, resolved_scene_token_hex, map_api, map_name)
+                except Exception:
+                    route_roadblock_ids = None
+        else:
+            route_roadblock_ids = list(route_roadblock_ids_raw)
 
     with _timing_ctx(timing, "extract_lanes"):
         lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
