@@ -23,6 +23,7 @@ install_deps() {
     docker exec $CONTAINER_NAME bash -c '
         if ! python3 -c "import rasterio" 2>/dev/null; then
             pip3 install --quiet \
+                Cython \
                 shapely \
                 geopandas \
                 botocore \

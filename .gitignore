@@ -41,6 +41,11 @@ outputs/**
 scripts/extract_single_frame/_tmp_*.py
 scripts/extract_single_frame/*.bak*
 
+# Cython extension build artifacts (fast_geometry)
+src/platform/build/
+src/platform/*.so
+src/platform/fast_geometry.c
+
 data_process/debug_log/
 test_viz/
 # Accidental nested outputs written by container (root-owned)

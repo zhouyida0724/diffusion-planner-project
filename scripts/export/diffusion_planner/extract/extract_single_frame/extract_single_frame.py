@@ -30,7 +30,37 @@ if _REPO_ROOT not in sys.path:
 
 from nuplan.common.maps.nuplan_map.map_factory import get_maps_api  # noqa: E402
 
-from src.platform.nuplan.features import extract_single_frame as core  # noqa: E402
+# Implementation switch (does NOT change CLI behavior):
+#   EXTRACT_SINGLE_FRAME_IMPL=py|cy|auto
+#     - py: force pure-python reference implementation
+#     - cy: force fast_geometry-accelerated implementation (import must succeed)
+#     - auto (default): use cy if available, else py
+from src.platform.nuplan.features import extract_single_frame as _core_py  # noqa: E402
+
+_core_cy = None
+_core_cy_err: Exception | None = None
+try:
+    from src.platform.nuplan.features import extract_single_frame_cy as _core_cy  # type: ignore  # noqa: E402
+except Exception as e:  # pragma: no cover
+    _core_cy = None
+    _core_cy_err = e
+
+_impl = os.environ.get("EXTRACT_SINGLE_FRAME_IMPL", "auto").strip().lower()
+if _impl not in {"py", "cy", "auto"}:
+    _impl = "auto"
+
+if _impl == "py":
+    core = _core_py
+elif _impl == "cy":
+    if _core_cy is None:
+        raise ImportError(
+            "EXTRACT_SINGLE_FRAME_IMPL=cy requested but Cython/fast implementation failed to import. "
+            "Ensure src/platform/fast_geometry is built and importable. "
+            f"Original error: {_core_cy_err}"
+        )
+    core = _core_cy
+else:  # auto
+    core = _core_cy if _core_cy is not None else _core_py
 
 # --------------------------------------------------------------------------------------
 # Public constants (kept for backwards compatibility with other scripts/tests)
