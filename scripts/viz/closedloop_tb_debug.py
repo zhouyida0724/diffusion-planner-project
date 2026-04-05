@@ -84,7 +84,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump-dir", type=str, required=True)
     ap.add_argument("--scenario", type=str, required=True)
-    ap.add_argument("--idm-simlog", type=str, required=True)
+    ap.add_argument(
+        "--idm-simlog",
+        type=str,
+        default=None,
+        help="Optional IDM baseline simlog (.msgpack.xz). Only used when --plot-idm is set.",
+    )
+    ap.add_argument(
+        "--plot-idm",
+        action="store_true",
+        help="Overlay IDM planned trajectory (requires --idm-simlog). Default: off.",
+    )
     ap.add_argument("--logdir", type=str, required=True)
     ap.add_argument("--ticks", type=str, default="0-40")
     ap.add_argument("--image-size", type=int, default=800)
@@ -104,7 +114,7 @@ def main() -> int:
         raise SystemExit("torch.utils.tensorboard is unavailable")
 
     dump_dir = Path(args.dump_dir)
-    idm_simlog = Path(args.idm_simlog)
+    idm_simlog = Path(args.idm_simlog) if (args.idm_simlog is not None) else None
     logdir = Path(args.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
 
@@ -123,7 +133,7 @@ def main() -> int:
     writer = SummaryWriter(log_dir=str(logdir))
     writer.add_text("meta/scenario", args.scenario, 0)
     writer.add_text("meta/dump_dir", str(dump_dir), 0)
-    writer.add_text("meta/idm_simlog", str(idm_simlog), 0)
+    writer.add_text("meta/idm_simlog", str(idm_simlog) if idm_simlog is not None else "<disabled>", 0)
 
     for t in ticks:
         p = dump_dir / f"tick_{t:03d}_iter_{t:03d}.npz"
@@ -146,21 +156,24 @@ def main() -> int:
         }
 
         diff_xy = z["closed_loop_y"][..., 0:2].astype(np.float32)
-        horizon = int(diff_xy.shape[0])
-        idm_xy = _load_idm_plan_ego_frame(idm_simlog, tick=int(t), horizon=horizon)
 
         # nuBoard / simlog convention is: traj[0] is current ego, traj[1:] are future.
         # Our dump convention is: closed_loop_y[0] is the first future point (t=+0.1s), i.e. future-only.
         if args.traj_convention == "current_plus_future":
             diff_xy = np.concatenate([np.zeros((1, 2), dtype=np.float32), diff_xy], axis=0)
-            if idm_xy is not None:
-                idm_xy = np.concatenate([np.zeros((1, 2), dtype=np.float32), idm_xy], axis=0)
 
         overlays = [
             {"xy": diff_xy, "label": "diffusion_plan", "color": "orange", "lw": 3.0, "alpha": 0.95},
         ]
-        if idm_xy is not None:
-            overlays.append({"xy": idm_xy, "label": "idm_plan", "color": "cyan", "lw": 2.5, "alpha": 0.9})
+
+        if args.plot_idm:
+            if idm_simlog is None:
+                raise SystemExit("--plot-idm requires --idm-simlog")
+            idm_xy = _load_idm_plan_ego_frame(idm_simlog, tick=int(t), horizon=int(z["closed_loop_y"].shape[0]))
+            if idm_xy is not None and args.traj_convention == "current_plus_future":
+                idm_xy = np.concatenate([np.zeros((1, 2), dtype=np.float32), idm_xy], axis=0)
+            if idm_xy is not None:
+                overlays.append({"xy": idm_xy, "label": "idm_plan", "color": "cyan", "lw": 2.5, "alpha": 0.9})
 
         img = render_npz_style_scene(
             batch,
