@@ -88,6 +88,16 @@ def main() -> int:
     ap.add_argument("--logdir", type=str, required=True)
     ap.add_argument("--ticks", type=str, default="0-40")
     ap.add_argument("--image-size", type=int, default=800)
+    ap.add_argument(
+        "--traj-convention",
+        type=str,
+        default="current_plus_future",
+        choices=["future_only", "current_plus_future"],
+        help=(
+            "How to plot trajectories. 'future_only' plots only predicted future points. "
+            "'current_plus_future' prepends the current ego point (0,0) for nuBoard parity."
+        ),
+    )
     args = ap.parse_args()
 
     if SummaryWriter is None:
@@ -136,7 +146,15 @@ def main() -> int:
         }
 
         diff_xy = z["closed_loop_y"][..., 0:2].astype(np.float32)
-        idm_xy = _load_idm_plan_ego_frame(idm_simlog, tick=int(t), horizon=int(diff_xy.shape[0]))
+        horizon = int(diff_xy.shape[0])
+        idm_xy = _load_idm_plan_ego_frame(idm_simlog, tick=int(t), horizon=horizon)
+
+        # nuBoard / simlog convention is: traj[0] is current ego, traj[1:] are future.
+        # Our dump convention is: closed_loop_y[0] is the first future point (t=+0.1s), i.e. future-only.
+        if args.traj_convention == "current_plus_future":
+            diff_xy = np.concatenate([np.zeros((1, 2), dtype=np.float32), diff_xy], axis=0)
+            if idm_xy is not None:
+                idm_xy = np.concatenate([np.zeros((1, 2), dtype=np.float32), idm_xy], axis=0)
 
         overlays = [
             {"xy": diff_xy, "label": "diffusion_plan", "color": "orange", "lw": 3.0, "alpha": 0.95},
