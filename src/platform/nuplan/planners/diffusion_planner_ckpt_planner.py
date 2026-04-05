@@ -388,9 +388,17 @@ def _build_neighbor_agents_past_from_history(
     V = int(time_len)
     out = np.zeros((Pn, V, 11), dtype=np.float32)
 
+    # Slot 0 is reserved for ego history in the offline extractor.
+    try:
+        ego_states = getattr(history, "ego_states", None)
+        if ego_states is not None and Pn > 0:
+            out[0] = _build_ego_neighbor_slot(ego_states, time_len=V)
+    except Exception:
+        pass
+
     obs_deque = getattr(history, "observations", None)
     if not obs_deque:
-        return out, 0
+        return out, int(np.count_nonzero(out))
 
     obs_list = list(obs_deque)
     if not obs_list:
@@ -454,7 +462,10 @@ def _build_neighbor_agents_past_from_history(
         return out, int(np.count_nonzero(out))
 
     scored.sort(key=lambda t: t[0])
-    chosen_ids = [oid for _, oid in scored[:Pn]]
+
+    # Reserve slot 0 for ego.
+    max_neighbors = max(0, Pn - 1)
+    chosen_ids = [oid for _, oid in scored[:max_neighbors]]
 
     frame_maps: list[dict[str, object]] = []
     for o in aligned:
@@ -479,6 +490,7 @@ def _build_neighbor_agents_past_from_history(
     R = _rot2d(-cur_ego.heading)
 
     for p, oid in enumerate(chosen_ids):
+        pp = p + 1  # shift by 1 because slot 0 is ego
         for t in range(V):
             obj = frame_maps[t].get(oid)
             if obj is None:
@@ -489,36 +501,36 @@ def _build_neighbor_agents_past_from_history(
 
             dx_dy = R @ np.array([x - cur_ego.x, y - cur_ego.y], dtype=np.float64)
             # NOTE: match offline exporter: use ABSOLUTE heading for cos/sin (not delta-to-ego).
-            out[p, t, 0] = float(dx_dy[0])
-            out[p, t, 1] = float(dx_dy[1])
-            out[p, t, 2] = float(np.cos(float(heading)))
-            out[p, t, 3] = float(np.sin(float(heading)))
+            out[pp, t, 0] = float(dx_dy[0])
+            out[pp, t, 1] = float(dx_dy[1])
+            out[pp, t, 2] = float(np.cos(float(heading)))
+            out[pp, t, 3] = float(np.sin(float(heading)))
 
             if vx is not None and vy is not None:
                 vv = R @ np.array([vx, vy], dtype=np.float64)
-                out[p, t, 4] = float(vv[0])
-                out[p, t, 5] = float(vv[1])
+                out[pp, t, 4] = float(vv[0])
+                out[pp, t, 5] = float(vv[1])
 
             # NOTE: match offline exporter 11-dim layout:
             # [dx,dy,cos(heading_abs),sin(heading_abs),v_local_x,v_local_y,acc_x,acc_y,width,length,type_scalar]
             # Runtime tracked objects do not provide reliable accelerations -> set to 0.
-            out[p, t, 6] = 0.0
-            out[p, t, 7] = 0.0
-            out[p, t, 8] = float(width) if width is not None else 0.0
-            out[p, t, 9] = float(length) if length is not None else 0.0
-            out[p, t, 10] = 1.0
+            out[pp, t, 6] = 0.0
+            out[pp, t, 7] = 0.0
+            out[pp, t, 8] = float(width) if width is not None else 0.0
+            out[pp, t, 9] = float(length) if length is not None else 0.0
+            out[pp, t, 10] = 1.0
 
         # constant-hold backfill
         # consider position/heading/velocity for validity (exclude size/type slots)
-        valid = np.any(out[p, :, :6] != 0.0, axis=1)
+        valid = np.any(out[pp, :, :6] != 0.0, axis=1)
         if not np.any(valid):
             continue
         first = int(np.argmax(valid))
         for t in range(0, first):
-            out[p, t] = out[p, first]
+            out[pp, t] = out[pp, first]
         for t in range(1, V):
             if not valid[t]:
-                out[p, t] = out[p, t - 1]
+                out[pp, t] = out[pp, t - 1]
 
     nonzero = int(np.count_nonzero(out))
     return out, nonzero
@@ -704,32 +716,50 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             route_roadblock_ids=route_ids,
         )
         static_objects = extract_static_objects(conn, timestamp_us, cur_ego.x, cur_ego.y, cur_ego.heading)
-        neighbor_agents_past, _ = _build_neighbor_agents_past_from_history(
-            history=history,
-            cur_ego=cur_ego,
-            predicted_neighbor_num=int(cfg.agent_num),
-            time_len=int(cfg.time_len),
-            runtime_debug=self._runtime_debug,
-        )
 
-        if int(np.count_nonzero(neighbor_agents_past[1:])) == 0:
-            try:
-                db_neighbor_past, _ = extract_neighbor_agents(
-                    conn,
-                    timestamp_us,
-                    cur_ego.x,
-                    cur_ego.y,
-                    cur_ego.heading,
-                )
-                if tuple(db_neighbor_past.shape) == tuple(neighbor_agents_past.shape):
-                    db_neighbor_past[0] = neighbor_agents_past[0]
-                    neighbor_agents_past = db_neighbor_past.astype(np.float32, copy=False)
-            except Exception as e:
-                if self._runtime_debug:
-                    try:
-                        print(f"[DP_RUNTIME_DEBUG] neighbor DB fallback failed: {e}")
-                    except Exception:
-                        pass
+        # Neighbor history is a major train-vs-infer sensitivity.
+        # Prefer the offline DB extractor for neighbor tracks (selection + ordering + density), but
+        # always overwrite slot 0 with *sim-anchored* ego history to avoid PR37-style expert anchoring.
+        ego_slot0 = _build_ego_neighbor_slot(ego_states, time_len=int(cfg.time_len))
+
+        neighbor_agents_past = None
+        try:
+            db_neighbor_past, _ = extract_neighbor_agents(
+                conn,
+                timestamp_us,
+                cur_ego.x,
+                cur_ego.y,
+                cur_ego.heading,
+            )
+            neighbor_agents_past = db_neighbor_past.astype(np.float32, copy=False)
+        except Exception as e:
+            if self._runtime_debug:
+                try:
+                    print(f"[DP_RUNTIME_DEBUG] extract_neighbor_agents(DB) failed, falling back to observation history: {e}")
+                except Exception:
+                    pass
+
+        if neighbor_agents_past is None:
+            neighbor_agents_past, _ = _build_neighbor_agents_past_from_history(
+                history=history,
+                cur_ego=cur_ego,
+                predicted_neighbor_num=int(cfg.agent_num),
+                time_len=int(cfg.time_len),
+                runtime_debug=self._runtime_debug,
+            )
+
+        # Ensure shape + slot0 semantics
+        Pn = int(cfg.agent_num)
+        V = int(cfg.time_len)
+        if tuple(neighbor_agents_past.shape) != (Pn, V, 11):
+            fixed = np.zeros((Pn, V, 11), dtype=np.float32)
+            p = min(Pn, int(neighbor_agents_past.shape[0]))
+            v = min(V, int(neighbor_agents_past.shape[1]))
+            fixed[:p, :v] = neighbor_agents_past[:p, :v]
+            neighbor_agents_past = fixed
+
+        if Pn > 0:
+            neighbor_agents_past[0] = ego_slot0
 
         feats = {
             "ego_current_state": ego_current_state.astype(np.float32, copy=False),
