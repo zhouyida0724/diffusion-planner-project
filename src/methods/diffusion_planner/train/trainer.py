@@ -41,6 +41,10 @@ class TrainConfig:
     steps: int = 200
     batch_size: int = 32
     lr: float = 1e-4
+    # lr schedule
+    lr_schedule: str = "constant"  # constant|cosine
+    lr_min_ratio: float = 1.0  # cosine: lr_min = lr * lr_min_ratio
+    lr_warmup_steps: int = 0
     weight_decay: float = 0.0
     num_workers: int = 2
     log_every: int = 10
@@ -81,6 +85,12 @@ class TrainConfig:
     # - all: everything above
     tb_denoise_mode: str = "t_sweep"  # t_sweep|forward_noise|sampler|all
     tb_sampler_steps: int = 10
+
+    # spike dump (paper_dit_dpm diagnostics)
+    spike_dump: bool = False
+    spike_start: int = 2000
+    spike_thresh: float = 0.9
+    spike_topk: int = 8
 
 
 def seed_everything(seed: int) -> None:

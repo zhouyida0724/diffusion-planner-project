@@ -247,6 +247,8 @@ def train_loop_paper_dit_xstart(
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
+    spike_path = exp_dir / "spike_dump.jsonl"
+
     tb = None
     tb_enable = bool(getattr(cfg, "tb_enable", False))
     tb_every = int(getattr(cfg, "tb_every", 0) or 0)
@@ -269,6 +271,28 @@ def train_loop_paper_dit_xstart(
         print("[tb] disabled: torch.utils.tensorboard is unavailable in this environment", flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    def _lr_for_step(step_i: int) -> float:
+        """Compute LR for this step based on cfg.* schedule knobs."""
+
+        base_lr = float(cfg.lr)
+        sched = str(getattr(cfg, "lr_schedule", "constant") or "constant").lower()
+        warmup = int(getattr(cfg, "lr_warmup_steps", 0) or 0)
+
+        if warmup > 0 and step_i < warmup:
+            return base_lr * float(step_i + 1) / float(max(warmup, 1))
+
+        if sched == "cosine":
+            import math
+
+            min_ratio = float(getattr(cfg, "lr_min_ratio", 1.0) or 1.0)
+            min_lr = base_lr * min_ratio
+            denom = max(int(cfg.steps) - warmup, 1)
+            prog = float(step_i - warmup) / float(denom)
+            prog = max(0.0, min(1.0, prog))
+            return float(min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * prog)))
+
+        return base_lr
 
     # AMP (stability-first):
     # - bf16 autocast (preferred): typically stable without GradScaler.
@@ -734,6 +758,99 @@ def train_loop_paper_dit_xstart(
         breakdown["ego_planning_loss"] = float(ego_planning_loss.detach().float().item())
         breakdown["neighbor_prediction_loss"] = float(neighbor_prediction_loss.detach().float().item())
         _assert_finite(loss, "loss")
+
+        # LR schedule (per-step)
+        lr_now = _lr_for_step(int(step))
+        for pg in opt.param_groups:
+            pg["lr"] = lr_now
+
+        # Spike dump (data/step diagnosis)
+        if bool(getattr(cfg, "spike_dump", False)) and int(step) >= int(getattr(cfg, "spike_start", 2000) or 2000):
+            try:
+                loss_val = float(loss.detach().float().cpu().item())
+                thresh = float(getattr(cfg, "spike_thresh", 0.9) or 0.9)
+                if loss_val >= thresh:
+                    topk = int(getattr(cfg, "spike_topk", 8) or 8)
+
+                    # per-sample ego/neighbor losses
+                    ego_per = dpm_loss[:, 0, :].mean(dim=1)  # [B]
+                    nb = dpm_loss[:, 1:, :]  # [B,P-1,T]
+                    valid = neighbors_future_valid
+                    valid_f = valid.to(dtype=nb.dtype)
+                    nb_sum = (nb * valid_f).sum(dim=(1, 2))
+                    nb_cnt = valid_f.sum(dim=(1, 2)).clamp(min=1.0)
+                    nb_per = nb_sum / nb_cnt
+                    total_per = ego_per + float(alpha_planning_loss) * nb_per
+
+                    k = min(int(topk), int(total_per.shape[0]))
+                    vals, idxs = torch.topk(total_per.detach().float().cpu(), k=k)
+
+                    meta = batch.get("meta")
+
+                    def _meta_at(i: int) -> dict[str, Any]:
+                        if isinstance(meta, list) and i < len(meta):
+                            m = meta[i]
+                            return dict(m) if isinstance(m, dict) else {"meta": str(m)}
+                        if isinstance(meta, dict):
+                            out: dict[str, Any] = {}
+                            for kk, vv in meta.items():
+                                try:
+                                    if isinstance(vv, (list, tuple)) and i < len(vv):
+                                        out[kk] = vv[i]
+                                    else:
+                                        out[kk] = vv
+                                except Exception:
+                                    continue
+                            return out
+                        return {}
+
+                    def _infer_city(shard_dir: Any) -> str | None:
+                        if shard_dir is None:
+                            return None
+                        s = str(shard_dir).lower()
+                        if "boston" in s:
+                            return "boston"
+                        if "pittsburgh" in s:
+                            return "pittsburgh"
+                        if "vegas" in s:
+                            return "vegas"
+                        return None
+
+                    rec = {
+                        "step": int(step),
+                        "loss": float(loss_val),
+                        "lr": float(lr_now),
+                        "alpha_planning_loss": float(alpha_planning_loss),
+                        "thresh": float(thresh),
+                        "topk": [],
+                        "ts": time.time(),
+                    }
+                    for rank, (v, j) in enumerate(zip(vals.tolist(), idxs.tolist())):
+                        m = _meta_at(int(j))
+                        shard_dir = m.get("shard_dir")
+                        rec["topk"].append(
+                            {
+                                "rank": int(rank),
+                                "total": float(v),
+                                "ego": float(ego_per[int(j)].detach().float().cpu().item()),
+                                "nb": float(nb_per[int(j)].detach().float().cpu().item()),
+                                "t": float(t[int(j)].detach().float().cpu().item()) if torch.is_tensor(t) else None,
+                                "sample_id": m.get("sample_id"),
+                                "shard_dir": shard_dir,
+                                "row_idx": m.get("row_idx"),
+                                "city": _infer_city(shard_dir),
+                            }
+                        )
+
+                    with spike_path.open("a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                    print(
+                        f"[spike] step {int(step):05d} loss={loss_val:.6f} lr={lr_now:.2e} "
+                        f"top0_total={rec['topk'][0]['total']:.6f} city={rec['topk'][0].get('city')}",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"[spike] dump failed: {e}", flush=True)
 
         # optim
         if _do_profile(step):

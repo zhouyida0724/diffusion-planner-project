@@ -101,6 +101,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cosine"])
+    p.add_argument("--lr-min-ratio", type=float, default=1.0, help="For cosine: lr_min = lr * lr_min_ratio")
+    p.add_argument("--lr-warmup-steps", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=2)
 
     # paper_dit_dpm loss weights
@@ -226,6 +229,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of DPM-Solver steps for sampler TensorBoard intermediates.",
     )
     p.add_argument("--tb-image-size", type=int, default=800, help="Best-effort render size for TB images.")
+
+    # loss spike dump (diagnosis)
+    p.add_argument("--spike-dump", action="store_true", help="Dump top-k samples when train loss spikes.")
+    p.add_argument("--spike-start", type=int, default=2000, help="Start dumping spikes after this step.")
+    p.add_argument("--spike-thresh", type=float, default=0.9, help="Dump when loss >= this threshold.")
+    p.add_argument("--spike-topk", type=int, default=8, help="How many top samples to dump per spike batch.")
 
     return p.parse_args()
 
@@ -490,6 +499,9 @@ def main() -> None:
         steps=args.steps,
         batch_size=args.batch_size,
         lr=args.lr,
+        lr_schedule=str(getattr(args, "lr_schedule", "constant")),
+        lr_min_ratio=float(getattr(args, "lr_min_ratio", 1.0)),
+        lr_warmup_steps=int(getattr(args, "lr_warmup_steps", 0) or 0),
         num_workers=args.num_workers,
         log_every=args.log_every,
         ckpt_every=args.ckpt_every,
@@ -513,6 +525,12 @@ def main() -> None:
         tb_denoise_mode=str(getattr(args, "tb_denoise_mode", "t_sweep")),
         tb_sampler_steps=int(getattr(args, "tb_sampler_steps", args.tb_denoise_k)),
         tb_image_size=int(args.tb_image_size),
+
+        # spike dump
+        spike_dump=bool(getattr(args, "spike_dump", False)),
+        spike_start=int(getattr(args, "spike_start", 2000) or 2000),
+        spike_thresh=float(getattr(args, "spike_thresh", 0.9) or 0.9),
+        spike_topk=int(getattr(args, "spike_topk", 8) or 8),
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.
