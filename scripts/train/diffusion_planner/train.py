@@ -40,6 +40,7 @@ from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
 from src.methods.diffusion_planner.paper.train import train_loop_paper_dit_xstart
 from src.methods.diffusion_planner.train.trainer import TrainConfig, train_loop, train_loop_diffusion_eps
+from torch.utils.data import ConcatDataset, Subset
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +191,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fast-val-batch-size", type=int, default=64)
     p.add_argument("--fast-val-num-workers", type=int, default=2)
 
+    # Multi-city fast evaluation (equal status). Each city uses the same N and the same schedule.
+    p.add_argument("--fast-eval-every", type=int, default=0, help="Run multi-city fast eval every N steps (0 disables).")
+    p.add_argument("--fast-eval-n", type=int, default=1024, help="Number of fast-eval samples per city.")
+    p.add_argument("--fast-eval-seed", type=int, default=0, help="Seed for deterministic fast-eval subset selection.")
+
+    p.add_argument("--fast-eval-boston-roots", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-boston-slices", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-pittsburgh-roots", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-vegas-roots", type=str, nargs="+", default=None)
+
     p.add_argument(
         "--max-samples",
         type=int,
@@ -217,6 +228,78 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tb-image-size", type=int, default=800, help="Best-effort render size for TB images.")
 
     return p.parse_args()
+
+
+def _stable_int(s: str) -> int:
+    import hashlib
+
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+    return int(h, 16)
+
+
+def _build_balanced_subset_dataset(
+    *,
+    roots: list[str],
+    n_total: int,
+    seed: int,
+    cache_root: str,
+) -> ConcatDataset:
+    """Create a deterministic subset dataset with (roughly) equal samples from each root.
+
+    This is used for multi-city fast-eval so that each city is evaluated on the same number of samples,
+    without one partition dominating (e.g. always taking from p0 first).
+    """
+
+    if n_total <= 0:
+        raise ValueError("n_total must be > 0")
+    if not roots:
+        raise ValueError("roots is empty")
+
+    dss = []
+    perms: list[list[int]] = []
+    ptrs: list[int] = []
+    for r in roots:
+        ds_i = ShardedNpzFeatureDataset([r], max_samples=None, cache_root=cache_root)
+        dss.append(ds_i)
+        L = len(ds_i)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(seed) + _stable_int(r))
+        perm = torch.randperm(L, generator=g).tolist() if L > 0 else []
+        perms.append(perm)
+        ptrs.append(0)
+
+    m = len(dss)
+    base = n_total // m
+    rem = n_total % m
+    target = [base + (1 if i < rem else 0) for i in range(m)]
+
+    chosen: list[list[int]] = [[] for _ in range(m)]
+    # first pass: take target per root
+    for i in range(m):
+        take = min(target[i], len(perms[i]))
+        chosen[i].extend(perms[i][:take])
+        ptrs[i] = take
+
+    # redistribute any remaining budget to roots with remaining capacity
+    remaining = n_total - sum(len(x) for x in chosen)
+    while remaining > 0:
+        progressed = False
+        for i in range(m):
+            if remaining <= 0:
+                break
+            if ptrs[i] < len(perms[i]):
+                chosen[i].append(perms[i][ptrs[i]])
+                ptrs[i] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    subsets = [Subset(ds_i, idxs) for ds_i, idxs in zip(dss, chosen) if len(idxs) > 0]
+    if not subsets:
+        # Fall back to empty concat (should not happen in practice)
+        return ConcatDataset([])
+    return ConcatDataset(subsets)
 
 
 def _discover_slice_dirs(dataset_root: Path) -> list[Path]:
@@ -295,6 +378,7 @@ def main() -> None:
         raise SystemExit("No training roots provided. Use --train-roots (or legacy --data-root).")
 
     fast_val_loader = None
+    fast_eval_loaders: dict[str, DataLoader] = {}
 
     if args.mode == "paper_dit_dpm":
         ds = ShardedNpzFeatureDataset(
@@ -334,6 +418,40 @@ def main() -> None:
                 print("[fast-val] No fast-val roots expanded; fast validation disabled.")
         elif int(getattr(args, "fast_val_every", 0) or 0) > 0:
             print("[fast-val] --fast-val-every set but --fast-val-roots not provided; fast validation disabled.")
+
+        # Multi-city fast evaluation (equal status), using balanced random subsets.
+        if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
+            n_city = int(getattr(args, "fast_eval_n", 1024) or 1024)
+            seed_city = int(getattr(args, "fast_eval_seed", 0) or 0)
+
+            def _maybe_add_city(city: str, roots: list[str] | None, slices: list[str] | None = None) -> None:
+                if not roots:
+                    return
+                expanded = _expand_roots(list(roots), slices)
+                if not expanded:
+                    return
+                ds_city = _build_balanced_subset_dataset(
+                    roots=expanded,
+                    n_total=n_city,
+                    seed=seed_city,
+                    cache_root=args.cache_root,
+                )
+                fast_eval_loaders[city] = DataLoader(
+                    ds_city,
+                    batch_size=int(args.fast_val_batch_size),
+                    shuffle=False,
+                    num_workers=int(args.fast_val_num_workers),
+                    pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
+                    drop_last=False,
+                )
+
+            _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
+            _maybe_add_city("pittsburgh", args.fast_eval_pittsburgh_roots, None)
+            _maybe_add_city("vegas", args.fast_eval_vegas_roots, None)
+
+            if fast_eval_loaders:
+                sizes = ", ".join([f"{k}={n_city}" for k in fast_eval_loaders.keys()])
+                print(f"Fast-eval (multi-city) enabled: every={int(args.fast_eval_every)} per_city_n={n_city} seed={seed_city} ({sizes})")
     else:
         ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
         print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
@@ -418,6 +536,8 @@ def main() -> None:
             train_loader=dl,
             fast_val_loader=fast_val_loader,
             fast_val_every=int(getattr(args, "fast_val_every", 0) or 0),
+            fast_eval_loaders=(fast_eval_loaders or None),
+            fast_eval_every=int(getattr(args, "fast_eval_every", 0) or 0),
         )
     else:
         raise SystemExit(f"Unknown mode: {args.mode}")

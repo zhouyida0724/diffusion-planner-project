@@ -229,6 +229,8 @@ def train_loop_paper_dit_xstart(
     max_grad_norm: Optional[float] = 1.0,
     fast_val_loader: Optional[DataLoader] = None,
     fast_val_every: int = 0,
+    fast_eval_loaders: Optional[dict[str, DataLoader]] = None,
+    fast_eval_every: int = 0,
 ) -> Path:
     """Train paper DiT with x_start objective under VP-SDE.
 
@@ -324,6 +326,160 @@ def train_loop_paper_dit_xstart(
     # -----------------
     fast_val_every = int(fast_val_every or 0)
     fast_val_path = exp_dir / "fast_val.jsonl"
+
+    # New: multi-domain fast evaluation (city-equal) with macro-average.
+    fast_eval_every = int(fast_eval_every or 0)
+    fast_eval_path = exp_dir / "fast_eval.jsonl"
+
+    def _run_fast_eval(step_i: int) -> None:
+        if not fast_eval_loaders or fast_eval_every <= 0:
+            return
+
+        model.train()  # keep train-mode per request
+        t_eval0 = time.time()
+
+        horizon_idxs = [9, 29, 49, 79]
+        alpha_planning_loss = float(getattr(cfg, "alpha_planning_loss", 1.0) or 1.0)
+
+        per_city: dict[str, dict[str, float]] = {}
+
+        def _eval_one(loader: DataLoader) -> tuple[dict[str, float], int]:
+            n_total = 0
+            sum_metrics: dict[str, float] = {}
+            with torch.no_grad():
+                for batch in loader:
+                    batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+                    x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                    x0n = model.config.state_normalizer(x0_4)
+
+                    neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                        batch,
+                        predicted_neighbor_num=Pn,
+                        future_len=Tf,
+                    )
+
+                    x0n_masked = x0n.clone()
+                    x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+
+                    B = int(x0n_masked.shape[0])
+                    t = torch.zeros((B,), device=device, dtype=torch.float32)
+
+                    inputs = {
+                        "ego_current_state": batch["ego_current_state"],
+                        "neighbor_agents_past": batch["neighbor_agents_past"],
+                        "static_objects": batch["static_objects"],
+                        "lanes": batch["lanes"],
+                        "lanes_speed_limit": batch["lanes_speed_limit"],
+                        "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                        "route_lanes": batch["route_lanes"],
+                        "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                        "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                        "sampled_trajectories": x0n_masked,
+                        "diffusion_time": t,
+                    }
+
+                    with autocast_ctx:
+                        _, dec_out = model(inputs)
+                    pred = dec_out["score"]  # [B,P,1+T,4]
+
+                    # val loss proxy (future-only, official masking)
+                    pred_fut = pred[:, :, 1:, :]
+                    gt_fut = x0n_masked[:, :, 1:, :]
+                    dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
+                    ego_loss = dpm_loss[:, 0, :].mean()
+                    nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                    nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                    val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
+
+                    # ADE/FDE on ego (x,y)
+                    pred_x0 = model.config.state_normalizer.inverse(pred) if hasattr(model.config.state_normalizer, "inverse") else None
+                    if pred_x0 is None:
+                        pred_ego_xy = pred[:, 0, 1:, :2]
+                    else:
+                        pred_ego_xy = pred_x0[:, 0, 1:, :2]
+
+                    gt_ego_future = batch["ego_agent_future"]
+                    if gt_ego_future.shape[-2] == Tf + 1:
+                        gt_ego_future = gt_ego_future[:, 1:, :]
+                    gt_ego_xy = gt_ego_future[..., :2]
+
+                    ade_fde = _ade_fde_at_horizons(pred_ego_xy, gt_ego_xy, horizon_idxs)
+
+                    metrics_batch: dict[str, float] = {
+                        "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()),
+                    }
+                    metrics_batch.update(ade_fde)
+
+                    n_total += B
+                    for k, v in metrics_batch.items():
+                        sum_metrics[k] = sum_metrics.get(k, 0.0) + float(v) * B
+
+            if n_total <= 0:
+                return {}, 0
+            metrics = {k: (v / n_total) for k, v in sum_metrics.items()}
+            return metrics, n_total
+
+        # evaluate each city equally (no city is "main")
+        for city, loader in fast_eval_loaders.items():
+            metrics, n = _eval_one(loader)
+            if not metrics:
+                continue
+            metrics.update(
+                {
+                    "city": str(city),
+                    "step": int(step_i),
+                    "n": int(n),
+                    "wall_s": float(time.time() - t_eval0),
+                    "ts": time.time(),
+                }
+            )
+            per_city[str(city)] = dict(metrics)
+
+            parts = [f"{k}={metrics[k]:.6f}" for k in sorted(metrics.keys()) if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
+            print(f"[fast-eval] city={city} step {step_i:05d} | n={n} | " + " | ".join(parts), flush=True)
+
+            if tb is not None:
+                try:
+                    tb.add_scalar(f"fast_eval/{city}/val_loss_proxy", float(metrics.get("val_loss_proxy", float("nan"))), int(step_i))
+                    for k, v in metrics.items():
+                        if k.startswith("ade_") or k.startswith("fde_"):
+                            tb.add_scalar(f"fast_eval/{city}/{k}", float(v), int(step_i))
+                except Exception:
+                    pass
+
+            with fast_eval_path.open("a") as f:
+                f.write(json.dumps(metrics) + "\n")
+
+        # macro-average across cities (equal weight)
+        if per_city:
+            keys = [k for k in next(iter(per_city.values())).keys() if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
+            macro: dict[str, float] = {}
+            for k in keys:
+                vals = [float(m[k]) for m in per_city.values() if k in m]
+                if vals:
+                    macro[k] = float(sum(vals) / len(vals))
+            macro_rec: dict[str, float | int | str] = {
+                "city": "macro",
+                "step": int(step_i),
+                "n": int(min(int(m.get("n", 0)) for m in per_city.values()) if per_city else 0),
+                "wall_s": float(time.time() - t_eval0),
+                "ts": time.time(),
+                **macro,
+            }
+
+            if tb is not None:
+                try:
+                    tb.add_scalar("fast_eval_macro/val_loss_proxy", float(macro.get("val_loss_proxy", float("nan"))), int(step_i))
+                    for k, v in macro.items():
+                        if k.startswith("ade_") or k.startswith("fde_"):
+                            tb.add_scalar(f"fast_eval_macro/{k}", float(v), int(step_i))
+                    tb.flush()
+                except Exception:
+                    pass
+
+            with fast_eval_path.open("a") as f:
+                f.write(json.dumps(macro_rec) + "\n")
 
     def _run_fast_val(step_i: int) -> None:
         if fast_val_loader is None or fast_val_every <= 0:
@@ -446,6 +602,10 @@ def train_loop_paper_dit_xstart(
     if fast_val_loader is not None and fast_val_every > 0:
         _run_fast_val(0)
 
+    # initial fast-eval at step 0
+    if fast_eval_loaders is not None and fast_eval_every > 0:
+        _run_fast_eval(0)
+
     profile_steps = int(getattr(cfg, "profile_steps", 0) or 0)
     profile_every = int(getattr(cfg, "profile_every", 0) or 0)
 
@@ -462,6 +622,9 @@ def train_loop_paper_dit_xstart(
     while step < cfg.steps:
         if fast_val_loader is not None and fast_val_every > 0 and (step % fast_val_every) == 0 and step != 0:
             _run_fast_val(step)
+
+        if fast_eval_loaders is not None and fast_eval_every > 0 and (step % fast_eval_every) == 0 and step != 0:
+            _run_fast_eval(step)
 
         step_t0 = time.time()
         breakdown: dict[str, Any] = {}
@@ -962,6 +1125,10 @@ def train_loop_paper_dit_xstart(
     # final fast-val at step=cfg.steps
     if fast_val_loader is not None and fast_val_every > 0:
         _run_fast_val(int(cfg.steps))
+
+    # final fast-eval at step=cfg.steps
+    if fast_eval_loaders is not None and fast_eval_every > 0:
+        _run_fast_eval(int(cfg.steps))
 
     latest = exp_dir / "checkpoint_latest.pt"
     try:
