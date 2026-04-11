@@ -243,7 +243,7 @@ def _build_balanced_subset_dataset(
     n_total: int,
     seed: int,
     cache_root: str,
-) -> ConcatDataset:
+) -> tuple[ConcatDataset, set[tuple[str, int]]]:
     """Create a deterministic subset dataset with (roughly) equal samples from each root.
 
     This is used for multi-city fast-eval so that each city is evaluated on the same number of samples,
@@ -258,6 +258,7 @@ def _build_balanced_subset_dataset(
     dss = []
     perms: list[list[int]] = []
     ptrs: list[int] = []
+    chosen_keys: set[tuple[str, int]] = set()
     for r in roots:
         ds_i = ShardedNpzFeatureDataset([r], max_samples=None, cache_root=cache_root)
         dss.append(ds_i)
@@ -295,11 +296,18 @@ def _build_balanced_subset_dataset(
         if not progressed:
             break
 
+    # Record unique sample keys for blacklist: (shard_dir, row_idx)
+    for ds_i, idxs in zip(dss, chosen):
+        for idx in idxs:
+            shard_idx, row_idx, _meta = ds_i._index[int(idx)]  # type: ignore[attr-defined]
+            spec = ds_i.shards[int(shard_idx)]
+            chosen_keys.add((str(spec.shard_dir.resolve()), int(row_idx)))
+
     subsets = [Subset(ds_i, idxs) for ds_i, idxs in zip(dss, chosen) if len(idxs) > 0]
     if not subsets:
         # Fall back to empty concat (should not happen in practice)
-        return ConcatDataset([])
-    return ConcatDataset(subsets)
+        return ConcatDataset([]), set()
+    return ConcatDataset(subsets), chosen_keys
 
 
 def _discover_slice_dirs(dataset_root: Path) -> list[Path]:
@@ -379,11 +387,56 @@ def main() -> None:
 
     fast_val_loader = None
     fast_eval_loaders: dict[str, DataLoader] = {}
+    fast_eval_exclude_keys: set[tuple[str, int]] = set()
 
     if args.mode == "paper_dit_dpm":
+        # Multi-city fast evaluation (equal status) + strict blacklist isolation.
+        # We build fast-eval subsets first, then blacklist them from the training dataset.
+        if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
+            n_city = int(getattr(args, "fast_eval_n", 1024) or 1024)
+            seed_city = int(getattr(args, "fast_eval_seed", 0) or 0)
+
+            def _maybe_add_city(city: str, roots: list[str] | None, slices: list[str] | None = None) -> None:
+                nonlocal fast_eval_exclude_keys
+                if not roots:
+                    return
+                expanded = _expand_roots(list(roots), slices)
+                if not expanded:
+                    return
+                ds_city, keys_city = _build_balanced_subset_dataset(
+                    roots=expanded,
+                    n_total=n_city,
+                    seed=seed_city,
+                    cache_root=args.cache_root,
+                )
+                if len(keys_city) <= 0:
+                    return
+                fast_eval_exclude_keys |= set(keys_city)
+                fast_eval_loaders[city] = DataLoader(
+                    ds_city,
+                    batch_size=int(args.fast_val_batch_size),
+                    shuffle=False,
+                    num_workers=int(args.fast_val_num_workers),
+                    pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
+                    drop_last=False,
+                )
+
+            _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
+            _maybe_add_city("pittsburgh", args.fast_eval_pittsburgh_roots, None)
+            _maybe_add_city("vegas", args.fast_eval_vegas_roots, None)
+
+            if fast_eval_loaders:
+                cities = ",".join(sorted(fast_eval_loaders.keys()))
+                print(
+                    f"Fast-eval (multi-city) enabled: every={int(args.fast_eval_every)} per_city_n={n_city} seed={seed_city} "
+                    f"cities=[{cities}] blacklist_train_keys={len(fast_eval_exclude_keys)}",
+                    flush=True,
+                )
+
         ds = ShardedNpzFeatureDataset(
             train_roots,
             max_samples=args.max_samples,
+            exclude_keys=(fast_eval_exclude_keys or None),
             cache_root=args.cache_root,
         )
         print(f"Dataset size: {len(ds)} kept samples | mode=paper_dit_dpm")
@@ -419,39 +472,7 @@ def main() -> None:
         elif int(getattr(args, "fast_val_every", 0) or 0) > 0:
             print("[fast-val] --fast-val-every set but --fast-val-roots not provided; fast validation disabled.")
 
-        # Multi-city fast evaluation (equal status), using balanced random subsets.
-        if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
-            n_city = int(getattr(args, "fast_eval_n", 1024) or 1024)
-            seed_city = int(getattr(args, "fast_eval_seed", 0) or 0)
-
-            def _maybe_add_city(city: str, roots: list[str] | None, slices: list[str] | None = None) -> None:
-                if not roots:
-                    return
-                expanded = _expand_roots(list(roots), slices)
-                if not expanded:
-                    return
-                ds_city = _build_balanced_subset_dataset(
-                    roots=expanded,
-                    n_total=n_city,
-                    seed=seed_city,
-                    cache_root=args.cache_root,
-                )
-                fast_eval_loaders[city] = DataLoader(
-                    ds_city,
-                    batch_size=int(args.fast_val_batch_size),
-                    shuffle=False,
-                    num_workers=int(args.fast_val_num_workers),
-                    pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
-                    drop_last=False,
-                )
-
-            _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
-            _maybe_add_city("pittsburgh", args.fast_eval_pittsburgh_roots, None)
-            _maybe_add_city("vegas", args.fast_eval_vegas_roots, None)
-
-            if fast_eval_loaders:
-                sizes = ", ".join([f"{k}={n_city}" for k in fast_eval_loaders.keys()])
-                print(f"Fast-eval (multi-city) enabled: every={int(args.fast_eval_every)} per_city_n={n_city} seed={seed_city} ({sizes})")
+        # (fast-eval loaders already built above for blacklist isolation)
     else:
         ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
         print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
