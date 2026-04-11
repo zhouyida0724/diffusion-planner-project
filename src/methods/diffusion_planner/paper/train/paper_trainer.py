@@ -787,18 +787,69 @@ def train_loop_paper_dit_xstart(
 
                     meta = batch.get("meta")
 
+                    def _jsonable(v: Any) -> Any:
+                        """Convert common tensor/numpy/path-ish values into JSON-serializable types."""
+
+                        try:
+                            import numpy as np  # type: ignore
+                        except Exception:  # pragma: no cover
+                            np = None  # type: ignore
+
+                        if v is None:
+                            return None
+                        if torch.is_tensor(v):
+                            vv = v.detach().cpu()
+                            if vv.numel() == 1:
+                                return vv.item()
+                            # Avoid gigantic dumps; keep small vectors readable.
+                            try:
+                                return vv.tolist()
+                            except Exception:
+                                return str(vv)
+                        if np is not None and isinstance(v, (getattr(np, "integer", ()), getattr(np, "floating", ()))):
+                            try:
+                                return v.item()
+                            except Exception:
+                                return float(v)
+                        if isinstance(v, (bytes, bytearray)):
+                            try:
+                                return v.decode("utf-8", errors="replace")
+                            except Exception:
+                                return str(v)
+                        # Path-like
+                        try:
+                            from pathlib import Path
+
+                            if isinstance(v, Path):
+                                return str(v)
+                        except Exception:
+                            pass
+                        # Basic python types are already JSONable.
+                        if isinstance(v, (str, int, float, bool)):
+                            return v
+                        # Lists/tuples: convert elements
+                        if isinstance(v, (list, tuple)):
+                            return [_jsonable(x) for x in v]
+                        # Dict: convert values
+                        if isinstance(v, dict):
+                            return {str(k): _jsonable(val) for k, val in v.items()}
+                        # Fallback
+                        return str(v)
+
                     def _meta_at(i: int) -> dict[str, Any]:
                         if isinstance(meta, list) and i < len(meta):
                             m = meta[i]
-                            return dict(m) if isinstance(m, dict) else {"meta": str(m)}
+                            if isinstance(m, dict):
+                                return {str(k): _jsonable(v) for k, v in m.items()}
+                            return {"meta": _jsonable(m)}
                         if isinstance(meta, dict):
                             out: dict[str, Any] = {}
                             for kk, vv in meta.items():
                                 try:
                                     if isinstance(vv, (list, tuple)) and i < len(vv):
-                                        out[kk] = vv[i]
+                                        out[kk] = _jsonable(vv[i])
                                     else:
-                                        out[kk] = vv
+                                        out[kk] = _jsonable(vv)
                                 except Exception:
                                     continue
                             return out
