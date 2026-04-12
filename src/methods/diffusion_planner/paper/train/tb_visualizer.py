@@ -360,6 +360,7 @@ def render_xy_scatter_with_context(
     marker: str = ".",
     alpha: float = 0.95,
     ego_past_xy: torch.Tensor | np.ndarray | None = None,
+    connect_line: bool = True,
 ) -> np.ndarray | None:
     """Render XY scatter over the same NPZ-style scene context (unified coordinates).
 
@@ -572,7 +573,7 @@ def render_xy_scatter_with_context(
             c=np.linspace(0.1, 1.0, xy_np.shape[0]),
             cmap="viridis",
         )
-        if xy_np.shape[0] >= 2:
+        if connect_line and xy_np.shape[0] >= 2:
             ax.plot(xy_np[:, 0], xy_np[:, 1], color="orange", linewidth=2.5, alpha=0.7)
 
         ax.set_title(title)
@@ -582,6 +583,47 @@ def render_xy_scatter_with_context(
         return _figure_to_rgb(fig)
     finally:
         plt.close(fig)
+
+
+def stitch_montage(
+    panels: list[np.ndarray | None],
+    *,
+    rows: int = 2,
+    cols: int = 2,
+    bg: int = 255,
+) -> np.ndarray | None:
+    """Stitch a small fixed-size montage (e.g., 2x2) from HWC RGB uint8 images.
+
+    Missing panels are filled with a blank canvas.
+    """
+
+    if rows <= 0 or cols <= 0:
+        raise ValueError("rows/cols must be positive")
+
+    # Find first valid panel to infer size.
+    first = None
+    for p in panels:
+        if p is not None:
+            first = p
+            break
+    if first is None:
+        return None
+    h, w = int(first.shape[0]), int(first.shape[1])
+    if first.ndim != 3 or first.shape[2] != 3:
+        raise ValueError(f"panel must be HWC RGB, got {first.shape}")
+
+    canvas = np.full((h * rows, w * cols, 3), int(bg), dtype=np.uint8)
+    for i in range(rows * cols):
+        r = i // cols
+        c = i % cols
+        p = panels[i] if i < len(panels) else None
+        if p is None:
+            continue
+        if p.shape[:2] != (h, w):
+            # Best-effort: if mismatched, skip instead of crashing.
+            continue
+        canvas[r * h : (r + 1) * h, c * w : (c + 1) * w, :] = p[:, :, :3]
+    return canvas
 
 
 def render_xy_scatter(
