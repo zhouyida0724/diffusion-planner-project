@@ -266,7 +266,8 @@ def train_loop_paper_dit_xstart(
     start_step = 0
     resume_ckpt = getattr(cfg, "resume_ckpt", None)
     if resume_ckpt:
-        ckpt = torch.load(str(resume_ckpt), map_location="cpu")
+        # Load directly onto the training device so optimizer state tensors match param device.
+        ckpt = torch.load(str(resume_ckpt), map_location=device)
         if isinstance(ckpt, dict):
             if "model_state" in ckpt:
                 model.load_state_dict(ckpt["model_state"], strict=True)
