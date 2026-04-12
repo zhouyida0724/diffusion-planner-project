@@ -229,6 +229,8 @@ def train_loop_paper_dit_xstart(
     max_grad_norm: Optional[float] = 1.0,
     fast_val_loader: Optional[DataLoader] = None,
     fast_val_every: int = 0,
+    fast_eval_loaders: Optional[dict[str, DataLoader]] = None,
+    fast_eval_every: int = 0,
 ) -> Path:
     """Train paper DiT with x_start objective under VP-SDE.
 
@@ -245,6 +247,8 @@ def train_loop_paper_dit_xstart(
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
+    spike_path = exp_dir / "spike_dump.jsonl"
+
     tb = None
     tb_enable = bool(getattr(cfg, "tb_enable", False))
     tb_every = int(getattr(cfg, "tb_every", 0) or 0)
@@ -254,6 +258,28 @@ def train_loop_paper_dit_xstart(
     tb_sampler_steps = max(1, int(getattr(cfg, "tb_sampler_steps", tb_denoise_k) or tb_denoise_k))
     tb_image_size = int(getattr(cfg, "tb_image_size", 800) or 800)
     tb_warned_disabled = False
+
+    # Optimizer
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    # Optional resume
+    start_step = 0
+    resume_ckpt = getattr(cfg, "resume_ckpt", None)
+    if resume_ckpt:
+        # Load directly onto the training device so optimizer state tensors match param device.
+        ckpt = torch.load(str(resume_ckpt), map_location=device)
+        if isinstance(ckpt, dict):
+            if "model_state" in ckpt:
+                model.load_state_dict(ckpt["model_state"], strict=True)
+            if "optimizer_state" in ckpt:
+                try:
+                    opt.load_state_dict(ckpt["optimizer_state"])
+                except Exception as e:
+                    print(f"[resume] optimizer state load failed: {e}; continuing with fresh optimizer", flush=True)
+            start_step = int(ckpt.get("step", 0)) + 1
+            print(f"[resume] loaded {resume_ckpt}; start_step={start_step}", flush=True)
+        else:
+            print(f"[resume] invalid checkpoint payload type: {type(ckpt)}; ignoring resume", flush=True)
     if tb_enable and SummaryWriter is not None:
         try:
             tb = SummaryWriter(log_dir=str(exp_dir / "tb"))
@@ -266,7 +292,29 @@ def train_loop_paper_dit_xstart(
     elif tb_enable and SummaryWriter is None:
         print("[tb] disabled: torch.utils.tensorboard is unavailable in this environment", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # (optimizer created above; may have been resumed)
+
+    def _lr_for_step(step_i: int) -> float:
+        """Compute LR for this step based on cfg.* schedule knobs."""
+
+        base_lr = float(cfg.lr)
+        sched = str(getattr(cfg, "lr_schedule", "constant") or "constant").lower()
+        warmup = int(getattr(cfg, "lr_warmup_steps", 0) or 0)
+
+        if warmup > 0 and step_i < warmup:
+            return base_lr * float(step_i + 1) / float(max(warmup, 1))
+
+        if sched == "cosine":
+            import math
+
+            min_ratio = float(getattr(cfg, "lr_min_ratio", 1.0) or 1.0)
+            min_lr = base_lr * min_ratio
+            denom = max(int(cfg.steps) - warmup, 1)
+            prog = float(step_i - warmup) / float(denom)
+            prog = max(0.0, min(1.0, prog))
+            return float(min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * prog)))
+
+        return base_lr
 
     # AMP (stability-first):
     # - bf16 autocast (preferred): typically stable without GradScaler.
@@ -313,7 +361,7 @@ def train_loop_paper_dit_xstart(
 
     model.train()
     t0 = time.time()
-    step = 0
+    step = int(start_step)
     loader_it = iter(train_loader)
 
     Pn = int(model.config.predicted_neighbor_num)
@@ -324,6 +372,214 @@ def train_loop_paper_dit_xstart(
     # -----------------
     fast_val_every = int(fast_val_every or 0)
     fast_val_path = exp_dir / "fast_val.jsonl"
+
+    # New: multi-domain fast evaluation (city-equal) with macro-average.
+    fast_eval_every = int(fast_eval_every or 0)
+    fast_eval_path = exp_dir / "fast_eval.jsonl"
+
+    def _run_fast_eval(step_i: int) -> None:
+        if not fast_eval_loaders or fast_eval_every <= 0:
+            return
+
+        fast_eval_mode = str(getattr(cfg, "fast_eval_mode", "proxy") or "proxy")
+        if fast_eval_mode not in ("proxy", "sampler"):
+            fast_eval_mode = "proxy"
+
+        # NOTE: proxy mode historically used train-mode per request.
+        # Sampler mode must match inference, so we run in eval() temporarily.
+        was_training = model.training
+        if fast_eval_mode == "sampler":
+            model.eval()
+        else:
+            model.train()  # keep train-mode for legacy proxy
+        t_eval0 = time.time()
+
+        horizon_idxs = [9, 29, 49, 79]
+        alpha_planning_loss = float(getattr(cfg, "alpha_planning_loss", 1.0) or 1.0)
+
+        per_city: dict[str, dict[str, float]] = {}
+
+        def _eval_one(loader: DataLoader) -> tuple[dict[str, float], int]:
+            n_total = 0
+            sum_metrics: dict[str, float] = {}
+            with torch.no_grad():
+                for batch in loader:
+                    batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+                    B = int(batch["ego_current_state"].shape[0])
+
+                    if fast_eval_mode == "proxy":
+                        # --- teacher-forced proxy: one-step x0 prediction at t=0 ---
+                        x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                        x0n = model.config.state_normalizer(x0_4)
+
+                        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                            batch,
+                            predicted_neighbor_num=Pn,
+                            future_len=Tf,
+                        )
+
+                        x0n_masked = x0n.clone()
+                        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+
+                        t = torch.zeros((B,), device=device, dtype=torch.float32)
+                        inputs = {
+                            "ego_current_state": batch["ego_current_state"],
+                            "neighbor_agents_past": batch["neighbor_agents_past"],
+                            "static_objects": batch["static_objects"],
+                            "lanes": batch["lanes"],
+                            "lanes_speed_limit": batch["lanes_speed_limit"],
+                            "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                            "route_lanes": batch["route_lanes"],
+                            "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                            "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                            "sampled_trajectories": x0n_masked,
+                            "diffusion_time": t,
+                        }
+
+                        with autocast_ctx:
+                            _, dec_out = model(inputs)
+                        pred = dec_out["score"]  # [B,P,1+T,4] (normalized)
+
+                        # val loss proxy (future-only, official masking)
+                        pred_fut = pred[:, :, 1:, :]
+                        gt_fut = x0n_masked[:, :, 1:, :]
+                        dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
+                        ego_loss = dpm_loss[:, 0, :].mean()
+                        nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                        nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                        val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
+
+                        # ADE/FDE on ego (x,y)
+                        pred_x0 = model.config.state_normalizer.inverse(pred)
+                        pred_ego_xy = pred_x0[:, 0, 1:, :2]
+                    else:
+                        # --- sampler mode: run inference sampler (matches closed-loop) ---
+                        steps_s = int(getattr(cfg, "fast_eval_diffusion_steps", 10) or 10)
+                        inputs = {
+                            "ego_current_state": batch["ego_current_state"],
+                            "neighbor_agents_past": batch["neighbor_agents_past"],
+                            "static_objects": batch["static_objects"],
+                            "lanes": batch["lanes"],
+                            "lanes_speed_limit": batch["lanes_speed_limit"],
+                            "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                            "route_lanes": batch["route_lanes"],
+                            "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                            "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                            "diffusion_steps": steps_s,
+                        }
+                        with autocast_ctx:
+                            _, dec_out = model(inputs)
+                        # dec_out["prediction"]: [B,P,T,4] in inverse space
+                        pred_raw = dec_out["prediction"]  # [B,P,T,4] raw
+                        pred_ego_xy = pred_raw[:, 0, :, :2]
+
+                        # In sampler mode we still want a per-city "loss-like" scalar that is
+                        # consistent with inference. We compute an MSE in normalized space
+                        # between sampled prediction and GT (future only), using the same
+                        # neighbor validity masking as training.
+                        x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                        x0n = model.config.state_normalizer(x0_4)
+                        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                            batch,
+                            predicted_neighbor_num=Pn,
+                            future_len=Tf,
+                        )
+                        x0n_masked = x0n.clone()
+                        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+                        gt_fut_n = x0n_masked[:, :, 1:, :]  # [B,P,T,4]
+                        pred_fut_n = model.config.state_normalizer(pred_raw)  # [B,P,T,4]
+                        dpm_loss = torch.sum((pred_fut_n - gt_fut_n) ** 2, dim=-1)  # [B,P,T]
+                        ego_loss = dpm_loss[:, 0, :].mean()
+                        nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                        nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                        val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
+
+                    gt_ego_future = batch["ego_agent_future"]
+                    if gt_ego_future.shape[-2] == Tf + 1:
+                        gt_ego_future = gt_ego_future[:, 1:, :]
+                    gt_ego_xy = gt_ego_future[..., :2]
+
+                    ade_fde = _ade_fde_at_horizons(pred_ego_xy, gt_ego_xy, horizon_idxs)
+
+                    metrics_batch: dict[str, float] = {
+                        "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()) if torch.is_tensor(val_loss_proxy) else float("nan"),
+                    }
+                    metrics_batch.update(ade_fde)
+
+                    n_total += B
+                    for k, v in metrics_batch.items():
+                        sum_metrics[k] = sum_metrics.get(k, 0.0) + float(v) * B
+
+            if n_total <= 0:
+                return {}, 0
+            metrics = {k: (v / n_total) for k, v in sum_metrics.items()}
+            return metrics, n_total
+
+        # evaluate each city equally (no city is "main")
+        for city, loader in fast_eval_loaders.items():
+            metrics, n = _eval_one(loader)
+            if not metrics:
+                continue
+            metrics.update(
+                {
+                    "city": str(city),
+                    "step": int(step_i),
+                    "n": int(n),
+                    "wall_s": float(time.time() - t_eval0),
+                    "ts": time.time(),
+                }
+            )
+            per_city[str(city)] = dict(metrics)
+
+            parts = [f"{k}={metrics[k]:.6f}" for k in sorted(metrics.keys()) if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
+            print(f"[fast-eval] city={city} step {step_i:05d} | n={n} | " + " | ".join(parts), flush=True)
+
+            if tb is not None:
+                try:
+                    tb.add_scalar(f"fast_eval/{city}/val_loss_proxy", float(metrics.get("val_loss_proxy", float("nan"))), int(step_i))
+                    for k, v in metrics.items():
+                        if k.startswith("ade_") or k.startswith("fde_"):
+                            tb.add_scalar(f"fast_eval/{city}/{k}", float(v), int(step_i))
+                except Exception:
+                    pass
+
+            with fast_eval_path.open("a") as f:
+                f.write(json.dumps(metrics) + "\n")
+
+        # macro-average across cities (equal weight)
+        if per_city:
+            keys = [k for k in next(iter(per_city.values())).keys() if k.startswith(("val_loss_proxy", "ade_", "fde_"))]
+            macro: dict[str, float] = {}
+            for k in keys:
+                vals = [float(m[k]) for m in per_city.values() if k in m]
+                if vals:
+                    macro[k] = float(sum(vals) / len(vals))
+            macro_rec: dict[str, float | int | str] = {
+                "city": "macro",
+                "step": int(step_i),
+                "n": int(min(int(m.get("n", 0)) for m in per_city.values()) if per_city else 0),
+                "wall_s": float(time.time() - t_eval0),
+                "ts": time.time(),
+                **macro,
+            }
+
+            if tb is not None:
+                try:
+                    tb.add_scalar("fast_eval_macro/val_loss_proxy", float(macro.get("val_loss_proxy", float("nan"))), int(step_i))
+                    for k, v in macro.items():
+                        if k.startswith("ade_") or k.startswith("fde_"):
+                            tb.add_scalar(f"fast_eval_macro/{k}", float(v), int(step_i))
+                    tb.flush()
+                except Exception:
+                    pass
+
+            with fast_eval_path.open("a") as f:
+                f.write(json.dumps(macro_rec) + "\n")
+
+        # restore model mode
+        if fast_eval_mode == "sampler":
+            model.train(was_training)
 
     def _run_fast_val(step_i: int) -> None:
         if fast_val_loader is None or fast_val_every <= 0:
@@ -446,6 +702,10 @@ def train_loop_paper_dit_xstart(
     if fast_val_loader is not None and fast_val_every > 0:
         _run_fast_val(0)
 
+    # initial fast-eval at step 0
+    if fast_eval_loaders is not None and fast_eval_every > 0:
+        _run_fast_eval(0)
+
     profile_steps = int(getattr(cfg, "profile_steps", 0) or 0)
     profile_every = int(getattr(cfg, "profile_every", 0) or 0)
 
@@ -462,6 +722,9 @@ def train_loop_paper_dit_xstart(
     while step < cfg.steps:
         if fast_val_loader is not None and fast_val_every > 0 and (step % fast_val_every) == 0 and step != 0:
             _run_fast_val(step)
+
+        if fast_eval_loaders is not None and fast_eval_every > 0 and (step % fast_eval_every) == 0 and step != 0:
+            _run_fast_eval(step)
 
         step_t0 = time.time()
         breakdown: dict[str, Any] = {}
@@ -571,6 +834,150 @@ def train_loop_paper_dit_xstart(
         breakdown["ego_planning_loss"] = float(ego_planning_loss.detach().float().item())
         breakdown["neighbor_prediction_loss"] = float(neighbor_prediction_loss.detach().float().item())
         _assert_finite(loss, "loss")
+
+        # LR schedule (per-step)
+        lr_now = _lr_for_step(int(step))
+        for pg in opt.param_groups:
+            pg["lr"] = lr_now
+
+        # Spike dump (data/step diagnosis)
+        if bool(getattr(cfg, "spike_dump", False)) and int(step) >= int(getattr(cfg, "spike_start", 2000) or 2000):
+            try:
+                loss_val = float(loss.detach().float().cpu().item())
+                thresh = float(getattr(cfg, "spike_thresh", 0.9) or 0.9)
+                if loss_val >= thresh:
+                    topk = int(getattr(cfg, "spike_topk", 8) or 8)
+
+                    # per-sample ego/neighbor losses
+                    ego_per = dpm_loss[:, 0, :].mean(dim=1)  # [B]
+                    nb = dpm_loss[:, 1:, :]  # [B,P-1,T]
+                    valid = neighbors_future_valid
+                    valid_f = valid.to(dtype=nb.dtype)
+                    nb_sum = (nb * valid_f).sum(dim=(1, 2))
+                    nb_cnt = valid_f.sum(dim=(1, 2)).clamp(min=1.0)
+                    nb_per = nb_sum / nb_cnt
+                    total_per = ego_per + float(alpha_planning_loss) * nb_per
+
+                    k = min(int(topk), int(total_per.shape[0]))
+                    vals, idxs = torch.topk(total_per.detach().float().cpu(), k=k)
+
+                    meta = batch.get("meta")
+
+                    def _jsonable(v: Any) -> Any:
+                        """Convert common tensor/numpy/path-ish values into JSON-serializable types."""
+
+                        try:
+                            import numpy as np  # type: ignore
+                        except Exception:  # pragma: no cover
+                            np = None  # type: ignore
+
+                        if v is None:
+                            return None
+                        if torch.is_tensor(v):
+                            vv = v.detach().cpu()
+                            if vv.numel() == 1:
+                                return vv.item()
+                            # Avoid gigantic dumps; keep small vectors readable.
+                            try:
+                                return vv.tolist()
+                            except Exception:
+                                return str(vv)
+                        if np is not None and isinstance(v, (getattr(np, "integer", ()), getattr(np, "floating", ()))):
+                            try:
+                                return v.item()
+                            except Exception:
+                                return float(v)
+                        if isinstance(v, (bytes, bytearray)):
+                            try:
+                                return v.decode("utf-8", errors="replace")
+                            except Exception:
+                                return str(v)
+                        # Path-like
+                        try:
+                            from pathlib import Path
+
+                            if isinstance(v, Path):
+                                return str(v)
+                        except Exception:
+                            pass
+                        # Basic python types are already JSONable.
+                        if isinstance(v, (str, int, float, bool)):
+                            return v
+                        # Lists/tuples: convert elements
+                        if isinstance(v, (list, tuple)):
+                            return [_jsonable(x) for x in v]
+                        # Dict: convert values
+                        if isinstance(v, dict):
+                            return {str(k): _jsonable(val) for k, val in v.items()}
+                        # Fallback
+                        return str(v)
+
+                    def _meta_at(i: int) -> dict[str, Any]:
+                        if isinstance(meta, list) and i < len(meta):
+                            m = meta[i]
+                            if isinstance(m, dict):
+                                return {str(k): _jsonable(v) for k, v in m.items()}
+                            return {"meta": _jsonable(m)}
+                        if isinstance(meta, dict):
+                            out: dict[str, Any] = {}
+                            for kk, vv in meta.items():
+                                try:
+                                    if isinstance(vv, (list, tuple)) and i < len(vv):
+                                        out[kk] = _jsonable(vv[i])
+                                    else:
+                                        out[kk] = _jsonable(vv)
+                                except Exception:
+                                    continue
+                            return out
+                        return {}
+
+                    def _infer_city(shard_dir: Any) -> str | None:
+                        if shard_dir is None:
+                            return None
+                        s = str(shard_dir).lower()
+                        if "boston" in s:
+                            return "boston"
+                        if "pittsburgh" in s:
+                            return "pittsburgh"
+                        if "vegas" in s:
+                            return "vegas"
+                        return None
+
+                    rec = {
+                        "step": int(step),
+                        "loss": float(loss_val),
+                        "lr": float(lr_now),
+                        "alpha_planning_loss": float(alpha_planning_loss),
+                        "thresh": float(thresh),
+                        "topk": [],
+                        "ts": time.time(),
+                    }
+                    for rank, (v, j) in enumerate(zip(vals.tolist(), idxs.tolist())):
+                        m = _meta_at(int(j))
+                        shard_dir = m.get("shard_dir")
+                        rec["topk"].append(
+                            {
+                                "rank": int(rank),
+                                "total": float(v),
+                                "ego": float(ego_per[int(j)].detach().float().cpu().item()),
+                                "nb": float(nb_per[int(j)].detach().float().cpu().item()),
+                                "t": float(t[int(j)].detach().float().cpu().item()) if torch.is_tensor(t) else None,
+                                "sample_id": m.get("sample_id"),
+                                "shard_dir": shard_dir,
+                                "row_idx": m.get("row_idx"),
+                                "city": _infer_city(shard_dir),
+                            }
+                        )
+
+                    with spike_path.open("a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                    print(
+                        f"[spike] step {int(step):05d} loss={loss_val:.6f} lr={lr_now:.2e} "
+                        f"top0_total={rec['topk'][0]['total']:.6f} city={rec['topk'][0].get('city')}",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"[spike] dump failed: {e}", flush=True)
 
         # optim
         if _do_profile(step):
@@ -962,6 +1369,10 @@ def train_loop_paper_dit_xstart(
     # final fast-val at step=cfg.steps
     if fast_val_loader is not None and fast_val_every > 0:
         _run_fast_val(int(cfg.steps))
+
+    # final fast-eval at step=cfg.steps
+    if fast_eval_loaders is not None and fast_eval_every > 0:
+        _run_fast_eval(int(cfg.steps))
 
     latest = exp_dir / "checkpoint_latest.pt"
     try:

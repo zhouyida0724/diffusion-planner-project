@@ -40,12 +40,14 @@ class ShardedNpzFeatureDataset(Dataset):
         data_root: str | Path,
         *,
         max_samples: Optional[int] = None,
+        exclude_keys: Optional[set[tuple[str, int]]] = None,
         cache_root: str | Path = "outputs/cache/training_arrays",
         cache_max_open: int = 4,
     ):
         self.data_root = data_root
         self.cache_root = Path(cache_root)
         self.shards: list[ShardSpec] = discover_shards(data_root)
+        self.exclude_keys: set[tuple[str, int]] = set(exclude_keys or set())
 
         # NOTE: paper training MUST NOT fall back to compressed npz.
         # We only read from mmap-friendly arrays prepared by materialize_training_cache.py.
@@ -64,7 +66,14 @@ class ShardedNpzFeatureDataset(Dataset):
                     if obj.get("qc_hard_skip", False):
                         total_hard_skip += 1
                         continue
-                    self._index.append((s_idx, row, obj))
+
+                    # NOTE: arrays are stored for kept-only samples (after qc_hard_skip filtering),
+                    # in the same order as manifest lines after filtering. Therefore `row` is the
+                    # row index into cached arrays for this shard. If we exclude additional samples
+                    # (for leakage-free fast-eval), we MUST still increment `row` to keep alignment.
+                    key = (str(spec.shard_dir.resolve()), int(row))
+                    if key not in self.exclude_keys:
+                        self._index.append((s_idx, row, obj))
                     row += 1
                     if max_samples is not None and len(self._index) >= max_samples:
                         break

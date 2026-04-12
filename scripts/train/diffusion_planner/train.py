@@ -40,6 +40,7 @@ from src.methods.diffusion_planner.models.simple_mlp import SimpleFutureMLP
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner, PaperModelConfig
 from src.methods.diffusion_planner.paper.train import train_loop_paper_dit_xstart
 from src.methods.diffusion_planner.train.trainer import TrainConfig, train_loop, train_loop_diffusion_eps
+from torch.utils.data import ConcatDataset, Subset
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,6 +101,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cosine"])
+    p.add_argument("--lr-min-ratio", type=float, default=1.0, help="For cosine: lr_min = lr * lr_min_ratio")
+    p.add_argument("--lr-warmup-steps", type=int, default=0)
+    p.add_argument(
+        "--resume-ckpt",
+        type=str,
+        default=None,
+        help="Resume from a checkpoint_step_XXXXXX.pt produced by this trainer.",
+    )
     p.add_argument("--num-workers", type=int, default=2)
 
     # paper_dit_dpm loss weights
@@ -190,6 +200,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fast-val-batch-size", type=int, default=64)
     p.add_argument("--fast-val-num-workers", type=int, default=2)
 
+    # Multi-city fast evaluation (equal status). Each city uses the same N and the same schedule.
+    p.add_argument("--fast-eval-every", type=int, default=0, help="Run multi-city fast eval every N steps (0 disables).")
+    p.add_argument("--fast-eval-n", type=int, default=1024, help="Number of fast-eval samples per city.")
+    p.add_argument("--fast-eval-seed", type=int, default=0, help="Seed for deterministic fast-eval subset selection.")
+
+    p.add_argument(
+        "--fast-eval-mode",
+        type=str,
+        default="proxy",
+        choices=["proxy", "sampler"],
+        help="Fast-eval mode. proxy=t=0 one-step (cheap). sampler=run DPM sampler (matches inference; expensive).",
+    )
+    p.add_argument(
+        "--fast-eval-diffusion-steps",
+        type=int,
+        default=10,
+        help="When --fast-eval-mode=sampler, number of DPM sampler steps.",
+    )
+    p.add_argument(
+        "--fast-eval-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for fast-eval loaders (default: --fast-val-batch-size).",
+    )
+    p.add_argument(
+        "--fast-eval-num-workers",
+        type=int,
+        default=None,
+        help="Num workers for fast-eval loaders (default: --fast-val-num-workers).",
+    )
+
+    p.add_argument("--fast-eval-boston-roots", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-boston-slices", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-pittsburgh-roots", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-vegas-roots", type=str, nargs="+", default=None)
+
     p.add_argument(
         "--max-samples",
         type=int,
@@ -216,7 +262,93 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--tb-image-size", type=int, default=800, help="Best-effort render size for TB images.")
 
+    # loss spike dump (diagnosis)
+    p.add_argument("--spike-dump", action="store_true", help="Dump top-k samples when train loss spikes.")
+    p.add_argument("--spike-start", type=int, default=2000, help="Start dumping spikes after this step.")
+    p.add_argument("--spike-thresh", type=float, default=0.9, help="Dump when loss >= this threshold.")
+    p.add_argument("--spike-topk", type=int, default=8, help="How many top samples to dump per spike batch.")
+
     return p.parse_args()
+
+
+def _stable_int(s: str) -> int:
+    import hashlib
+
+    h = hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+    return int(h, 16)
+
+
+def _build_balanced_subset_dataset(
+    *,
+    roots: list[str],
+    n_total: int,
+    seed: int,
+    cache_root: str,
+) -> tuple[ConcatDataset, set[tuple[str, int]]]:
+    """Create a deterministic subset dataset with (roughly) equal samples from each root.
+
+    This is used for multi-city fast-eval so that each city is evaluated on the same number of samples,
+    without one partition dominating (e.g. always taking from p0 first).
+    """
+
+    if n_total <= 0:
+        raise ValueError("n_total must be > 0")
+    if not roots:
+        raise ValueError("roots is empty")
+
+    dss = []
+    perms: list[list[int]] = []
+    ptrs: list[int] = []
+    chosen_keys: set[tuple[str, int]] = set()
+    for r in roots:
+        ds_i = ShardedNpzFeatureDataset([r], max_samples=None, cache_root=cache_root)
+        dss.append(ds_i)
+        L = len(ds_i)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(seed) + _stable_int(r))
+        perm = torch.randperm(L, generator=g).tolist() if L > 0 else []
+        perms.append(perm)
+        ptrs.append(0)
+
+    m = len(dss)
+    base = n_total // m
+    rem = n_total % m
+    target = [base + (1 if i < rem else 0) for i in range(m)]
+
+    chosen: list[list[int]] = [[] for _ in range(m)]
+    # first pass: take target per root
+    for i in range(m):
+        take = min(target[i], len(perms[i]))
+        chosen[i].extend(perms[i][:take])
+        ptrs[i] = take
+
+    # redistribute any remaining budget to roots with remaining capacity
+    remaining = n_total - sum(len(x) for x in chosen)
+    while remaining > 0:
+        progressed = False
+        for i in range(m):
+            if remaining <= 0:
+                break
+            if ptrs[i] < len(perms[i]):
+                chosen[i].append(perms[i][ptrs[i]])
+                ptrs[i] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+
+    # Record unique sample keys for blacklist: (shard_dir, row_idx)
+    for ds_i, idxs in zip(dss, chosen):
+        for idx in idxs:
+            shard_idx, row_idx, _meta = ds_i._index[int(idx)]  # type: ignore[attr-defined]
+            spec = ds_i.shards[int(shard_idx)]
+            chosen_keys.add((str(spec.shard_dir.resolve()), int(row_idx)))
+
+    subsets = [Subset(ds_i, idxs) for ds_i, idxs in zip(dss, chosen) if len(idxs) > 0]
+    if not subsets:
+        # Fall back to empty concat (should not happen in practice)
+        return ConcatDataset([]), set()
+    return ConcatDataset(subsets), chosen_keys
 
 
 def _discover_slice_dirs(dataset_root: Path) -> list[Path]:
@@ -295,11 +427,57 @@ def main() -> None:
         raise SystemExit("No training roots provided. Use --train-roots (or legacy --data-root).")
 
     fast_val_loader = None
+    fast_eval_loaders: dict[str, DataLoader] = {}
+    fast_eval_exclude_keys: set[tuple[str, int]] = set()
 
     if args.mode == "paper_dit_dpm":
+        # Multi-city fast evaluation (equal status) + strict blacklist isolation.
+        # We build fast-eval subsets first, then blacklist them from the training dataset.
+        if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
+            n_city = int(getattr(args, "fast_eval_n", 1024) or 1024)
+            seed_city = int(getattr(args, "fast_eval_seed", 0) or 0)
+
+            def _maybe_add_city(city: str, roots: list[str] | None, slices: list[str] | None = None) -> None:
+                nonlocal fast_eval_exclude_keys
+                if not roots:
+                    return
+                expanded = _expand_roots(list(roots), slices)
+                if not expanded:
+                    return
+                ds_city, keys_city = _build_balanced_subset_dataset(
+                    roots=expanded,
+                    n_total=n_city,
+                    seed=seed_city,
+                    cache_root=args.cache_root,
+                )
+                if len(keys_city) <= 0:
+                    return
+                fast_eval_exclude_keys |= set(keys_city)
+                fast_eval_loaders[city] = DataLoader(
+                    ds_city,
+                    batch_size=int(getattr(args, "fast_eval_batch_size", None) or args.fast_val_batch_size),
+                    shuffle=False,
+                    num_workers=int(getattr(args, "fast_eval_num_workers", None) or args.fast_val_num_workers),
+                    pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
+                    drop_last=False,
+                )
+
+            _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
+            _maybe_add_city("pittsburgh", args.fast_eval_pittsburgh_roots, None)
+            _maybe_add_city("vegas", args.fast_eval_vegas_roots, None)
+
+            if fast_eval_loaders:
+                cities = ",".join(sorted(fast_eval_loaders.keys()))
+                print(
+                    f"Fast-eval (multi-city) enabled: every={int(args.fast_eval_every)} per_city_n={n_city} seed={seed_city} "
+                    f"cities=[{cities}] blacklist_train_keys={len(fast_eval_exclude_keys)}",
+                    flush=True,
+                )
+
         ds = ShardedNpzFeatureDataset(
             train_roots,
             max_samples=args.max_samples,
+            exclude_keys=(fast_eval_exclude_keys or None),
             cache_root=args.cache_root,
         )
         print(f"Dataset size: {len(ds)} kept samples | mode=paper_dit_dpm")
@@ -334,6 +512,8 @@ def main() -> None:
                 print("[fast-val] No fast-val roots expanded; fast validation disabled.")
         elif int(getattr(args, "fast_val_every", 0) or 0) > 0:
             print("[fast-val] --fast-val-every set but --fast-val-roots not provided; fast validation disabled.")
+
+        # (fast-eval loaders already built above for blacklist isolation)
     else:
         ds = ShardedNpzDataset(train_roots, max_samples=args.max_samples)
         print(f"Dataset size: {len(ds)} kept samples | x_dim={ds.x_dim} | y_T={ds.y_T}")
@@ -351,6 +531,9 @@ def main() -> None:
         steps=args.steps,
         batch_size=args.batch_size,
         lr=args.lr,
+        lr_schedule=str(getattr(args, "lr_schedule", "constant")),
+        lr_min_ratio=float(getattr(args, "lr_min_ratio", 1.0)),
+        lr_warmup_steps=int(getattr(args, "lr_warmup_steps", 0) or 0),
         num_workers=args.num_workers,
         log_every=args.log_every,
         ckpt_every=args.ckpt_every,
@@ -374,6 +557,19 @@ def main() -> None:
         tb_denoise_mode=str(getattr(args, "tb_denoise_mode", "t_sweep")),
         tb_sampler_steps=int(getattr(args, "tb_sampler_steps", args.tb_denoise_k)),
         tb_image_size=int(args.tb_image_size),
+
+        # spike dump
+        spike_dump=bool(getattr(args, "spike_dump", False)),
+        spike_start=int(getattr(args, "spike_start", 2000) or 2000),
+        spike_thresh=float(getattr(args, "spike_thresh", 0.9) or 0.9),
+        spike_topk=int(getattr(args, "spike_topk", 8) or 8),
+
+        # fast-eval behavior
+        fast_eval_mode=str(getattr(args, "fast_eval_mode", "proxy") or "proxy"),
+        fast_eval_diffusion_steps=int(getattr(args, "fast_eval_diffusion_steps", 10) or 10),
+
+        # resume
+        resume_ckpt=str(getattr(args, "resume_ckpt", None)) if getattr(args, "resume_ckpt", None) else None,
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.
@@ -418,6 +614,8 @@ def main() -> None:
             train_loader=dl,
             fast_val_loader=fast_val_loader,
             fast_val_every=int(getattr(args, "fast_val_every", 0) or 0),
+            fast_eval_loaders=(fast_eval_loaders or None),
+            fast_eval_every=int(getattr(args, "fast_eval_every", 0) or 0),
         )
     else:
         raise SystemExit(f"Unknown mode: {args.mode}")
