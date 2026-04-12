@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from contextlib import nullcontext
 
 try:
@@ -310,7 +311,9 @@ def train_loop_paper_dit_xstart(
             print(f"[resume] invalid checkpoint payload type: {type(ckpt)}; ignoring resume", flush=True)
     if tb_enable and SummaryWriter is not None:
         try:
-            tb = SummaryWriter(log_dir=str(exp_dir / "tb"))
+            # TensorBoard sometimes gets confused when multiple event files share the same base name
+            # and one gets an auto-suffix like ".1". Make filenames unique per process start.
+            tb = SummaryWriter(log_dir=str(exp_dir / "tb"), filename_suffix=f".{uuid.uuid4().hex[:8]}")
             tb.add_text("meta/exp_name", str(cfg.exp_name), 0)
             tb.add_text("meta/mode", "paper_dit_dpm", 0)
             tb.add_text("meta/tb_image_logging", f"enabled every={tb_every} samples={tb_num_samples} denoise_k={tb_denoise_k}", 0)
@@ -384,7 +387,7 @@ def train_loop_paper_dit_xstart(
             print("[tb] SummaryWriter unavailable (torch.utils.tensorboard not installed); skipping TensorBoard logs.", flush=True)
         else:
             tb_dir = getattr(cfg, "tb_dir", None) or str(exp_dir / "tb")
-            writer = SummaryWriter(log_dir=tb_dir)
+            writer = SummaryWriter(log_dir=tb_dir, filename_suffix=f".{uuid.uuid4().hex[:8]}")
             print(f"[tb] writing TensorBoard logs to: {tb_dir}", flush=True)
 
     model.train()
