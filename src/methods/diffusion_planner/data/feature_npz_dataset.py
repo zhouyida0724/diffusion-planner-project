@@ -156,6 +156,20 @@ class ShardedNpzFeatureDataset(Dataset):
             shard_name = parts[-1]
             return self.cache_root / "train_data_boston150w" / part_dir / shard_name
 
+        # Pittsburgh 200k partitions (p0..p4)
+        if "pittsburgh_200k" in parts:
+            i = parts.index("pittsburgh_200k")
+            part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
+            shard_name = parts[-1]
+            return self.cache_root / "pittsburgh_200k" / part_dir / shard_name
+
+        # Vegas 200k partitions (p0..p4)
+        if "vegas_200k" in parts:
+            i = parts.index("vegas_200k")
+            part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
+            shard_name = parts[-1]
+            return self.cache_root / "vegas_200k" / part_dir / shard_name
+
         # generic fallback: use shard dir name only
         return self.cache_root / "unknown" / parts[-1]
 
