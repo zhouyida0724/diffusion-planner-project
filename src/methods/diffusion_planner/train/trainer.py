@@ -92,6 +92,10 @@ class TrainConfig:
     spike_thresh: float = 0.9
     spike_topk: int = 8
 
+    # resume (optional)
+    # Path to a checkpoint payload produced by this trainer, e.g. checkpoint_step_XXXXXX.pt
+    resume_ckpt: str | None = None
+
 
 def seed_everything(seed: int) -> None:
     import random

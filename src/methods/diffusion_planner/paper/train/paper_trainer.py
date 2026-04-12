@@ -258,6 +258,27 @@ def train_loop_paper_dit_xstart(
     tb_sampler_steps = max(1, int(getattr(cfg, "tb_sampler_steps", tb_denoise_k) or tb_denoise_k))
     tb_image_size = int(getattr(cfg, "tb_image_size", 800) or 800)
     tb_warned_disabled = False
+
+    # Optimizer
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    # Optional resume
+    start_step = 0
+    resume_ckpt = getattr(cfg, "resume_ckpt", None)
+    if resume_ckpt:
+        ckpt = torch.load(str(resume_ckpt), map_location="cpu")
+        if isinstance(ckpt, dict):
+            if "model_state" in ckpt:
+                model.load_state_dict(ckpt["model_state"], strict=True)
+            if "optimizer_state" in ckpt:
+                try:
+                    opt.load_state_dict(ckpt["optimizer_state"])
+                except Exception as e:
+                    print(f"[resume] optimizer state load failed: {e}; continuing with fresh optimizer", flush=True)
+            start_step = int(ckpt.get("step", 0)) + 1
+            print(f"[resume] loaded {resume_ckpt}; start_step={start_step}", flush=True)
+        else:
+            print(f"[resume] invalid checkpoint payload type: {type(ckpt)}; ignoring resume", flush=True)
     if tb_enable and SummaryWriter is not None:
         try:
             tb = SummaryWriter(log_dir=str(exp_dir / "tb"))
@@ -270,7 +291,7 @@ def train_loop_paper_dit_xstart(
     elif tb_enable and SummaryWriter is None:
         print("[tb] disabled: torch.utils.tensorboard is unavailable in this environment", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # (optimizer created above; may have been resumed)
 
     def _lr_for_step(step_i: int) -> float:
         """Compute LR for this step based on cfg.* schedule knobs."""
@@ -339,7 +360,7 @@ def train_loop_paper_dit_xstart(
 
     model.train()
     t0 = time.time()
-    step = 0
+    step = int(start_step)
     loader_it = iter(train_loader)
 
     Pn = int(model.config.predicted_neighbor_num)

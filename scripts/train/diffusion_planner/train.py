@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cosine"])
     p.add_argument("--lr-min-ratio", type=float, default=1.0, help="For cosine: lr_min = lr * lr_min_ratio")
     p.add_argument("--lr-warmup-steps", type=int, default=0)
+    p.add_argument(
+        "--resume-ckpt",
+        type=str,
+        default=None,
+        help="Resume from a checkpoint_step_XXXXXX.pt produced by this trainer.",
+    )
     p.add_argument("--num-workers", type=int, default=2)
 
     # paper_dit_dpm loss weights
@@ -531,6 +537,9 @@ def main() -> None:
         spike_start=int(getattr(args, "spike_start", 2000) or 2000),
         spike_thresh=float(getattr(args, "spike_thresh", 0.9) or 0.9),
         spike_topk=int(getattr(args, "spike_topk", 8) or 8),
+
+        # resume
+        resume_ckpt=str(getattr(args, "resume_ckpt", None)) if getattr(args, "resume_ckpt", None) else None,
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.
