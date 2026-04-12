@@ -471,8 +471,29 @@ def train_loop_paper_dit_xstart(
                         with autocast_ctx:
                             _, dec_out = model(inputs)
                         # dec_out["prediction"]: [B,P,T,4] in inverse space
-                        pred_ego_xy = dec_out["prediction"][:, 0, :, :2]
-                        val_loss_proxy = torch.tensor(float("nan"), device=device)
+                        pred_raw = dec_out["prediction"]  # [B,P,T,4] raw
+                        pred_ego_xy = pred_raw[:, 0, :, :2]
+
+                        # In sampler mode we still want a per-city "loss-like" scalar that is
+                        # consistent with inference. We compute an MSE in normalized space
+                        # between sampled prediction and GT (future only), using the same
+                        # neighbor validity masking as training.
+                        x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                        x0n = model.config.state_normalizer(x0_4)
+                        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                            batch,
+                            predicted_neighbor_num=Pn,
+                            future_len=Tf,
+                        )
+                        x0n_masked = x0n.clone()
+                        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+                        gt_fut_n = x0n_masked[:, :, 1:, :]  # [B,P,T,4]
+                        pred_fut_n = model.config.state_normalizer(pred_raw)  # [B,P,T,4]
+                        dpm_loss = torch.sum((pred_fut_n - gt_fut_n) ** 2, dim=-1)  # [B,P,T]
+                        ego_loss = dpm_loss[:, 0, :].mean()
+                        nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                        nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                        val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
 
                     gt_ego_future = batch["ego_agent_future"]
                     if gt_ego_future.shape[-2] == Tf + 1:
