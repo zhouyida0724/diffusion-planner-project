@@ -205,6 +205,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fast-eval-n", type=int, default=1024, help="Number of fast-eval samples per city.")
     p.add_argument("--fast-eval-seed", type=int, default=0, help="Seed for deterministic fast-eval subset selection.")
 
+    p.add_argument(
+        "--fast-eval-mode",
+        type=str,
+        default="proxy",
+        choices=["proxy", "sampler"],
+        help="Fast-eval mode. proxy=t=0 one-step (cheap). sampler=run DPM sampler (matches inference; expensive).",
+    )
+    p.add_argument(
+        "--fast-eval-diffusion-steps",
+        type=int,
+        default=10,
+        help="When --fast-eval-mode=sampler, number of DPM sampler steps.",
+    )
+    p.add_argument(
+        "--fast-eval-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for fast-eval loaders (default: --fast-val-batch-size).",
+    )
+    p.add_argument(
+        "--fast-eval-num-workers",
+        type=int,
+        default=None,
+        help="Num workers for fast-eval loaders (default: --fast-val-num-workers).",
+    )
+
     p.add_argument("--fast-eval-boston-roots", type=str, nargs="+", default=None)
     p.add_argument("--fast-eval-boston-slices", type=str, nargs="+", default=None)
     p.add_argument("--fast-eval-pittsburgh-roots", type=str, nargs="+", default=None)
@@ -429,9 +455,9 @@ def main() -> None:
                 fast_eval_exclude_keys |= set(keys_city)
                 fast_eval_loaders[city] = DataLoader(
                     ds_city,
-                    batch_size=int(args.fast_val_batch_size),
+                    batch_size=int(getattr(args, "fast_eval_batch_size", None) or args.fast_val_batch_size),
                     shuffle=False,
-                    num_workers=int(args.fast_val_num_workers),
+                    num_workers=int(getattr(args, "fast_eval_num_workers", None) or args.fast_val_num_workers),
                     pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
                     drop_last=False,
                 )
@@ -537,6 +563,10 @@ def main() -> None:
         spike_start=int(getattr(args, "spike_start", 2000) or 2000),
         spike_thresh=float(getattr(args, "spike_thresh", 0.9) or 0.9),
         spike_topk=int(getattr(args, "spike_topk", 8) or 8),
+
+        # fast-eval behavior
+        fast_eval_mode=str(getattr(args, "fast_eval_mode", "proxy") or "proxy"),
+        fast_eval_diffusion_steps=int(getattr(args, "fast_eval_diffusion_steps", 10) or 10),
 
         # resume
         resume_ckpt=str(getattr(args, "resume_ckpt", None)) if getattr(args, "resume_ckpt", None) else None,

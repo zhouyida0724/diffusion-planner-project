@@ -92,6 +92,12 @@ class TrainConfig:
     spike_thresh: float = 0.9
     spike_topk: int = 8
 
+    # fast-eval mode (paper_dit_dpm)
+    # - proxy: one-step x0 prediction at t=0 (teacher-forced; cheap, NOT true inference)
+    # - sampler: run the same DPM sampler as inference and compute metrics on sampled trajectories
+    fast_eval_mode: str = "proxy"  # proxy|sampler
+    fast_eval_diffusion_steps: int = 10
+
     # resume (optional)
     # Path to a checkpoint payload produced by this trainer, e.g. checkpoint_step_XXXXXX.pt
     resume_ckpt: str | None = None

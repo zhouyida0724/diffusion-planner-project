@@ -381,7 +381,17 @@ def train_loop_paper_dit_xstart(
         if not fast_eval_loaders or fast_eval_every <= 0:
             return
 
-        model.train()  # keep train-mode per request
+        fast_eval_mode = str(getattr(cfg, "fast_eval_mode", "proxy") or "proxy")
+        if fast_eval_mode not in ("proxy", "sampler"):
+            fast_eval_mode = "proxy"
+
+        # NOTE: proxy mode historically used train-mode per request.
+        # Sampler mode must match inference, so we run in eval() temporarily.
+        was_training = model.training
+        if fast_eval_mode == "sampler":
+            model.eval()
+        else:
+            model.train()  # keep train-mode for legacy proxy
         t_eval0 = time.time()
 
         horizon_idxs = [9, 29, 49, 79]
@@ -396,54 +406,73 @@ def train_loop_paper_dit_xstart(
                 for batch in loader:
                     batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
-                    x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
-                    x0n = model.config.state_normalizer(x0_4)
+                    B = int(batch["ego_current_state"].shape[0])
 
-                    neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
-                        batch,
-                        predicted_neighbor_num=Pn,
-                        future_len=Tf,
-                    )
+                    if fast_eval_mode == "proxy":
+                        # --- teacher-forced proxy: one-step x0 prediction at t=0 ---
+                        x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                        x0n = model.config.state_normalizer(x0_4)
 
-                    x0n_masked = x0n.clone()
-                    x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+                        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                            batch,
+                            predicted_neighbor_num=Pn,
+                            future_len=Tf,
+                        )
 
-                    B = int(x0n_masked.shape[0])
-                    t = torch.zeros((B,), device=device, dtype=torch.float32)
+                        x0n_masked = x0n.clone()
+                        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
 
-                    inputs = {
-                        "ego_current_state": batch["ego_current_state"],
-                        "neighbor_agents_past": batch["neighbor_agents_past"],
-                        "static_objects": batch["static_objects"],
-                        "lanes": batch["lanes"],
-                        "lanes_speed_limit": batch["lanes_speed_limit"],
-                        "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
-                        "route_lanes": batch["route_lanes"],
-                        "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
-                        "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
-                        "sampled_trajectories": x0n_masked,
-                        "diffusion_time": t,
-                    }
+                        t = torch.zeros((B,), device=device, dtype=torch.float32)
+                        inputs = {
+                            "ego_current_state": batch["ego_current_state"],
+                            "neighbor_agents_past": batch["neighbor_agents_past"],
+                            "static_objects": batch["static_objects"],
+                            "lanes": batch["lanes"],
+                            "lanes_speed_limit": batch["lanes_speed_limit"],
+                            "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                            "route_lanes": batch["route_lanes"],
+                            "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                            "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                            "sampled_trajectories": x0n_masked,
+                            "diffusion_time": t,
+                        }
 
-                    with autocast_ctx:
-                        _, dec_out = model(inputs)
-                    pred = dec_out["score"]  # [B,P,1+T,4]
+                        with autocast_ctx:
+                            _, dec_out = model(inputs)
+                        pred = dec_out["score"]  # [B,P,1+T,4] (normalized)
 
-                    # val loss proxy (future-only, official masking)
-                    pred_fut = pred[:, :, 1:, :]
-                    gt_fut = x0n_masked[:, :, 1:, :]
-                    dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
-                    ego_loss = dpm_loss[:, 0, :].mean()
-                    nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
-                    nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
-                    val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
+                        # val loss proxy (future-only, official masking)
+                        pred_fut = pred[:, :, 1:, :]
+                        gt_fut = x0n_masked[:, :, 1:, :]
+                        dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
+                        ego_loss = dpm_loss[:, 0, :].mean()
+                        nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                        nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                        val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
 
-                    # ADE/FDE on ego (x,y)
-                    pred_x0 = model.config.state_normalizer.inverse(pred) if hasattr(model.config.state_normalizer, "inverse") else None
-                    if pred_x0 is None:
-                        pred_ego_xy = pred[:, 0, 1:, :2]
-                    else:
+                        # ADE/FDE on ego (x,y)
+                        pred_x0 = model.config.state_normalizer.inverse(pred)
                         pred_ego_xy = pred_x0[:, 0, 1:, :2]
+                    else:
+                        # --- sampler mode: run inference sampler (matches closed-loop) ---
+                        steps_s = int(getattr(cfg, "fast_eval_diffusion_steps", 10) or 10)
+                        inputs = {
+                            "ego_current_state": batch["ego_current_state"],
+                            "neighbor_agents_past": batch["neighbor_agents_past"],
+                            "static_objects": batch["static_objects"],
+                            "lanes": batch["lanes"],
+                            "lanes_speed_limit": batch["lanes_speed_limit"],
+                            "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                            "route_lanes": batch["route_lanes"],
+                            "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                            "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                            "diffusion_steps": steps_s,
+                        }
+                        with autocast_ctx:
+                            _, dec_out = model(inputs)
+                        # dec_out["prediction"]: [B,P,T,4] in inverse space
+                        pred_ego_xy = dec_out["prediction"][:, 0, :, :2]
+                        val_loss_proxy = torch.tensor(float("nan"), device=device)
 
                     gt_ego_future = batch["ego_agent_future"]
                     if gt_ego_future.shape[-2] == Tf + 1:
@@ -453,7 +482,7 @@ def train_loop_paper_dit_xstart(
                     ade_fde = _ade_fde_at_horizons(pred_ego_xy, gt_ego_xy, horizon_idxs)
 
                     metrics_batch: dict[str, float] = {
-                        "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()),
+                        "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()) if torch.is_tensor(val_loss_proxy) else float("nan"),
                     }
                     metrics_batch.update(ade_fde)
 
@@ -526,6 +555,10 @@ def train_loop_paper_dit_xstart(
 
             with fast_eval_path.open("a") as f:
                 f.write(json.dumps(macro_rec) + "\n")
+
+        # restore model mode
+        if fast_eval_mode == "sampler":
+            model.train(was_training)
 
     def _run_fast_val(step_i: int) -> None:
         if fast_val_loader is None or fast_val_every <= 0:
