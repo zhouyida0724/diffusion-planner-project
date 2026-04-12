@@ -547,7 +547,11 @@ def main() -> None:
         amp=args.amp,
         alpha_planning_loss=args.alpha_planning_loss,
         # tensorboard (scalar + image logging)
-        tensorboard=bool(getattr(args, "tensorboard", False)) or bool(args.tb_enable),
+        # NOTE: tb_enable already initializes a SummaryWriter in paper_trainer (and logs scalars).
+        # If we also set tensorboard=True here, paper_trainer would create a second SummaryWriter
+        # pointing at the same logdir, producing an events.*.1 file. TensorBoard's directory watcher
+        # often gets stuck on that .1 file and the UI shows a single point.
+        tensorboard=bool(getattr(args, "tensorboard", False)),
         tb_dir=getattr(args, "tb_dir", None),
         # richer image logging (paper_dit_dpm)
         tb_enable=bool(args.tb_enable),

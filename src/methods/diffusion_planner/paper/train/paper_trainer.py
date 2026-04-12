@@ -381,8 +381,10 @@ def train_loop_paper_dit_xstart(
     perf = _PerfTracker(exp_dir=exp_dir, cfg=cfg, device=device)
 
     # TensorBoard (optional)
+    # We already initialize `tb` above when tb_enable=True. Avoid creating a second SummaryWriter
+    # pointing at the same logdir, because it will produce events.*.1 and TensorBoard may get stuck.
     writer = None
-    if bool(getattr(cfg, "tensorboard", False)):
+    if bool(getattr(cfg, "tensorboard", False)) and tb is None:
         if SummaryWriter is None:
             print("[tb] SummaryWriter unavailable (torch.utils.tensorboard not installed); skipping TensorBoard logs.", flush=True)
         else:
