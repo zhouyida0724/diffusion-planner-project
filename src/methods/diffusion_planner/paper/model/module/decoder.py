@@ -77,13 +77,21 @@ class Decoder(nn.Module):
             out = self.dit(sampled_trajectories, diffusion_time, ego_neighbor_encoding, route_lanes, neighbor_current_mask)
             return {"score": out.reshape(B, P, -1, 4)}
 
-        # inference sampling: start from noisy trajectory but keep t=0 state constrained
+        # inference sampling: start from noisy trajectory but keep t=0 state constrained.
+        # IMPORTANT: DiT is trained in *normalized* state space (via StateNormalizer).
+        # Therefore sampling must also happen in normalized space. We normalize current
+        # states, sample x0 in normalized space, then inverse-normalize for output.
+
+        # Normalize current states (expects shape [B,P,1,4] for correct broadcasting).
+        current_states_norm = self._state_normalizer(current_states[:, :, None, :])[:, :, 0, :]
+
+        # Random noise for future states in normalized space.
         noise = torch.randn(B, P, self._future_len, 4, device=current_states.device) * 0.5
-        xT = torch.cat([current_states[:, :, None], noise], dim=2).reshape(B, P, -1)
+        xT = torch.cat([current_states_norm[:, :, None], noise], dim=2).reshape(B, P, -1)
 
         def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step: int):
             xt2 = xt.reshape(B, P, -1, 4)
-            xt2[:, :, 0, :] = current_states
+            xt2[:, :, 0, :] = current_states_norm
             return xt2.reshape(B, P, -1)
 
         diffusion_steps = int(inputs.get("diffusion_steps", 10))
@@ -161,6 +169,8 @@ class Decoder(nn.Module):
 
         # x0 currently is normalized in [B, P, (1+T), 4] (includes current state at index 0).
         x0_view = x0.reshape(B, P, -1, 4)
+        # Ensure the constrained current state is exactly preserved.
+        x0_view[:, :, 0, :] = current_states_norm
         x0_norm_fut = x0_view[:, :, 1:]
         x0_inv_fut = self._state_normalizer.inverse(x0_view)[:, :, 1:]
 
