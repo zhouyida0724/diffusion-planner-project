@@ -70,7 +70,12 @@ class PaperDiTDpmPlanner(AbstractPlanner):
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
         device = torch.device(self._device)
-        ckpt = torch.load(self._ckpt_path, map_location=device)
+        # PyTorch newer versions default `weights_only=True`, which breaks checkpoints
+        # that include non-tensor metadata (we rely on paper_config/cfg).
+        try:
+            ckpt = torch.load(self._ckpt_path, map_location=device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(self._ckpt_path, map_location=device)
         if not isinstance(ckpt, dict) or "model_state" not in ckpt:
             raise RuntimeError(f"Unexpected checkpoint format at {self._ckpt_path}")
 

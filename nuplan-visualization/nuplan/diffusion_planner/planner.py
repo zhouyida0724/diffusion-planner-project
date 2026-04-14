@@ -80,7 +80,12 @@ class DiffusionPlanner(AbstractPlanner):
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
         if self._ckpt_path is not None:
-            state_dict:Dict = torch.load(self._ckpt_path, map_location=self._device)
+            # PyTorch newer versions default `weights_only=True`, which can break older checkpoints
+            # that store non-tensor metadata.
+            try:
+                state_dict:Dict = torch.load(self._ckpt_path, map_location=self._device, weights_only=False)
+            except TypeError:
+                state_dict:Dict = torch.load(self._ckpt_path, map_location=self._device)
             
             if self._ema_enabled and "ema_state_dict" in state_dict:
                 state_dict = state_dict['ema_state_dict']
