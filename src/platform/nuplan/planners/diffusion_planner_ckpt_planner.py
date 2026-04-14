@@ -570,6 +570,9 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._route_roadblock_ids = None
         self._init_done = False
 
+        # SQLite connection reused for offline-style feature extraction (paper model path)
+        self._feature_conn: Optional[sqlite3.Connection] = None
+
         # Runtime debug (gated by env var)
         # Back-compat: DP_RUNTIME_DEBUG=1 enables all debug.
         # New flags:
