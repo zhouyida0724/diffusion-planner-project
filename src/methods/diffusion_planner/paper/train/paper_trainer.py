@@ -1161,7 +1161,9 @@ def train_loop_paper_dit_xstart(
                             x0n_masked_1 = x0n_1.clone()
                             x0n_masked_1[:, 1:, :, :][neighbor_mask_full_1] = 0.0
 
-                            enc_inputs_vis = {
+                            # IMPORTANT: match training/inference by applying observation normalization
+                            # to conditioning features before feeding the encoder/DiT sampler.
+                            enc_inputs_vis_raw = {
                                 "ego_current_state": batch1["ego_current_state"],
                                 "neighbor_agents_past": batch1["neighbor_agents_past"],
                                 "static_objects": batch1["static_objects"],
@@ -1169,9 +1171,17 @@ def train_loop_paper_dit_xstart(
                                 "lanes_speed_limit": batch1["lanes_speed_limit"],
                                 "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
                                 "route_lanes": batch1["route_lanes"],
-                                "route_lanes_speed_limit": batch1.get("route_lanes_speed_limit"),
-                                "route_lanes_has_speed_limit": batch1.get("route_lanes_has_speed_limit"),
                             }
+                            if batch1.get("route_lanes_speed_limit") is not None:
+                                enc_inputs_vis_raw["route_lanes_speed_limit"] = batch1["route_lanes_speed_limit"]
+                            if batch1.get("route_lanes_has_speed_limit") is not None:
+                                enc_inputs_vis_raw["route_lanes_has_speed_limit"] = batch1["route_lanes_has_speed_limit"]
+
+                            enc_inputs_vis = (
+                                model.config.observation_normalizer(enc_inputs_vis_raw)
+                                if hasattr(model.config, "observation_normalizer")
+                                else enc_inputs_vis_raw
+                            )
                             enc_vis = model.encoder(enc_inputs_vis)
 
                             neighbors_past_1 = batch1["neighbor_agents_past"]
@@ -1231,7 +1241,7 @@ def train_loop_paper_dit_xstart(
                                         model_type=model.decoder.decoder.dit.model_type,
                                         model_kwargs={
                                             "cross_c": enc_vis["encoding"],
-                                            "route_lanes": batch1["route_lanes"],
+                                            "route_lanes": enc_inputs_vis.get("route_lanes", batch1["route_lanes"]),
                                             "neighbor_current_mask": neighbor_current_mask_1,
                                         },
                                         guidance_type="uncond",
