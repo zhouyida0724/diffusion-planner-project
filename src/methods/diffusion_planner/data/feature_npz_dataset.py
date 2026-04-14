@@ -31,7 +31,79 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .npz_dataset import ShardSpec, discover_shards
+from .npz_dataset import ShardSpec
+
+
+def _discover_feature_shards_one(data_root: Path) -> List[ShardSpec]:
+    """Discover shard directories for feature dataset.
+
+    Supports both:
+      1) exporter outputs: shard_*/data.npz + manifest.jsonl
+      2) cache-only shards: shard_*/arrays/*.npy + manifest_kept.jsonl
+
+    This dataset only uses the manifest for indexing and reads features from
+    mmap-friendly cache arrays, so we accept cache shards even without data.npz.
+    """
+
+    data_root = data_root.expanduser().resolve()
+
+    if (data_root / "shards").is_dir():
+        shards_root = data_root / "shards"
+    else:
+        shards_root = data_root
+
+    def _mk_spec(d: Path) -> ShardSpec | None:
+        # Prefer kept manifest if present (already qc_hard_skip filtered).
+        manifest_kept = d / "manifest_kept.jsonl"
+        manifest = d / "manifest.jsonl"
+        arrays_dir = d / "arrays"
+        npz_path = d / "data.npz"
+
+        if arrays_dir.is_dir() and manifest_kept.is_file():
+            return ShardSpec(shard_dir=d, npz_path=npz_path, manifest_path=manifest_kept)
+        if npz_path.is_file() and manifest.is_file():
+            return ShardSpec(shard_dir=d, npz_path=npz_path, manifest_path=manifest)
+        return None
+
+    # direct shard directory
+    spec = _mk_spec(shards_root)
+    if spec is not None:
+        return [spec]
+
+    shard_dirs = sorted([p for p in shards_root.glob("shard_*") if p.is_dir()])
+    out: List[ShardSpec] = []
+    for d in shard_dirs:
+        s = _mk_spec(d)
+        if s is not None:
+            out.append(s)
+
+    if not out:
+        raise FileNotFoundError(
+            f"No shards found under {data_root}. Expected either shard_*/data.npz+manifest.jsonl or shard_*/arrays+manifest_kept.jsonl"
+        )
+    return out
+
+
+def discover_feature_shards(data_roots: List[str | Path] | str | Path) -> List[ShardSpec]:
+    """Discover shards from one or many roots (feature dataset).
+
+    Unlike the generic discover_shards(), this also supports cache-only shards.
+    """
+
+    if isinstance(data_roots, (str, Path)):
+        roots = [data_roots]
+    else:
+        roots = list(data_roots)
+
+    specs: List[ShardSpec] = []
+    for r in roots:
+        specs.extend(_discover_feature_shards_one(Path(r)))
+
+    uniq: Dict[Path, ShardSpec] = {}
+    for s in specs:
+        uniq[s.shard_dir.resolve()] = s
+
+    return [uniq[k] for k in sorted(uniq.keys())]
 
 
 class ShardedNpzFeatureDataset(Dataset):
@@ -46,7 +118,7 @@ class ShardedNpzFeatureDataset(Dataset):
     ):
         self.data_root = data_root
         self.cache_root = Path(cache_root)
-        self.shards: list[ShardSpec] = discover_shards(data_root)
+        self.shards: list[ShardSpec] = discover_feature_shards(data_root)
         self.exclude_keys: set[tuple[str, int]] = set(exclude_keys or set())
 
         # NOTE: paper training MUST NOT fall back to compressed npz.
@@ -138,6 +210,10 @@ class ShardedNpzFeatureDataset(Dataset):
             (we materialize 200k caches under train_data_boston150w to avoid
              name collisions like shard_000 across partitions).
         """
+
+        # Cache-only shards: shard_dir already *is* the cache dir.
+        if (Path(spec.shard_dir) / "arrays").is_dir():
+            return Path(spec.shard_dir)
 
         parts = list(Path(spec.shard_dir).parts)
 
