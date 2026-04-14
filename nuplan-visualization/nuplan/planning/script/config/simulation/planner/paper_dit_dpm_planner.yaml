@@ -1,0 +1,24 @@
+paper_dit_dpm_planner:
+  _target_: nuplan.diffusion_planner.paper_dit_dpm_planner.PaperDiTDpmPlanner
+  _convert_: "all"
+
+  # Trained checkpoint (paper_dit_dpm)
+  ckpt_path: /workspace/outputs/training/mix_3city_full_e10_bs64_bf16_gpu_20260413_0026_resume137667_lr3_samplerFE2000_n256_nw2/checkpoint_step_458889.pt
+
+  # Sampler settings
+  diffusion_steps: 10
+
+  past_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+    num_poses: 20
+    time_horizon: 2
+
+  future_trajectory_sampling:
+    _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+    _convert_: "all"
+    num_poses: 80
+    time_horizon: 8
+
+  device: cuda
+
