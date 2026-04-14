@@ -541,8 +541,13 @@ def _build_neighbor_agents_past_from_history(
 class DiffusionPlannerCkpt(AbstractPlanner):
     """nuPlan planner that loads a repo-local checkpoint and predicts a trajectory."""
 
+    # We need the scenario object to locate the underlying nuPlan DB (log file) so we can
+    # reuse the offline extractor semantics at runtime.
+    requires_scenario: bool = True
+
     def __init__(
         self,
+        scenario: AbstractScenario,
         ckpt_path: str,
         past_trajectory_sampling: TrajectorySampling,
         future_trajectory_sampling: TrajectorySampling,
@@ -552,6 +557,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         sampling_steps: int = 10,
         **_: object,
     ):
+        self._scenario = scenario
         self._ckpt_path = str(ckpt_path)
         self._past_trajectory_sampling = past_trajectory_sampling
         self._future_trajectory_sampling = future_trajectory_sampling
