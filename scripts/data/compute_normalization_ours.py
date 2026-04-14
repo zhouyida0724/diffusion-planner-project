@@ -34,11 +34,14 @@ from typing import Iterable
 import numpy as np
 
 
-def _iter_arrays_dirs(cache_root: Path) -> Iterable[Path]:
-    # arrays dirs typically look like: .../p*/shard_*/arrays
-    for p in cache_root.rglob("arrays"):
-        if p.is_dir():
-            yield p
+def _iter_arrays_dirs(cache_roots: list[Path]) -> Iterable[Path]:
+    """Yield all arrays/ directories under one or more cache roots."""
+
+    for cache_root in cache_roots:
+        # arrays dirs typically look like: .../p*/shard_*/arrays
+        for p in cache_root.rglob("arrays"):
+            if p.is_dir():
+                yield p
 
 
 def _masked_reduce_sum_sumsq_count(x: np.ndarray, *, mask_rows_all_zero: bool = True) -> tuple[np.ndarray, np.ndarray, int]:
@@ -78,15 +81,34 @@ def _finalize_mean_std(sum_: np.ndarray, sumsq: np.ndarray, count: int, *, eps: 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cache-root", type=str, required=True, help="Root under which to search **/arrays/*.npy")
+    ap.add_argument(
+        "--cache-roots",
+        type=str,
+        nargs="+",
+        default=None,
+        help="One or more roots under which to search **/arrays/*.npy (preferred).",
+    )
+    ap.add_argument(
+        "--cache-root",
+        type=str,
+        default=None,
+        help="(Deprecated) Single root under which to search **/arrays/*.npy. Use --cache-roots instead.",
+    )
     ap.add_argument("--out", type=str, default="normalization_ours.json", help="Output JSON path")
     ap.add_argument("--max-arrays-dirs", type=int, default=0, help="If >0, only process first N arrays/ dirs")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    cache_root = Path(args.cache_root)
-    if not cache_root.exists():
-        raise SystemExit(f"cache_root not found: {cache_root}")
+    roots_raw = list(args.cache_roots or [])
+    if args.cache_root:
+        roots_raw.append(str(args.cache_root))
+    if not roots_raw:
+        raise SystemExit("No cache roots provided. Use --cache-roots (or deprecated --cache-root).")
+
+    cache_roots = [Path(r) for r in roots_raw]
+    for r in cache_roots:
+        if not r.exists():
+            raise SystemExit(f"cache_root not found: {r}")
 
     # Conditioning features (ObservationNormalizer expects these keys).
     obs_keys = [
@@ -114,13 +136,14 @@ def main() -> None:
     nb_sumsq = None
     nb_count = 0
 
-    arrays_dirs = list(_iter_arrays_dirs(cache_root))
+    arrays_dirs = list(_iter_arrays_dirs(cache_roots))
     arrays_dirs.sort()
     if int(args.max_arrays_dirs or 0) > 0:
         arrays_dirs = arrays_dirs[: int(args.max_arrays_dirs)]
 
     if args.verbose:
-        print(f"Found {len(arrays_dirs)} arrays/ dirs under {cache_root}")
+        roots_s = ", ".join([str(r) for r in cache_roots])
+        print(f"Found {len(arrays_dirs)} arrays/ dirs under: {roots_s}")
 
     for i, d in enumerate(arrays_dirs):
         # quick presence check
@@ -234,4 +257,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
