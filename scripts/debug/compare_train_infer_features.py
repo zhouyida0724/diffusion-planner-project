@@ -116,6 +116,21 @@ def main() -> int:
     ap.add_argument("--shard-dir", type=str, required=True)
     ap.add_argument("--index", type=int, default=None)
     ap.add_argument("--sample-id", type=str, default=None)
+    ap.add_argument(
+        "--db-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional override for manifest db_path (useful if you don't care about the original absolute path). "
+            "If set, we will connect to this sqlite DB instead of meta['db_path']."
+        ),
+    )
+    ap.add_argument(
+        "--location",
+        type=str,
+        default=None,
+        help="Optional override for manifest location (map name), e.g. us-ma-boston",
+    )
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--routing-mode", type=str, default="auto", help="Passed to extract_features (auto|raw)")
     ap.add_argument(
@@ -137,7 +152,7 @@ def main() -> int:
     manifest = _load_manifest(shard_dir)
     row_idx, meta = _pick_sample(manifest, index=args.index, sample_id=args.sample_id)
 
-    db_path_s = str(meta.get("db_path"))
+    db_path_s = str(args.db_path) if args.db_path is not None else str(meta.get("db_path"))
     # Apply optional prefix rewrites (useful when running inside a container with different mounts).
     for rule in list(args.db_path_rewrite or []):
         if "=" not in rule:
@@ -148,7 +163,7 @@ def main() -> int:
     db_path = Path(db_path_s)
     scene_token_hex = str(meta.get("scene_token_hex"))
     frame_index = int(meta.get("frame_index"))
-    location = str(meta.get("location"))
+    location = str(args.location) if args.location is not None else str(meta.get("location"))
 
     print(f"[compare] sample_id={meta.get('sample_id')} row_idx={row_idx}")
     print(f"[compare] db_path={db_path}")
