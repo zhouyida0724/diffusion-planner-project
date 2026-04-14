@@ -276,6 +276,14 @@ class PaperDiTDpmPlanner(AbstractPlanner):
                 pad = np.repeat(pred[-1:], expected_T - pred.shape[0], axis=0)
                 pred = np.concatenate([pred, pad], axis=0)
 
+        # Optional debug: mirror lateral axis in ego frame.
+        # Enable with DP_MIRROR_Y=1 to test suspected left/right coordinate mismatch.
+        if os.getenv("DP_MIRROR_Y", "0") not in ("", "0", "false", "False"):
+            # Mirror across x-axis: y -> -y, heading -> -heading.
+            # Since heading is represented as (cos, sin), we flip sin only.
+            pred[:, 1] *= -1.0
+            pred[:, 3] *= -1.0
+
         heading = np.arctan2(pred[:, 3], pred[:, 2])[..., None]
         traj = np.concatenate([pred[:, :2], heading], axis=-1)
         return transform_predictions_to_states(traj, ego_state_history, future_horizon, step_interval)
