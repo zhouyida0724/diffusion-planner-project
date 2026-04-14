@@ -1,6 +1,6 @@
 # Data files
 # NOTE: We also have python packages named `data/` under src/. Keep those tracked.
-data/
+/data/
 !src/methods/diffusion_planner/data/
 !src/methods/diffusion_planner/data/**
 

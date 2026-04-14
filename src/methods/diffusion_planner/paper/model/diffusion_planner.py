@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
@@ -49,6 +49,10 @@ class PaperModelConfig:
     state_mean: list[list[list[float]]] | None = None
     state_std: list[list[list[float]]] | None = None
 
+    # observation normalization: mapping key -> {mean: [...], std: [...]}
+    # Keys should match the inputs dict (e.g. ego_current_state, neighbor_agents_past, lanes, ...)
+    observation_norm: dict[str, dict[str, list[float]]] | None = None
+
     def build_state_normalizer(self) -> StateNormalizer:
         # mean/std for ego + neighbors (P = 1 + predicted_neighbor_num)
         if self.state_mean is None or self.state_std is None:
@@ -65,8 +69,19 @@ class PaperModelConfig:
         return StateNormalizer(mean, std)
 
     def build_observation_normalizer(self) -> ObservationNormalizer:
-        # no-op for now (kept for API parity)
-        return ObservationNormalizer({})
+        if not self.observation_norm:
+            return ObservationNormalizer({})
+        ndt: dict[str, dict[str, torch.Tensor]] = {}
+        for k, v in self.observation_norm.items():
+            if not isinstance(v, dict):
+                continue
+            if "mean" not in v or "std" not in v:
+                continue
+            ndt[str(k)] = {
+                "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                "std": torch.tensor(v["std"], dtype=torch.float32),
+            }
+        return ObservationNormalizer(ndt)
 
 
 class PaperDiffusionPlanner(nn.Module):
@@ -98,8 +113,11 @@ class PaperDiffusionPlanner(nn.Module):
         return self.decoder.decoder.sde
 
     def forward(self, inputs: dict) -> tuple[dict, dict]:
-        enc = self.encoder(inputs)
-        dec = self.decoder(enc, inputs)
+        # Normalize conditioning features (matches inference path).
+        # IMPORTANT: state normalization is handled explicitly in training and inside decoder sampling.
+        inputs_n = self.config.observation_normalizer(inputs) if hasattr(self.config, "observation_normalizer") else inputs
+        enc = self.encoder(inputs_n)
+        dec = self.decoder(enc, inputs_n)
         return enc, dec
 
     @torch.no_grad()
@@ -109,6 +127,8 @@ class PaperDiffusionPlanner(nn.Module):
         self.eval()
         inputs = dict(inputs)
         inputs["diffusion_steps"] = int(diffusion_steps)
+
+        inputs = self.config.observation_normalizer(inputs) if hasattr(self.config, "observation_normalizer") else inputs
 
         enc = self.encoder(inputs)
         # run decoder in eval mode
@@ -135,7 +155,8 @@ class PaperDiffusionPlanner(nn.Module):
         return {
             "kind": self.CKPT_KIND,
             "version": self.CKPT_VERSION,
-            "paper_config": self.config.__dict__,
+            # asdict() only serializes dataclass fields (avoids torch Tensor/Module attrs).
+            "paper_config": asdict(self.config),
         }
 
 
