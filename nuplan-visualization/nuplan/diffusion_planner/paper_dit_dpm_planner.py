@@ -285,6 +285,50 @@ class PaperDiTDpmPlanner(AbstractPlanner):
         inputs = self._planner_input_to_model_inputs(current_input)
         _, outputs = self._model(inputs)
 
+        # Debug check: is the model's first predicted point unrealistically far from origin?
+        # Enable with DP_CHECK_FIRST_POINT=1
+        if os.getenv("DP_CHECK_FIRST_POINT", "0") not in ("", "0", "false", "False"):
+            k = int(os.getenv("DP_CHECK_FIRST_POINT_K", "10"))
+            t = getattr(self, "_dp_first_point_ticks", 0)
+            if t < k:
+                try:
+                    ego_state = current_input.history.current_state[0]
+
+                    # Speed estimate (m/s)
+                    speed = None
+                    dcs = getattr(ego_state, "dynamic_car_state", None)
+                    if dcs is not None:
+                        for attr in ("speed",):
+                            if hasattr(dcs, attr):
+                                speed = float(getattr(dcs, attr))
+                                break
+                        if speed is None and hasattr(dcs, "rear_axle_velocity_2d"):
+                            v2 = getattr(dcs, "rear_axle_velocity_2d")
+                            if hasattr(v2, "magnitude"):
+                                speed = float(v2.magnitude())
+                    if speed is None:
+                        speed = 0.0
+
+                    dt = float(self._step_interval)
+                    exp_disp = speed * dt
+
+                    pred = outputs["prediction"][0, 0].detach().float().cpu().numpy()  # [T,4]
+                    p0 = pred[0, :2] if pred.shape[0] > 0 else np.array([np.nan, np.nan], dtype=np.float32)
+                    p1 = pred[1, :2] if pred.shape[0] > 1 else np.array([np.nan, np.nan], dtype=np.float32)
+                    p0n = float(np.linalg.norm(p0))
+                    p1n = float(np.linalg.norm(p1))
+
+                    ratio = (p1n / max(exp_disp, 1e-6)) if np.isfinite(p1n) else float("nan")
+                    print(
+                        "[DP_FIRST_POINT] "
+                        f"tick={t} speed={speed:.3f}m/s dt={dt:.3f}s exp_disp={exp_disp:.3f}m "
+                        f"p0=({p0[0]:.3f},{p0[1]:.3f}) |p0|={p0n:.3f} "
+                        f"p1=({p1[0]:.3f},{p1[1]:.3f}) |p1|={p1n:.3f} ratio={ratio:.2f}"
+                    )
+                except Exception:
+                    pass
+            setattr(self, "_dp_first_point_ticks", t + 1)
+
         # Lightweight debug to validate output space/time alignment.
         # Enable with DP_RUNTIME_DEBUG=1. Limit prints with DP_RUNTIME_DEBUG_K.
         if os.getenv("DP_RUNTIME_DEBUG", "0") not in ("", "0", "false", "False"):
