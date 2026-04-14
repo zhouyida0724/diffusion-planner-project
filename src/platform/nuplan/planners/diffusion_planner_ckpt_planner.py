@@ -615,7 +615,13 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._load_checkpoint_or_raise()
 
     def _load_checkpoint_or_raise(self) -> None:
-        ckpt = torch.load(self._ckpt_path, map_location="cpu")
+        # PyTorch 2.6 changed default `weights_only` to True, which can break loading
+        # older checkpoints that store non-tensor metadata (e.g., normalizer objects).
+        # Our checkpoints are trusted (repo-local), so we force weights_only=False when supported.
+        try:
+            ckpt = torch.load(self._ckpt_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(self._ckpt_path, map_location="cpu")
         if isinstance(ckpt, dict) and "model_state" not in ckpt and "model_state_dict" in ckpt:
             ckpt = dict(ckpt)
             ckpt["model_state"] = ckpt["model_state_dict"]
