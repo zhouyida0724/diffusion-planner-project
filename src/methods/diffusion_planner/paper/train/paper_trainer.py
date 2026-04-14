@@ -397,6 +397,10 @@ def train_loop_paper_dit_xstart(
     step = int(start_step)
     loader_it = iter(train_loader)
 
+    # When cfg.steps == 0 (eval-only runs), the training loop body never executes.
+    # Keep ckpt_path defined so we can still write checkpoint_latest or skip safely.
+    ckpt_path: Optional[Path] = None
+
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
 
@@ -1347,23 +1351,34 @@ def train_loop_paper_dit_xstart(
 
         step += 1
 
-    # final fast-val at step=cfg.steps
-    if fast_val_loader is not None and fast_val_every > 0:
-        _run_fast_val(int(cfg.steps))
+    # final fast-val / fast-eval at step=cfg.steps
+    # For cfg.steps == 0, we already ran the initial eval at step 0, so skip the final one.
+    if int(cfg.steps) > 0:
+        if fast_val_loader is not None and fast_val_every > 0:
+            _run_fast_val(int(cfg.steps))
 
-    # final fast-eval at step=cfg.steps
-    if fast_eval_loaders is not None and fast_eval_every > 0:
-        _run_fast_eval(int(cfg.steps))
+        if fast_eval_loaders is not None and fast_eval_every > 0:
+            _run_fast_eval(int(cfg.steps))
 
     latest = exp_dir / "checkpoint_latest.pt"
-    try:
-        if latest.is_symlink() or latest.exists():
-            latest.unlink()
-        latest.symlink_to(os.path.basename(ckpt_path))
-    except Exception:
-        import shutil
+    # If no checkpoint was written (e.g. cfg.steps==0), prefer linking to resume_ckpt.
+    if ckpt_path is None:
+        resume_ckpt = getattr(cfg, "resume_ckpt", None)
+        if resume_ckpt:
+            try:
+                ckpt_path = Path(str(resume_ckpt)).expanduser().resolve()
+            except Exception:
+                ckpt_path = None
 
-        shutil.copy2(ckpt_path, latest)
+    if ckpt_path is not None and Path(ckpt_path).exists():
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(os.path.basename(str(ckpt_path)))
+        except Exception:
+            import shutil
+
+            shutil.copy2(str(ckpt_path), latest)
 
     perf.write_perf_json()
 
