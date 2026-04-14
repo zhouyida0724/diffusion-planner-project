@@ -118,6 +118,15 @@ def main() -> int:
     ap.add_argument("--sample-id", type=str, default=None)
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--routing-mode", type=str, default="auto", help="Passed to extract_features (auto|raw)")
+    ap.add_argument(
+        "--db-path-rewrite",
+        action="append",
+        default=[],
+        help=(
+            "Optional path prefix rewrite for manifest db_path, repeatable. "
+            "Format: OLD=NEW. Example: --db-path-rewrite /media/datasets=/workspace/data/nuplan/data/cache"
+        ),
+    )
     args = ap.parse_args()
 
     shard_dir = Path(args.shard_dir)
@@ -128,7 +137,15 @@ def main() -> int:
     manifest = _load_manifest(shard_dir)
     row_idx, meta = _pick_sample(manifest, index=args.index, sample_id=args.sample_id)
 
-    db_path = Path(str(meta.get("db_path")))
+    db_path_s = str(meta.get("db_path"))
+    # Apply optional prefix rewrites (useful when running inside a container with different mounts).
+    for rule in list(args.db_path_rewrite or []):
+        if "=" not in rule:
+            raise SystemExit(f"Invalid --db-path-rewrite (expected OLD=NEW): {rule}")
+        old, new = rule.split("=", 1)
+        if db_path_s.startswith(old):
+            db_path_s = new + db_path_s[len(old) :]
+    db_path = Path(db_path_s)
     scene_token_hex = str(meta.get("scene_token_hex"))
     frame_index = int(meta.get("frame_index"))
     location = str(meta.get("location"))
