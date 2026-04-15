@@ -737,13 +737,15 @@ def train_loop_paper_dit_xstart(
             perf.records[-1]["fast_val"] = dict(metrics)
             perf.write_perf_json()
 
-    # initial fast-val at step 0
+    # Initial fast-val / fast-eval.
+    # NOTE: When resuming, logging these at step=0 pollutes TensorBoard (non-monotonic steps across restarts),
+    # creating confusing zig-zag lines. Log them at the checkpoint step instead.
+    eval_step0 = max(0, int(step) - 1)
     if fast_val_loader is not None and fast_val_every > 0:
-        _run_fast_val(0)
+        _run_fast_val(eval_step0)
 
-    # initial fast-eval at step 0
     if fast_eval_loaders is not None and fast_eval_every > 0:
-        _run_fast_eval(0)
+        _run_fast_eval(eval_step0)
 
     profile_steps = int(getattr(cfg, "profile_steps", 0) or 0)
     profile_every = int(getattr(cfg, "profile_every", 0) or 0)
