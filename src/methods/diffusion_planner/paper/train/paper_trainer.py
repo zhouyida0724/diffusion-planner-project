@@ -253,6 +253,8 @@ def train_loop_paper_dit_xstart(
     tb = None
     tb_enable = bool(getattr(cfg, "tb_enable", False))
     tb_every = int(getattr(cfg, "tb_every", 0) or 0)
+    # NOTE: tb_num_samples is interpreted as "per-city" for stable multi-city TB tags.
+    # (So tb_num_samples=3 means sample_0..sample_2 for each city.)
     tb_num_samples = max(1, int(getattr(cfg, "tb_num_samples", 1) or 1))
     tb_denoise_k = max(1, int(getattr(cfg, "tb_denoise_k", 10) or 1))
     tb_denoise_mode = str(getattr(cfg, "tb_denoise_mode", "t_sweep") or "t_sweep")
@@ -277,7 +279,7 @@ def train_loop_paper_dit_xstart(
             if B0 is None or B0 <= 0:
                 continue
             samples: list[dict[str, Any]] = []
-            for i in range(min(2, B0)):
+            for i in range(min(tb_num_samples, B0)):
                 s: dict[str, Any] = {}
                 for k, v in _batch.items():
                     if torch.is_tensor(v):
@@ -1125,8 +1127,8 @@ def train_loop_paper_dit_xstart(
                 # No per-solver-step spam.
 
                 cities = ["boston", "pittsburgh", "vegas"]
-                vis_per_city = max(1, int(tb_num_samples) // max(1, len(cities)))
-                vis_per_city = min(vis_per_city, 2)
+                # tb_num_samples is per-city.
+                vis_per_city = max(1, int(tb_num_samples))
 
                 def _fallback_from_train_batch(n: int, *, salt: int) -> list[dict[str, Any]]:
                     B_vis = int(batch["ego_current_state"].shape[0])
