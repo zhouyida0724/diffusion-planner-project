@@ -56,7 +56,11 @@ DB_PATH = os.environ.get(
         "2021.06.14.17.26.26_veh-38_04544_04920.db",
     ),
 )
-MAP_ROOT = os.environ.get("NUPLAN_MAP_ROOT", os.path.join(_NUPLAN_DATA_ROOT, "maps"))
+# Support both legacy NUPLAN_MAP_ROOT and nuPlan's more common NUPLAN_MAPS_ROOT.
+MAP_ROOT = os.environ.get(
+    "NUPLAN_MAP_ROOT",
+    os.environ.get("NUPLAN_MAPS_ROOT", os.path.join(_NUPLAN_DATA_ROOT, "maps")),
+)
 MAP_VERSION = os.environ.get("NUPLAN_MAP_VERSION", "9.12.1817")
 MAP_NAME = os.environ.get("NUPLAN_MAP_NAME", "us-nv-las-vegas-strip")
 

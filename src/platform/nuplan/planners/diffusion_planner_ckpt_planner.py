@@ -51,6 +51,8 @@ from src.platform.nuplan.features.extract_single_frame import (
     get_traffic_lights_at_timestamp,
 )
 
+from src.platform.nuplan.features.feature_contract import maybe_check_feature_contract
+
 
 @dataclass
 class _EgoKinematics:
@@ -539,8 +541,13 @@ def _build_neighbor_agents_past_from_history(
 class DiffusionPlannerCkpt(AbstractPlanner):
     """nuPlan planner that loads a repo-local checkpoint and predicts a trajectory."""
 
+    # We need the scenario object to locate the underlying nuPlan DB (log file) so we can
+    # reuse the offline extractor semantics at runtime.
+    requires_scenario: bool = True
+
     def __init__(
         self,
+        scenario: AbstractScenario,
         ckpt_path: str,
         past_trajectory_sampling: TrajectorySampling,
         future_trajectory_sampling: TrajectorySampling,
@@ -550,6 +557,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         sampling_steps: int = 10,
         **_: object,
     ):
+        self._scenario = scenario
         self._ckpt_path = str(ckpt_path)
         self._past_trajectory_sampling = past_trajectory_sampling
         self._future_trajectory_sampling = future_trajectory_sampling
@@ -567,6 +575,9 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._map_api = None
         self._route_roadblock_ids = None
         self._init_done = False
+
+        # SQLite connection reused for offline-style feature extraction (paper model path)
+        self._feature_conn: Optional[sqlite3.Connection] = None
 
         # Runtime debug (gated by env var)
         # Back-compat: DP_RUNTIME_DEBUG=1 enables all debug.
@@ -604,7 +615,13 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._load_checkpoint_or_raise()
 
     def _load_checkpoint_or_raise(self) -> None:
-        ckpt = torch.load(self._ckpt_path, map_location="cpu")
+        # PyTorch 2.6 changed default `weights_only` to True, which can break loading
+        # older checkpoints that store non-tensor metadata (e.g., normalizer objects).
+        # Our checkpoints are trusted (repo-local), so we force weights_only=False when supported.
+        try:
+            ckpt = torch.load(self._ckpt_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(self._ckpt_path, map_location="cpu")
         if isinstance(ckpt, dict) and "model_state" not in ckpt and "model_state_dict" in ckpt:
             ckpt = dict(ckpt)
             ckpt["model_state"] = ckpt["model_state_dict"]
@@ -849,123 +866,55 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         neighbor_agents_past_nonzero_count: int = 0
 
         if self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND:
+            # IMPORTANT: For paper checkpoints, the runtime conditioning MUST be semantically aligned
+            # with what we exported for training. Do NOT use ad-hoc DetectionsTracks-derived tensors.
+            #
+            # We build features through the same offline extractor logic (sqlite + map_api), so the
+            # model sees the same schema/order/padding as training.
             assert isinstance(self._model, PaperDiffusionPlanner)
-            if not self._init_done or self._map_api is None:
-                raise RuntimeError("Planner.initialize() was not called or map_api missing")
-
             cfg = self._model.config
-            B = 1
-            Pn = int(cfg.predicted_neighbor_num)
-            time_len = int(cfg.time_len)
-            future_len = int(cfg.future_len)
-            lane_len = int(cfg.lane_len)
 
-            # Runtime route/lanes extraction (matches export logic, not a placeholder).
-            cur = ego_history[-1]
-            cur_k = _ego_kinematics(cur)
-            from nuplan.common.actor_state.state_representation import Point2D
-
-            point = Point2D(cur_k.x, cur_k.y)
-
-            lanes_np, lanes_avails_np, lanes_speed_np, lanes_has_speed_np = extract_lanes(
-                point=point,
-                map_api=self._map_api,
-                radius=150,
-                max_lanes=int(cfg.lane_num),
-                ego_heading=cur_k.heading,
-                traffic_light_data=None,
-            )
-            route_lanes_np, route_lanes_avails_np, route_speed_np, route_has_speed_np = extract_route_lanes(
-                point=point,
-                map_api=self._map_api,
-                radius=150,
-                max_route_lanes=int(cfg.route_num),
-                ego_heading=cur_k.heading,
-                traffic_light_data=None,
-                route_roadblock_ids=list(self._route_roadblock_ids) if self._route_roadblock_ids else None,
-            )
-
-            ego_current_state = torch.from_numpy(x[:10]).view(1, 10)
+            feats_np = self._build_paper_runtime_features(current_input, cfg)
+            # Contract check in numpy space (high-signal schema drift detection).
+            maybe_check_feature_contract(feats_np, batched=False)
 
             dbg_should_print = self._runtime_debug and (self._runtime_debug_ticks < self._runtime_debug_k)
             norm_dbg_should_print = self._norm_debug and (self._norm_debug_ticks < self._norm_debug_k)
 
-            # Neighbors: minimal runtime track history from DetectionsTracks.
-            # Paper model expects `agent_num = 1 + predicted_neighbor_num` and may include ego as slot 0.
-            agent_num = int(getattr(cfg, "agent_num", 1 + Pn))
-            neighbor_all = np.zeros((agent_num, time_len, 11), dtype=np.float32)
+            # Track nonzero count for debug only.
+            try:
+                neighbor_agents_past_nonzero_count = int(np.count_nonzero(feats_np.get("neighbor_agents_past")))
+            except Exception:
+                neighbor_agents_past_nonzero_count = 0
 
-            # Fill ego history into slot 0.
-            ego_states = list(current_input.history.ego_states)
-            ego_tail = ego_states[-time_len:]
-            aligned_ego: list[EgoState | None] = [None] * time_len
-            ego_off = time_len - len(ego_tail)
-            for i, s in enumerate(ego_tail):
-                aligned_ego[ego_off + i] = s
-
-            R0 = _rot2d(-cur_k.heading)
-            for t, s in enumerate(aligned_ego):
-                if s is None:
-                    continue
-                k = _ego_kinematics(s)
-                dx_dy = R0 @ np.array([k.x - cur_k.x, k.y - cur_k.y], dtype=np.float64)
-                vv = R0 @ np.array([k.vx, k.vy], dtype=np.float64)
-                aa = R0 @ np.array([k.ax, k.ay], dtype=np.float64)
-
-                neighbor_all[0, t, 0] = float(dx_dy[0])
-                neighbor_all[0, t, 1] = float(dx_dy[1])
-                # NOTE: match offline exporter: ABSOLUTE heading cos/sin (not delta-to-ego)
-                neighbor_all[0, t, 2] = float(np.cos(k.heading))
-                neighbor_all[0, t, 3] = float(np.sin(k.heading))
-                neighbor_all[0, t, 4] = float(vv[0])
-                neighbor_all[0, t, 5] = float(vv[1])
-                # accel in ego-local
-                neighbor_all[0, t, 6] = float(aa[0])
-                neighbor_all[0, t, 7] = float(aa[1])
-                # size + type scalar
-                neighbor_all[0, t, 8] = 1.8
-                neighbor_all[0, t, 9] = 4.5
-                neighbor_all[0, t, 10] = 1.0
-
-            # Fill tracked neighbor vehicles into slots [1:1+Pn].
-            neighbor_np, neighbor_nz = _build_neighbor_agents_past_from_history(
-                history=current_input.history,
-                cur_ego=cur_k,
-                predicted_neighbor_num=Pn,
-                time_len=time_len,
-                runtime_debug=dbg_should_print,
-            )
-            hi = min(Pn, max(0, agent_num - 1))
-            if hi > 0:
-                neighbor_all[1 : 1 + hi] = neighbor_np[:hi]
-
-            neighbor_agents_past = torch.from_numpy(neighbor_all).view(B, agent_num, time_len, 11)
-            neighbor_agents_past_nonzero_count = int(np.count_nonzero(neighbor_all))
-
-            neighbor_agents_future = torch.zeros((B, Pn, future_len, 3), dtype=torch.float32)
-            static_objects = torch.zeros((B, int(cfg.static_objects_num), int(cfg.static_objects_state_dim)), dtype=torch.float32)
-
-            lanes = torch.from_numpy(lanes_np).view(1, int(cfg.lane_num), lane_len, 12)
-            lanes_speed_limit = torch.from_numpy(lanes_speed_np).view(1, int(cfg.lane_num), 1)
-            lanes_has_speed_limit = torch.from_numpy(lanes_has_speed_np).view(1, int(cfg.lane_num), 1)
-
-            route_lanes = torch.from_numpy(route_lanes_np).view(1, int(cfg.route_num), lane_len, 12)
-            route_lanes_speed_limit = torch.from_numpy(route_speed_np).view(1, int(cfg.route_num), 1)
-            route_lanes_has_speed_limit = torch.from_numpy(route_has_speed_np).view(1, int(cfg.route_num), 1)
+            # Convert to torch + add batch dim.
+            def _to_t(x: np.ndarray) -> torch.Tensor:
+                t = torch.from_numpy(np.asarray(x))
+                if t.dtype == torch.float64:
+                    t = t.float()
+                return t
 
             inputs = {
-                "ego_current_state": ego_current_state,
-                "neighbor_agents_past": neighbor_agents_past,
-                "neighbor_agents_future": neighbor_agents_future,
-                "ego_agent_future": torch.zeros((B, future_len, 3), dtype=torch.float32),
-                "static_objects": static_objects,
-                "lanes": lanes,
-                "lanes_speed_limit": lanes_speed_limit,
-                "lanes_has_speed_limit": lanes_has_speed_limit,
-                "route_lanes": route_lanes,
-                "route_lanes_speed_limit": route_lanes_speed_limit,
-                "route_lanes_has_speed_limit": route_lanes_has_speed_limit,
+                "ego_current_state": _to_t(feats_np["ego_current_state"]).view(1, 10),
+                "neighbor_agents_past": _to_t(feats_np["neighbor_agents_past"]).view(1, int(cfg.agent_num), int(cfg.time_len), 11),
+                "neighbor_agents_future": _to_t(feats_np["neighbor_agents_future"]).view(1, int(cfg.agent_num), int(cfg.future_len), 3),
+                "ego_agent_future": _to_t(feats_np["ego_agent_future"]).view(1, int(cfg.future_len), 3),
+                "static_objects": _to_t(feats_np["static_objects"]).view(1, int(cfg.static_objects_num), int(cfg.static_objects_state_dim)),
+                "lanes": _to_t(feats_np["lanes"]).view(1, int(cfg.lane_num), int(cfg.lane_len), 12),
+                # NOTE: training arrays store speed_limit/has_speed_limit as [L] (not [L,1]).
+                "lanes_speed_limit": _to_t(feats_np["lanes_speed_limit"]).view(1, int(cfg.lane_num)),
+                "lanes_has_speed_limit": _to_t(feats_np["lanes_has_speed_limit"]).view(1, int(cfg.lane_num)),
+                "route_lanes": _to_t(feats_np["route_lanes"]).view(1, int(cfg.route_num), int(cfg.lane_len), 12),
+                "route_lanes_speed_limit": _to_t(feats_np["route_lanes_speed_limit"]).view(1, int(cfg.route_num)),
+                "route_lanes_has_speed_limit": _to_t(feats_np["route_lanes_has_speed_limit"]).view(1, int(cfg.route_num)),
             }
+            # (Optional but useful for debugging / proof-of-contract)
+            inputs["lanes_avails"] = _to_t(feats_np["lanes_avails"]).view(1, int(cfg.lane_num), int(cfg.lane_len)).bool()
+            inputs["route_lanes_avails"] = _to_t(feats_np["route_lanes_avails"]).view(1, int(cfg.route_num), int(cfg.lane_len)).bool()
+
+            # Contract check in torch space.
+            maybe_check_feature_contract(inputs, batched=True)
+
             if self._device == "cuda":
                 inputs = {k: (v.cuda(non_blocking=True) if torch.is_tensor(v) else v) for k, v in inputs.items()}
 

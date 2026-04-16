@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from contextlib import nullcontext
 
 try:
@@ -25,7 +26,7 @@ except Exception:  # pragma: no cover
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
 from src.methods.diffusion_planner.paper.model.diffusion_utils import dpm_solver_pytorch as dpm
-from .tb_visualizer import render_npz_style_scene, render_xy_scatter, render_xy_scatter_with_context
+from .tb_visualizer import render_npz_style_scene, render_xy_scatter, render_xy_scatter_with_context, stitch_montage
 
 
 def _t_to_tag(t: float) -> str:
@@ -252,12 +253,42 @@ def train_loop_paper_dit_xstart(
     tb = None
     tb_enable = bool(getattr(cfg, "tb_enable", False))
     tb_every = int(getattr(cfg, "tb_every", 0) or 0)
+    # NOTE: tb_num_samples is interpreted as "per-city" for stable multi-city TB tags.
+    # (So tb_num_samples=3 means sample_0..sample_2 for each city.)
     tb_num_samples = max(1, int(getattr(cfg, "tb_num_samples", 1) or 1))
     tb_denoise_k = max(1, int(getattr(cfg, "tb_denoise_k", 10) or 1))
     tb_denoise_mode = str(getattr(cfg, "tb_denoise_mode", "t_sweep") or "t_sweep")
     tb_sampler_steps = max(1, int(getattr(cfg, "tb_sampler_steps", tb_denoise_k) or tb_denoise_k))
     tb_image_size = int(getattr(cfg, "tb_image_size", 800) or 800)
     tb_warned_disabled = False
+
+    # Pre-sample stable visualization examples from fast-eval loaders (if available).
+    # This keeps TB tags stable across steps and aligned across cities.
+    tb_vis_by_city: dict[str, list[dict[str, Any]]] = {}
+    if fast_eval_loaders is not None:
+        for _city, _ldr in fast_eval_loaders.items():
+            try:
+                _batch = next(iter(_ldr))
+            except Exception:
+                continue
+            B0 = None
+            for _v in _batch.values():
+                if torch.is_tensor(_v):
+                    B0 = int(_v.shape[0])
+                    break
+            if B0 is None or B0 <= 0:
+                continue
+            samples: list[dict[str, Any]] = []
+            for i in range(min(tb_num_samples, B0)):
+                s: dict[str, Any] = {}
+                for k, v in _batch.items():
+                    if torch.is_tensor(v):
+                        s[k] = v[i : i + 1].to(device=device, dtype=torch.float32)
+                    else:
+                        s[k] = v
+                samples.append(s)
+            if samples:
+                tb_vis_by_city[str(_city)] = samples
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -282,7 +313,9 @@ def train_loop_paper_dit_xstart(
             print(f"[resume] invalid checkpoint payload type: {type(ckpt)}; ignoring resume", flush=True)
     if tb_enable and SummaryWriter is not None:
         try:
-            tb = SummaryWriter(log_dir=str(exp_dir / "tb"))
+            # TensorBoard sometimes gets confused when multiple event files share the same base name
+            # and one gets an auto-suffix like ".1". Make filenames unique per process start.
+            tb = SummaryWriter(log_dir=str(exp_dir / "tb"), filename_suffix=f".{uuid.uuid4().hex[:8]}")
             tb.add_text("meta/exp_name", str(cfg.exp_name), 0)
             tb.add_text("meta/mode", "paper_dit_dpm", 0)
             tb.add_text("meta/tb_image_logging", f"enabled every={tb_every} samples={tb_num_samples} denoise_k={tb_denoise_k}", 0)
@@ -350,19 +383,25 @@ def train_loop_paper_dit_xstart(
     perf = _PerfTracker(exp_dir=exp_dir, cfg=cfg, device=device)
 
     # TensorBoard (optional)
+    # We already initialize `tb` above when tb_enable=True. Avoid creating a second SummaryWriter
+    # pointing at the same logdir, because it will produce events.*.1 and TensorBoard may get stuck.
     writer = None
-    if bool(getattr(cfg, "tensorboard", False)):
+    if bool(getattr(cfg, "tensorboard", False)) and tb is None:
         if SummaryWriter is None:
             print("[tb] SummaryWriter unavailable (torch.utils.tensorboard not installed); skipping TensorBoard logs.", flush=True)
         else:
             tb_dir = getattr(cfg, "tb_dir", None) or str(exp_dir / "tb")
-            writer = SummaryWriter(log_dir=tb_dir)
+            writer = SummaryWriter(log_dir=tb_dir, filename_suffix=f".{uuid.uuid4().hex[:8]}")
             print(f"[tb] writing TensorBoard logs to: {tb_dir}", flush=True)
 
     model.train()
     t0 = time.time()
     step = int(start_step)
     loader_it = iter(train_loader)
+
+    # When cfg.steps == 0 (eval-only runs), the training loop body never executes.
+    # Keep ckpt_path defined so we can still write checkpoint_latest or skip safely.
+    ckpt_path: Optional[Path] = None
 
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
@@ -698,13 +737,15 @@ def train_loop_paper_dit_xstart(
             perf.records[-1]["fast_val"] = dict(metrics)
             perf.write_perf_json()
 
-    # initial fast-val at step 0
+    # Initial fast-val / fast-eval.
+    # NOTE: When resuming, logging these at step=0 pollutes TensorBoard (non-monotonic steps across restarts),
+    # creating confusing zig-zag lines. Log them at the checkpoint step instead.
+    eval_step0 = max(0, int(step) - 1)
     if fast_val_loader is not None and fast_val_every > 0:
-        _run_fast_val(0)
+        _run_fast_val(eval_step0)
 
-    # initial fast-eval at step 0
     if fast_eval_loaders is not None and fast_eval_every > 0:
-        _run_fast_eval(0)
+        _run_fast_eval(eval_step0)
 
     profile_steps = int(getattr(cfg, "profile_steps", 0) or 0)
     profile_every = int(getattr(cfg, "profile_every", 0) or 0)
@@ -1081,268 +1122,226 @@ def train_loop_paper_dit_xstart(
             try:
                 model.eval()
 
-                B_vis = int(batch["ego_current_state"].shape[0])
-                num_vis = min(tb_num_samples, B_vis)
+                # TB layout (stable tags):
+                #   viz/<city>/sample_<k>
+                #   denoise/<city>/sample_<k>
+                #   forward/<city>/sample_<k>
+                # No per-solver-step spam.
 
-                # Pick random samples from the current batch (deterministic-ish per step).
-                g = torch.Generator(device="cpu")
-                g.manual_seed(int(cfg.seed) + int(step) * 10007)
-                vis_idxs = torch.randperm(B_vis, generator=g)[:num_vis].tolist()
+                cities = ["boston", "pittsburgh", "vegas"]
+                # tb_num_samples is per-city.
+                vis_per_city = max(1, int(tb_num_samples))
 
-                for sample_idx in vis_idxs:
-                    # --- scene image (npz-style) ---
-                    infer_inputs = {
-                        "ego_current_state": batch["ego_current_state"][sample_idx : sample_idx + 1],
-                        "neighbor_agents_past": batch["neighbor_agents_past"][sample_idx : sample_idx + 1],
-                        "static_objects": batch["static_objects"][sample_idx : sample_idx + 1],
-                        "lanes": batch["lanes"][sample_idx : sample_idx + 1],
-                        "lanes_speed_limit": batch["lanes_speed_limit"][sample_idx : sample_idx + 1],
-                        "lanes_has_speed_limit": batch["lanes_has_speed_limit"][sample_idx : sample_idx + 1],
-                        "route_lanes": batch["route_lanes"][sample_idx : sample_idx + 1],
-                        "route_lanes_speed_limit": batch.get("route_lanes_speed_limit")[sample_idx : sample_idx + 1] if torch.is_tensor(batch.get("route_lanes_speed_limit")) else batch.get("route_lanes_speed_limit"),
-                        "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit")[sample_idx : sample_idx + 1] if torch.is_tensor(batch.get("route_lanes_has_speed_limit")) else batch.get("route_lanes_has_speed_limit"),
-                    }
+                def _fallback_from_train_batch(n: int, *, salt: int) -> list[dict[str, Any]]:
+                    B_vis = int(batch["ego_current_state"].shape[0])
+                    if B_vis <= 0:
+                        return []
+                    g = torch.Generator(device="cpu")
+                    g.manual_seed(int(cfg.seed) + int(step) * 10007 + int(salt))
+                    idxs = torch.randperm(B_vis, generator=g)[: min(n, B_vis)].tolist()
+                    outs: list[dict[str, Any]] = []
+                    for sample_idx in idxs:
+                        b1: dict[str, Any] = {}
+                        for k, v in batch.items():
+                            if torch.is_tensor(v) and v.shape[0] == B_vis:
+                                b1[k] = v[sample_idx : sample_idx + 1]
+                            else:
+                                b1[k] = v
+                        outs.append(b1)
+                    return outs
 
-                    # Best-effort inference trajectory for overlay.
-                    pred_xy = None
-                    try:
-                        pred_xy = model.sample_trajectory(infer_inputs, diffusion_steps=max(tb_denoise_k, 4))[:, :2]
-                    except Exception:
-                        pred_xy = None
+                for ci, city in enumerate(cities):
+                    samples = tb_vis_by_city.get(city)
+                    if not samples:
+                        samples = _fallback_from_train_batch(vis_per_city, salt=ci)
+                    if not samples:
+                        continue
 
-                    scene_img = render_npz_style_scene(
-                        batch,
-                        sample_idx=sample_idx,
-                        ego_future_xy=pred_xy,
-                        title=f"step={step} sample={sample_idx}",
-                        image_size=tb_image_size,
-                    )
-                    if scene_img is not None:
-                        tb.add_image(
-                            f"viz/scene/sample_{sample_idx}",
-                            torch.from_numpy(scene_img).permute(2, 0, 1),
-                            int(step),
-                        )
+                    for slot, batch1 in enumerate(samples[:vis_per_city]):
+                        with torch.no_grad():
+                            x0_4_1, _ = _build_joint_trajectories_x0(batch1, predicted_neighbor_num=Pn, future_len=Tf)
+                            x0n_1 = model.config.state_normalizer(x0_4_1)
+                            neighbor_mask_full_1, _ = _compute_neighbor_masks(batch1, predicted_neighbor_num=Pn, future_len=Tf)
+                            x0n_masked_1 = x0n_1.clone()
+                            x0n_masked_1[:, 1:, :, :][neighbor_mask_full_1] = 0.0
 
-                    # --- denoise scatter (xt + x0_pred), logged as multiple images ---
-                    # Build a B=1 batch for faster visualization compute.
-                    batch1: dict[str, Any] = {}
-                    for k, v in batch.items():
-                        if torch.is_tensor(v) and v.shape[0] == B_vis:
-                            batch1[k] = v[sample_idx : sample_idx + 1]
-                        else:
-                            batch1[k] = v
+                            # IMPORTANT: match training/inference by applying observation normalization
+                            # to conditioning features before feeding the encoder/DiT sampler.
+                            enc_inputs_vis_raw = {
+                                "ego_current_state": batch1["ego_current_state"],
+                                "neighbor_agents_past": batch1["neighbor_agents_past"],
+                                "static_objects": batch1["static_objects"],
+                                "lanes": batch1["lanes"],
+                                "lanes_speed_limit": batch1["lanes_speed_limit"],
+                                "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
+                                "route_lanes": batch1["route_lanes"],
+                            }
+                            if batch1.get("route_lanes_speed_limit") is not None:
+                                enc_inputs_vis_raw["route_lanes_speed_limit"] = batch1["route_lanes_speed_limit"]
+                            if batch1.get("route_lanes_has_speed_limit") is not None:
+                                enc_inputs_vis_raw["route_lanes_has_speed_limit"] = batch1["route_lanes_has_speed_limit"]
 
-                    with torch.no_grad():
-                        x0_4_1, _ = _build_joint_trajectories_x0(batch1, predicted_neighbor_num=Pn, future_len=Tf)
-                        x0n_1 = model.config.state_normalizer(x0_4_1)
-                        neighbor_mask_full_1, _ = _compute_neighbor_masks(batch1, predicted_neighbor_num=Pn, future_len=Tf)
-                        x0n_masked_1 = x0n_1.clone()
-                        x0n_masked_1[:, 1:, :, :][neighbor_mask_full_1] = 0.0
+                            enc_inputs_vis = (
+                                model.config.observation_normalizer(enc_inputs_vis_raw)
+                                if hasattr(model.config, "observation_normalizer")
+                                else enc_inputs_vis_raw
+                            )
+                            enc_vis = model.encoder(enc_inputs_vis)
 
-                        # Fixed noise is nice-to-have for smoother convergence visuals, but torch 2.1
-                        # doesn't support passing a per-call Generator to randn_like on all devices.
-                        # Use a fresh random noise tensor here (still shows convergence clearly).
-                        base_noise = torch.randn_like(x0n_masked_1[:, :, 1:, :])
+                            neighbors_past_1 = batch1["neighbor_agents_past"]
+                            if neighbors_past_1.shape[1] == Pn + 1:
+                                neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
+                            else:
+                                neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
+                            neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
 
-                        # Include an explicit t=1.0 panel (max noise) and go close to 0 for the final panel.
-                        t_values = torch.linspace(1.0, 0.01, steps=tb_denoise_k, device=device, dtype=torch.float32)
-                        t_values_forward = torch.linspace(0.01, 1.0, steps=tb_denoise_k, device=device, dtype=torch.float32)
-
-                        # Precompute encoder outputs once for this sample.
-                        enc_inputs_vis = {
-                            "ego_current_state": batch1["ego_current_state"],
-                            "neighbor_agents_past": batch1["neighbor_agents_past"],
-                            "static_objects": batch1["static_objects"],
-                            "lanes": batch1["lanes"],
-                            "lanes_speed_limit": batch1["lanes_speed_limit"],
-                            "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
-                            "route_lanes": batch1["route_lanes"],
-                            "route_lanes_speed_limit": batch1.get("route_lanes_speed_limit"),
-                            "route_lanes_has_speed_limit": batch1.get("route_lanes_has_speed_limit"),
-                        }
-                        enc_vis = model.encoder(enc_inputs_vis)
-
-                        # Build neighbor current mask (same as Decoder.forward training branch)
-                        neighbors_past_1 = batch1["neighbor_agents_past"]
-                        if neighbors_past_1.shape[1] == Pn + 1:
-                            neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
-                        else:
-                            neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
-                        neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
-
-                        # ------------------------------
-                        # (A) t-sweep panels (training-style)
-                        # ------------------------------
-                        if tb_denoise_mode in ["t_sweep", "all"]:
-                            for i, t_scalar in enumerate(t_values):
-                                t_val = float(t_scalar.item())
-                                t_vis = torch.full((1,), t_val, device=device, dtype=torch.float32)
+                            # Forward-noise montage (q(x_t|x0)).
+                            base_noise = torch.randn_like(x0n_masked_1[:, :, 1:, :])
+                            t_forward = [0.01, 0.1, 0.5, 1.0]
+                            forward_panels: list[Any] = []
+                            for t_val in t_forward:
+                                t_vis = torch.full((1,), float(t_val), device=device, dtype=torch.float32)
                                 mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
                                 xt_fut = mean + std * base_noise
                                 xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
-
-                                with autocast_ctx:
-                                    out_flat = model.decoder.decoder.dit(
-                                        xt_vis.reshape(1, 1 + Pn, -1),
-                                        t_vis,
-                                        enc_vis["encoding"],
-                                        batch1["route_lanes"],
-                                        neighbor_current_mask_1,
-                                    )
-                                x0_pred_vis = out_flat.reshape(1, 1 + Pn, -1, 4)  # normalized x0
-
                                 xt_inv = model.config.state_normalizer.inverse(xt_vis)
-                                x0_pred_inv = model.config.state_normalizer.inverse(x0_pred_vis)
-
                                 xt_xy = xt_inv[0, 0, 1:, :2]
-                                x0_pred_xy = x0_pred_inv[0, 0, 1:, :2]
-
-                                xt_img = render_xy_scatter_with_context(
+                                img = render_xy_scatter_with_context(
                                     batch1,
                                     sample_idx=0,
                                     xy=xt_xy,
-                                    title=f"xt | step={step} sample={sample_idx} panel={i:02d} t={t_val:.2f}",
+                                    title=f"forward xt | t={t_val:.2f}",
                                     image_size=tb_image_size,
                                     marker="x",
                                     alpha=0.85,
+                                    connect_line=False,
                                 )
-                                if xt_img is not None:
-                                    tb.add_image(
-                                        f"denoise/xt/sample_{sample_idx}/panel_{i:02d}",
-                                        torch.from_numpy(xt_img).permute(2, 0, 1),
-                                        int(step),
+                                forward_panels.append(img)
+                            forward_m = stitch_montage(forward_panels, rows=2, cols=2)
+                            if forward_m is not None:
+                                tb.add_image(
+                                    f"forward/{city}/sample_{slot}",
+                                    torch.from_numpy(forward_m).permute(2, 0, 1),
+                                    int(step),
+                                )
+
+                            # Sampler-consistent denoise + viz.
+                            if tb_denoise_mode in ["sampler", "all"]:
+                                try:
+                                    current_states_norm = x0n_masked_1[:, :, 0, :]
+                                    P = int(current_states_norm.shape[1])
+                                    future_noise = torch.randn((1, P, Tf, 4), device=device, dtype=torch.float32) * 0.5
+                                    xT = torch.cat([current_states_norm[:, :, None, :], future_noise], dim=2).reshape(1, P, -1)
+
+                                    def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step_i: int):
+                                        xt2 = xt.reshape(1, P, Tf + 1, 4)
+                                        xt2[:, :, 0, :] = current_states_norm
+                                        return xt2.reshape(1, P, -1)
+
+                                    noise_schedule = dpm.NoiseScheduleVP(schedule="linear")
+                                    model_fn = dpm.model_wrapper(
+                                        model.decoder.decoder.dit,
+                                        noise_schedule,
+                                        model_type=model.decoder.decoder.dit.model_type,
+                                        model_kwargs={
+                                            "cross_c": enc_vis["encoding"],
+                                            "route_lanes": enc_inputs_vis.get("route_lanes", batch1["route_lanes"]),
+                                            "neighbor_current_mask": neighbor_current_mask_1,
+                                        },
+                                        guidance_type="uncond",
+                                    )
+                                    dpm_solver = dpm.DPM_Solver(
+                                        model_fn,
+                                        noise_schedule,
+                                        algorithm_type="dpmsolver++",
+                                        correcting_xt_fn=initial_state_constraint,
                                     )
 
-                                x0_img = render_xy_scatter_with_context(
-                                    batch1,
-                                    sample_idx=0,
-                                    xy=x0_pred_xy,
-                                    title=f"x0_pred | step={step} sample={sample_idx} panel={i:02d} t={t_val:.2f}",
-                                    image_size=tb_image_size,
-                                    marker=".",
-                                    alpha=0.95,
-                                )
-                                if x0_img is not None:
-                                    tb.add_image(
-                                        f"denoise/x0_pred/sample_{sample_idx}/panel_{i:02d}",
-                                        torch.from_numpy(x0_img).permute(2, 0, 1),
-                                        int(step),
+                                    x0_flat, inter = dpm_solver.sample(
+                                        xT,
+                                        steps=tb_sampler_steps,
+                                        order=2,
+                                        skip_type="logSNR",
+                                        method="multistep",
+                                        denoise_to_zero=True,
+                                        return_intermediate=True,
                                     )
 
-                        # ------------------------------
-                        # (B) forward-noise panels (q(x_t | x0), low->high noise)
-                        # ------------------------------
-                        if tb_denoise_mode in ["forward_noise", "all"]:
-                            for i, t_scalar in enumerate(t_values_forward):
-                                t_val = float(t_scalar.item())
-                                t_tag = _t_to_tag(t_val)
-                                t_vis = torch.full((1,), t_val, device=device, dtype=torch.float32)
-                                mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
-                                xt_fut = mean + std * base_noise
-                                xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
-
-                                xt_inv = model.config.state_normalizer.inverse(xt_vis)
-                                xt_xy = xt_inv[0, 0, 1:, :2]
-
-                                xt_img = render_xy_scatter_with_context(
-                                    batch1,
-                                    sample_idx=0,
-                                    xy=xt_xy,
-                                    title=f"forward-noise xt | step={step} sample={sample_idx} panel={i:02d}/{len(t_values_forward)-1} t={t_val:.2f}",
-                                    image_size=tb_image_size,
-                                    marker="x",
-                                    alpha=0.85,
-                                )
-                                if xt_img is not None:
-                                    tb.add_image(
-                                        f"forward_noise/xt/sample_{sample_idx}/panel_{i:02d}_t_{t_tag}",
-                                        torch.from_numpy(xt_img).permute(2, 0, 1),
-                                        int(step),
+                                    t0 = 1.0 / float(noise_schedule.total_N)
+                                    timesteps = dpm_solver.get_time_steps(
+                                        skip_type="logSNR",
+                                        t_T=float(noise_schedule.T),
+                                        t_0=float(t0),
+                                        N=tb_sampler_steps,
+                                        device=device,
                                     )
+                                    t_labels = [float(timesteps[0].item())]
+                                    for j in range(1, int(timesteps.shape[0])):
+                                        t_labels.append(float(timesteps[j].item()))
+                                    if len(inter) == len(t_labels) + 1:
+                                        t_labels.append(float(t0))
 
-                        # ------------------------------
-                        # (C) sampler intermediates (true iterative denoising)
-                        # ------------------------------
-                        if tb_denoise_mode in ["sampler", "all"]:
-                            try:
-                                current_states_norm = x0n_masked_1[:, :, 0, :]
-                                P = int(current_states_norm.shape[1])
-                                future_noise = torch.randn((1, P, Tf, 4), device=device, dtype=torch.float32) * 0.5
-                                xT = torch.cat([current_states_norm[:, :, None, :], future_noise], dim=2).reshape(1, P, -1)
+                                    # Pick 4 snapshots close to t≈[1.0,0.5,0.1,t0].
+                                    targets = [1.0, 0.5, 0.1, float(t0)]
+                                    idxs = []
+                                    for tt in targets:
+                                        best_i, best_d = 0, 1e9
+                                        for i, t_i in enumerate(t_labels[: len(inter)]):
+                                            d = abs(float(t_i) - float(tt))
+                                            if d < best_d:
+                                                best_d = d
+                                                best_i = i
+                                        idxs.append(best_i)
+                                    uniq = []
+                                    for i in idxs:
+                                        if i not in uniq:
+                                            uniq.append(i)
 
-                                def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step_i: int):
-                                    xt2 = xt.reshape(1, P, Tf + 1, 4)
-                                    xt2[:, :, 0, :] = current_states_norm
-                                    return xt2.reshape(1, P, -1)
-
-                                noise_schedule = dpm.NoiseScheduleVP(schedule="linear")
-                                model_fn = dpm.model_wrapper(
-                                    model.decoder.decoder.dit,
-                                    noise_schedule,
-                                    model_type=model.decoder.decoder.dit.model_type,
-                                    model_kwargs={
-                                        "cross_c": enc_vis["encoding"],
-                                        "route_lanes": batch1["route_lanes"],
-                                        "neighbor_current_mask": neighbor_current_mask_1,
-                                    },
-                                    guidance_type="uncond",
-                                )
-                                dpm_solver = dpm.DPM_Solver(
-                                    model_fn,
-                                    noise_schedule,
-                                    algorithm_type="dpmsolver++",
-                                    correcting_xt_fn=initial_state_constraint,
-                                )
-
-                                x0_flat, inter = dpm_solver.sample(
-                                    xT,
-                                    steps=tb_sampler_steps,
-                                    order=2,
-                                    skip_type="logSNR",
-                                    method="multistep",
-                                    denoise_to_zero=True,
-                                    return_intermediate=True,
-                                )
-
-                                t0 = 1.0 / float(noise_schedule.total_N)
-                                timesteps = dpm_solver.get_time_steps(
-                                    skip_type="logSNR",
-                                    t_T=float(noise_schedule.T),
-                                    t_0=float(t0),
-                                    N=tb_sampler_steps,
-                                    device=device,
-                                )
-                                t_labels = [float(timesteps[0].item())]
-                                for j in range(1, int(timesteps.shape[0])):
-                                    t_labels.append(float(timesteps[j].item()))
-                                if len(inter) == len(t_labels) + 1:
-                                    t_labels.append(float(t0))
-
-                                for i, xt_flat in enumerate(inter):
-                                    t_i = t_labels[i] if i < len(t_labels) else float("nan")
-                                    t_tag = _t_to_tag(t_i) if t_i == t_i else "nan"
-                                    xt_view = xt_flat.reshape(1, P, Tf + 1, 4)
-                                    xt_inv = model.config.state_normalizer.inverse(xt_view)
-                                    xt_xy = xt_inv[0, 0, 1:, :2]
-
-                                    xt_img = render_xy_scatter_with_context(
-                                        batch1,
-                                        sample_idx=0,
-                                        xy=xt_xy,
-                                        title=f"sampler xt | step={step} sample={sample_idx} solver_step={i:02d}/{len(inter)-1} t={t_i:.4f}",
-                                        image_size=tb_image_size,
-                                        marker="x",
-                                        alpha=0.9,
-                                    )
-                                    if xt_img is not None:
+                                    denoise_panels: list[Any] = []
+                                    for i in uniq[:4]:
+                                        xt_view = inter[i].reshape(1, P, Tf + 1, 4)
+                                        xt_inv = model.config.state_normalizer.inverse(xt_view)
+                                        xt_xy = xt_inv[0, 0, 1:, :2]
+                                        t_i = t_labels[i] if i < len(t_labels) else float("nan")
+                                        img = render_xy_scatter_with_context(
+                                            batch1,
+                                            sample_idx=0,
+                                            xy=xt_xy,
+                                            title=f"denoise xt | t={t_i:.3f}",
+                                            image_size=tb_image_size,
+                                            marker="x",
+                                            alpha=0.9,
+                                            connect_line=False,
+                                        )
+                                        denoise_panels.append(img)
+                                    while len(denoise_panels) < 4:
+                                        denoise_panels.append(None)
+                                    denoise_m = stitch_montage(denoise_panels[:4], rows=2, cols=2)
+                                    if denoise_m is not None:
                                         tb.add_image(
-                                            f"sampler/xt/sample_{sample_idx}/solver_{i:02d}_t_{t_tag}",
-                                            torch.from_numpy(xt_img).permute(2, 0, 1),
+                                            f"denoise/{city}/sample_{slot}",
+                                            torch.from_numpy(denoise_m).permute(2, 0, 1),
                                             int(step),
                                         )
-                            except Exception as e:
-                                print(f"[tb] sampler-intermediate logging failed: {e}", flush=True)
+
+                                    x0_view = x0_flat.reshape(1, P, Tf + 1, 4)
+                                    x0_inv = model.config.state_normalizer.inverse(x0_view)
+                                    pred_xy = x0_inv[0, 0, 1:, :2]
+                                    scene_img = render_npz_style_scene(
+                                        batch1,
+                                        sample_idx=0,
+                                        ego_future_xy=pred_xy,
+                                        title=f"viz | step={step} city={city} slot={slot}",
+                                        image_size=tb_image_size,
+                                    )
+                                    if scene_img is not None:
+                                        tb.add_image(
+                                            f"viz/{city}/sample_{slot}",
+                                            torch.from_numpy(scene_img).permute(2, 0, 1),
+                                            int(step),
+                                        )
+                                except Exception as e:
+                                    print(f"[tb] sampler denoise logging failed: {e}", flush=True)
 
                 tb.flush()
             except Exception as e:
@@ -1366,23 +1365,34 @@ def train_loop_paper_dit_xstart(
 
         step += 1
 
-    # final fast-val at step=cfg.steps
-    if fast_val_loader is not None and fast_val_every > 0:
-        _run_fast_val(int(cfg.steps))
+    # final fast-val / fast-eval at step=cfg.steps
+    # For cfg.steps == 0, we already ran the initial eval at step 0, so skip the final one.
+    if int(cfg.steps) > 0:
+        if fast_val_loader is not None and fast_val_every > 0:
+            _run_fast_val(int(cfg.steps))
 
-    # final fast-eval at step=cfg.steps
-    if fast_eval_loaders is not None and fast_eval_every > 0:
-        _run_fast_eval(int(cfg.steps))
+        if fast_eval_loaders is not None and fast_eval_every > 0:
+            _run_fast_eval(int(cfg.steps))
 
     latest = exp_dir / "checkpoint_latest.pt"
-    try:
-        if latest.is_symlink() or latest.exists():
-            latest.unlink()
-        latest.symlink_to(os.path.basename(ckpt_path))
-    except Exception:
-        import shutil
+    # If no checkpoint was written (e.g. cfg.steps==0), prefer linking to resume_ckpt.
+    if ckpt_path is None:
+        resume_ckpt = getattr(cfg, "resume_ckpt", None)
+        if resume_ckpt:
+            try:
+                ckpt_path = Path(str(resume_ckpt)).expanduser().resolve()
+            except Exception:
+                ckpt_path = None
 
-        shutil.copy2(ckpt_path, latest)
+    if ckpt_path is not None and Path(ckpt_path).exists():
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(os.path.basename(str(ckpt_path)))
+        except Exception:
+            import shutil
+
+            shutil.copy2(str(ckpt_path), latest)
 
     perf.write_perf_json()
 

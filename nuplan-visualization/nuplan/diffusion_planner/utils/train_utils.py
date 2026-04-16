@@ -65,7 +65,12 @@ def resume_model(path: str, model, optimizer, scheduler, ema, device):
     path = os.path.join(path, 'latest.pth')
     ckpt = fileio.get(path)
     with io.BytesIO(ckpt) as f:
-        ckpt = torch.load(f)
+        # PyTorch newer versions default `weights_only=True`, which can break checkpoints
+        # that include non-tensor metadata.
+        try:
+            ckpt = torch.load(f, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(f)
 
     # load model
     try:
@@ -113,5 +118,4 @@ def resume_model(path: str, model, optimizer, scheduler, ema, device):
         print('no ema shadow found')
 
     return model, optimizer, scheduler, init_epoch, wandb_id, ema
-
 

@@ -148,6 +148,17 @@ def parse_args() -> argparse.Namespace:
         help="Training cache root (mmap-friendly arrays). Used by paper_dit_dpm dataset.",
     )
 
+    p.add_argument(
+        "--normalization-file",
+        type=str,
+        default=None,
+        help=(
+            "Optional normalization JSON (see scripts/data/compute_normalization_ours.py). "
+            "If provided, we will load state_mean/state_std and observation_norm into the paper model, "
+            "and those stats will be stored in checkpoints for eval/infer."
+        ),
+    )
+
     # step-level breakdown profiling (wall-clock timers)
     p.add_argument(
         "--profile-steps",
@@ -547,7 +558,11 @@ def main() -> None:
         amp=args.amp,
         alpha_planning_loss=args.alpha_planning_loss,
         # tensorboard (scalar + image logging)
-        tensorboard=bool(getattr(args, "tensorboard", False)) or bool(args.tb_enable),
+        # NOTE: tb_enable already initializes a SummaryWriter in paper_trainer (and logs scalars).
+        # If we also set tensorboard=True here, paper_trainer would create a second SummaryWriter
+        # pointing at the same logdir, producing an events.*.1 file. TensorBoard's directory watcher
+        # often gets stuck on that .1 file and the UI shows a single point.
+        tensorboard=bool(getattr(args, "tensorboard", False)),
         tb_dir=getattr(args, "tb_dir", None),
         # richer image logging (paper_dit_dpm)
         tb_enable=bool(args.tb_enable),
@@ -607,6 +622,22 @@ def main() -> None:
             lane_len=int(ln.shape[1]),
             future_len=future_len,
         )
+
+        # Optional: load normalization stats computed from training cache.
+        norm_path = getattr(args, "normalization_file", None)
+        if norm_path:
+            data = json.loads(Path(norm_path).read_text())
+            if "ego" in data and "neighbor" in data:
+                ego_mean = data["ego"]["mean"]
+                ego_std = data["ego"]["std"]
+                nb_mean = data["neighbor"]["mean"]
+                nb_std = data["neighbor"]["std"]
+                paper_cfg.state_mean = [[ego_mean]] + [[nb_mean]] * int(paper_cfg.predicted_neighbor_num)
+                paper_cfg.state_std = [[ego_std]] + [[nb_std]] * int(paper_cfg.predicted_neighbor_num)
+            # ObservationNormalizer consumes everything except ego/neighbor.
+            obs_norm = {k: v for k, v in data.items() if k not in ("ego", "neighbor")}
+            paper_cfg.observation_norm = obs_norm if obs_norm else None
+
         model = PaperDiffusionPlanner(paper_cfg)
         exp_dir = train_loop_paper_dit_xstart(
             cfg=cfg,
