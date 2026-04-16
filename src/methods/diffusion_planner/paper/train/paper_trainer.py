@@ -457,9 +457,42 @@ def train_loop_paper_dit_xstart(
                 tag = f"{sec:g}s".replace(".", "p")
                 horizon_tags.append((hh, tag))
 
+            turn_source = str(getattr(cfg, "fast_eval_turn_source", "tags_or_gt") or "tags_or_gt")
             turn_angle_deg = float(getattr(cfg, "fast_eval_turn_angle_deg", 15.0) or 15.0)
             turn_min_travel_m = float(getattr(cfg, "fast_eval_turn_min_travel_m", 5.0) or 5.0)
             turn_angle_thr = (turn_angle_deg * float(torch.pi)) / 180.0
+
+            _TURN_TAGS = {
+                # nuPlan maneuver tags we observed in manifests
+                "starting_left_turn",
+                "starting_right_turn",
+                "starting_high_speed_turn",
+                "starting_low_speed_turn",
+                "starting_protected_noncross_turn",
+                "starting_unprotected_cross_turn",
+            }
+
+            def _turn_mask_from_tags(meta_obj: Any, B: int, device: torch.device) -> Optional[torch.Tensor]:
+                """Best-effort turning mask from manifest tags.
+
+                Expects DataLoader-collated batch['meta'] to be a dict with key 'tags',
+                where tags is list[list[str]] length B.
+                """
+
+                if not isinstance(meta_obj, dict):
+                    return None
+                tags = meta_obj.get("tags")
+                if tags is None:
+                    return None
+                if not isinstance(tags, list) or len(tags) != B:
+                    return None
+                out = []
+                for tlist in tags:
+                    if not isinstance(tlist, list):
+                        out.append(False)
+                        continue
+                    out.append(any((t in _TURN_TAGS) for t in tlist))
+                return torch.tensor(out, dtype=torch.bool, device=device)
 
             def _turn_mask_from_gt(gt_xy: torch.Tensor) -> torch.Tensor:
                 """Classify turning samples from GT future xy.
@@ -586,7 +619,19 @@ def train_loop_paper_dit_xstart(
 
                     # ADE/FDE overall + turn/straight breakdown
                     d = torch.linalg.norm(pred_ego_xy - gt_ego_xy, dim=-1)  # [B,T]
-                    turn_mask = _turn_mask_from_gt(gt_ego_xy)
+                    # turning classification: tags preferred (if configured), with optional GT fallback
+                    turn_mask_tags = _turn_mask_from_tags(batch.get("meta"), B, gt_ego_xy.device)
+                    turn_mask_gt = _turn_mask_from_gt(gt_ego_xy)
+                    if turn_source == "tags":
+                        turn_mask = turn_mask_tags if turn_mask_tags is not None else torch.zeros((B,), dtype=torch.bool, device=gt_ego_xy.device)
+                    elif turn_source == "gt":
+                        turn_mask = turn_mask_gt
+                    else:  # tags_or_gt
+                        if turn_mask_tags is None:
+                            turn_mask = turn_mask_gt
+                        else:
+                            # If tags say turning, trust it; otherwise fall back to GT heuristic.
+                            turn_mask = turn_mask_tags | ((~turn_mask_tags) & turn_mask_gt)
                     n_turn_b = int(turn_mask.detach().long().sum().cpu().item())
                     n_straight_b = int(B - n_turn_b)
 

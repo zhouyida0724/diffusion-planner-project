@@ -230,6 +230,14 @@ def parse_args() -> argparse.Namespace:
         help="When --fast-eval-mode=sampler, number of DPM sampler steps.",
     )
 
+    p.add_argument(
+        "--fast-eval-turn-source",
+        type=str,
+        default="tags_or_gt",
+        choices=["tags_or_gt", "tags", "gt"],
+        help="How to classify turning for fast-eval breakdown.",
+    )
+
     # Fast-eval turn/straight breakdown (GT-based)
     p.add_argument(
         "--fast-eval-turn-angle-deg",
@@ -596,6 +604,7 @@ def main() -> None:
         # fast-eval behavior
         fast_eval_mode=str(getattr(args, "fast_eval_mode", "proxy") or "proxy"),
         fast_eval_diffusion_steps=int(getattr(args, "fast_eval_diffusion_steps", 10) or 10),
+        fast_eval_turn_source=str(getattr(args, "fast_eval_turn_source", "tags_or_gt") or "tags_or_gt"),
         fast_eval_turn_angle_deg=float(getattr(args, "fast_eval_turn_angle_deg", 15.0) or 15.0),
         fast_eval_turn_min_travel_m=float(getattr(args, "fast_eval_turn_min_travel_m", 5.0) or 5.0),
 

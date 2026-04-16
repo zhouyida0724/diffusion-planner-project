@@ -99,6 +99,10 @@ class TrainConfig:
     fast_eval_diffusion_steps: int = 10
 
     # fast-eval turn/straight breakdown (paper_dit_dpm)
+    # - tags_or_gt: prefer manifest tags if present, else fall back to GT-trajectory heuristic
+    # - tags: use tags only
+    # - gt: use GT-trajectory heuristic only
+    fast_eval_turn_source: str = "tags_or_gt"  # tags_or_gt|tags|gt
     # Turning is classified from GT future (ego_agent_future XY) by total heading change.
     # Heuristics (10Hz assumed): require some travel before trusting heading.
     fast_eval_turn_angle_deg: float = 15.0
