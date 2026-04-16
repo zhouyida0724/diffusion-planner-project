@@ -41,6 +41,27 @@ outputs/**
 scripts/extract_single_frame/_tmp_*.py
 scripts/extract_single_frame/*.bak*
 
+# Repo-local scratch dirs (never commit)
+/10/
+/exports_stub/
+/rerun_pr38_clean/
+/third_party/
+/tmp/
+/tmp_abmetrics/
+/train_data_boston150w/
+
+# One-off local launchers (keep out of git history)
+/_tmp_check_vegas_p3p4.py
+/plan_v0.1_*_20260404_1403
+/plan_v0.1_*_20260404_1405
+/scripts/run_train_mix3city_v4.sh
+/scripts/export/diffusion_planner/pipeline/run_export_vegas_*.sh
+/scripts/export/diffusion_planner/pipeline/run_export_vegas_*_in_docker.sh
+/scripts/export/diffusion_planner/pipeline/materialize_training_cache_partitions.py
+
+# Debug scratch scripts (use tmp/ instead if you need to share)
+/scripts/debug/
+
 # Cython extension build artifacts (fast_geometry)
 src/platform/build/
 src/platform/*.so
