@@ -229,6 +229,20 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="When --fast-eval-mode=sampler, number of DPM sampler steps.",
     )
+
+    # Fast-eval turn/straight breakdown (GT-based)
+    p.add_argument(
+        "--fast-eval-turn-angle-deg",
+        type=float,
+        default=15.0,
+        help="Turning threshold in degrees based on GT heading change (default: 15deg).",
+    )
+    p.add_argument(
+        "--fast-eval-turn-min-travel-m",
+        type=float,
+        default=5.0,
+        help="Min GT travel distance (meters) before classifying turning (default: 5m).",
+    )
     p.add_argument(
         "--fast-eval-batch-size",
         type=int,
@@ -582,6 +596,8 @@ def main() -> None:
         # fast-eval behavior
         fast_eval_mode=str(getattr(args, "fast_eval_mode", "proxy") or "proxy"),
         fast_eval_diffusion_steps=int(getattr(args, "fast_eval_diffusion_steps", 10) or 10),
+        fast_eval_turn_angle_deg=float(getattr(args, "fast_eval_turn_angle_deg", 15.0) or 15.0),
+        fast_eval_turn_min_travel_m=float(getattr(args, "fast_eval_turn_min_travel_m", 5.0) or 5.0),
 
         # resume
         resume_ckpt=str(getattr(args, "resume_ckpt", None)) if getattr(args, "resume_ckpt", None) else None,

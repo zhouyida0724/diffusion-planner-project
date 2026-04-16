@@ -98,6 +98,12 @@ class TrainConfig:
     fast_eval_mode: str = "proxy"  # proxy|sampler
     fast_eval_diffusion_steps: int = 10
 
+    # fast-eval turn/straight breakdown (paper_dit_dpm)
+    # Turning is classified from GT future (ego_agent_future XY) by total heading change.
+    # Heuristics (10Hz assumed): require some travel before trusting heading.
+    fast_eval_turn_angle_deg: float = 15.0
+    fast_eval_turn_min_travel_m: float = 5.0
+
     # resume (optional)
     # Path to a checkpoint payload produced by this trainer, e.g. checkpoint_step_XXXXXX.pt
     resume_ckpt: str | None = None

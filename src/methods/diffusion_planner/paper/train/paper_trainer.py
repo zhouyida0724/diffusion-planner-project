@@ -441,6 +441,51 @@ def train_loop_paper_dit_xstart(
         def _eval_one(loader: DataLoader) -> tuple[dict[str, float], int]:
             n_total = 0
             sum_metrics: dict[str, float] = {}
+
+            # Turn/straight breakdown (GT-based)
+            n_turn_total = 0
+            n_straight_total = 0
+            sum_turn: dict[str, float] = {}
+            sum_straight: dict[str, float] = {}
+
+            # Precompute horizon tags once.
+            horizon_tags: list[tuple[int, str]] = []
+            for _h in horizon_idxs:
+                hh = int(_h)
+                # Map idx->seconds assuming 10Hz (idx 9 => 1s).
+                sec = (hh + 1) / 10.0
+                tag = f"{sec:g}s".replace(".", "p")
+                horizon_tags.append((hh, tag))
+
+            turn_angle_deg = float(getattr(cfg, "fast_eval_turn_angle_deg", 15.0) or 15.0)
+            turn_min_travel_m = float(getattr(cfg, "fast_eval_turn_min_travel_m", 5.0) or 5.0)
+            turn_angle_thr = (turn_angle_deg * float(torch.pi)) / 180.0
+
+            def _turn_mask_from_gt(gt_xy: torch.Tensor) -> torch.Tensor:
+                """Classify turning samples from GT future xy.
+
+                Returns:
+                  mask: [B] bool, True = turning.
+                """
+
+                assert gt_xy.ndim == 3 and gt_xy.shape[-1] == 2
+                # [B,T-1,2]
+                dxy = gt_xy[:, 1:, :] - gt_xy[:, :-1, :]
+                step_dist = torch.linalg.norm(dxy, dim=-1)  # [B,T-1]
+                travel = step_dist.sum(dim=-1)  # [B]
+
+                # Heading change from velocities, with unwrap.
+                heading = torch.atan2(dxy[..., 1], dxy[..., 0])  # [B,T-1]
+                if heading.shape[-1] >= 2:
+                    dh = torch.diff(heading, dim=-1)  # [B,T-2]
+                    dh = torch.remainder(dh + torch.pi, 2.0 * torch.pi) - torch.pi
+                    heading_unwrap = torch.cat([heading[:, :1], heading[:, :1] + torch.cumsum(dh, dim=-1)], dim=-1)
+                    yaw_change = torch.abs(heading_unwrap[:, -1] - heading_unwrap[:, 0])
+                else:
+                    yaw_change = torch.zeros((gt_xy.shape[0],), device=gt_xy.device, dtype=gt_xy.dtype)
+
+                return (travel >= float(turn_min_travel_m)) & (yaw_change >= float(turn_angle_thr))
+
             with torch.no_grad():
                 for batch in loader:
                     batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -539,12 +584,47 @@ def train_loop_paper_dit_xstart(
                         gt_ego_future = gt_ego_future[:, 1:, :]
                     gt_ego_xy = gt_ego_future[..., :2]
 
-                    ade_fde = _ade_fde_at_horizons(pred_ego_xy, gt_ego_xy, horizon_idxs)
+                    # ADE/FDE overall + turn/straight breakdown
+                    d = torch.linalg.norm(pred_ego_xy - gt_ego_xy, dim=-1)  # [B,T]
+                    turn_mask = _turn_mask_from_gt(gt_ego_xy)
+                    n_turn_b = int(turn_mask.detach().long().sum().cpu().item())
+                    n_straight_b = int(B - n_turn_b)
+
+                    ade_fde: dict[str, float] = {}
+                    turn_metrics: dict[str, float] = {}
+                    straight_metrics: dict[str, float] = {}
+                    for hh, tag in horizon_tags:
+                        if hh < 0 or hh >= int(d.shape[1]):
+                            continue
+                        ade_v = d[:, : hh + 1].mean()
+                        fde_v = d[:, hh].mean()
+                        ade_fde[f"ade_{tag}"] = float(ade_v.detach().float().cpu().item())
+                        ade_fde[f"fde_{tag}"] = float(fde_v.detach().float().cpu().item())
+
+                        if n_turn_b > 0:
+                            ade_t = d[turn_mask, : hh + 1].mean()
+                            fde_t = d[turn_mask, hh].mean()
+                            turn_metrics[f"ade_{tag}_turn"] = float(ade_t.detach().float().cpu().item())
+                            turn_metrics[f"fde_{tag}_turn"] = float(fde_t.detach().float().cpu().item())
+                        if n_straight_b > 0:
+                            m = ~turn_mask
+                            ade_s = d[m, : hh + 1].mean()
+                            fde_s = d[m, hh].mean()
+                            straight_metrics[f"ade_{tag}_straight"] = float(ade_s.detach().float().cpu().item())
+                            straight_metrics[f"fde_{tag}_straight"] = float(fde_s.detach().float().cpu().item())
 
                     metrics_batch: dict[str, float] = {
                         "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()) if torch.is_tensor(val_loss_proxy) else float("nan"),
                     }
                     metrics_batch.update(ade_fde)
+
+                    # Accumulate turn/straight means (weighted by subset counts).
+                    n_turn_total += n_turn_b
+                    n_straight_total += n_straight_b
+                    for k, v in turn_metrics.items():
+                        sum_turn[k] = sum_turn.get(k, 0.0) + float(v) * float(n_turn_b)
+                    for k, v in straight_metrics.items():
+                        sum_straight[k] = sum_straight.get(k, 0.0) + float(v) * float(n_straight_b)
 
                     n_total += B
                     for k, v in metrics_batch.items():
@@ -552,7 +632,29 @@ def train_loop_paper_dit_xstart(
 
             if n_total <= 0:
                 return {}, 0
+
             metrics = {k: (v / n_total) for k, v in sum_metrics.items()}
+
+            # Always include breakdown keys for stable logging.
+            metrics["n_turn"] = int(n_turn_total)
+            metrics["n_straight"] = int(n_straight_total)
+            metrics["turn_ratio"] = float(n_turn_total / max(n_total, 1))
+
+            for _hh, tag in horizon_tags:
+                # turning
+                for base in ("ade", "fde"):
+                    k = f"{base}_{tag}_turn"
+                    if n_turn_total > 0 and k in sum_turn:
+                        metrics[k] = float(sum_turn[k] / n_turn_total)
+                    else:
+                        metrics[k] = float("nan")
+                # straight
+                for base in ("ade", "fde"):
+                    k = f"{base}_{tag}_straight"
+                    if n_straight_total > 0 and k in sum_straight:
+                        metrics[k] = float(sum_straight[k] / n_straight_total)
+                    else:
+                        metrics[k] = float("nan")
             return metrics, n_total
 
         # evaluate each city equally (no city is "main")
