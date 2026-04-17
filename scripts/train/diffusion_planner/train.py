@@ -502,7 +502,8 @@ def main() -> None:
                 if k == "meta":
                     continue
                 if torch.is_tensor(v0):
-                    out[k] = torch.cat([b[k] for b in batch], dim=0)
+                    # Dataset returns per-sample tensors (no batch dim). Stack into [B, ...].
+                    out[k] = torch.stack([b[k] for b in batch], dim=0)
                 else:
                     out[k] = [b.get(k) for b in batch]
 
