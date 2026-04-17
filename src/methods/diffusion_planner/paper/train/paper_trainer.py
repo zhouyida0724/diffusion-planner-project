@@ -266,6 +266,14 @@ def train_loop_paper_dit_xstart(
     # This keeps TB tags stable across steps and aligned across cities.
     tb_vis_by_city: dict[str, list[dict[str, Any]]] = {}
     if fast_eval_loaders is not None:
+        _TURN_TAGS = {
+            "starting_left_turn",
+            "starting_right_turn",
+            "starting_high_speed_turn",
+            "starting_low_speed_turn",
+            "starting_protected_noncross_turn",
+            "starting_unprotected_cross_turn",
+        }
         for _city, _ldr in fast_eval_loaders.items():
             try:
                 _batch = next(iter(_ldr))
@@ -278,8 +286,56 @@ def train_loop_paper_dit_xstart(
                     break
             if B0 is None or B0 <= 0:
                 continue
+
+            # Prefer turning scenes for visualization (when meta.tags is available).
+            prefer_turn = bool(getattr(cfg, "tb_prefer_turn", True))
+            turn_idxs: list[int] = []
+            other_idxs: list[int] = list(range(int(B0)))
+            if prefer_turn:
+                meta = _batch.get("meta")
+                try:
+                    tags = meta.get("tags") if isinstance(meta, dict) else None
+                    if isinstance(tags, list) and len(tags) == int(B0):
+                        # Strong preference: include both left+right turns when available.
+                        # (This keeps TB panels informative and avoids sampling only one direction.)
+                        left_idxs = [
+                            i
+                            for i, tlist in enumerate(tags)
+                            if isinstance(tlist, list) and ("starting_left_turn" in tlist)
+                        ]
+                        right_idxs = [
+                            i
+                            for i, tlist in enumerate(tags)
+                            if isinstance(tlist, list) and ("starting_right_turn" in tlist)
+                        ]
+                        any_turn_idxs = [
+                            i
+                            for i, tlist in enumerate(tags)
+                            if isinstance(tlist, list) and any((t in _TURN_TAGS) for t in tlist)
+                        ]
+
+                        # Stable, unique ordering.
+                        chosen_turn: list[int] = []
+                        if left_idxs:
+                            chosen_turn.append(int(left_idxs[0]))
+                        if right_idxs:
+                            ri = int(right_idxs[0])
+                            if ri not in chosen_turn:
+                                chosen_turn.append(ri)
+                        for i in any_turn_idxs:
+                            ii = int(i)
+                            if ii not in chosen_turn:
+                                chosen_turn.append(ii)
+
+                        turn_idxs = chosen_turn
+                        other_idxs = [i for i in range(int(B0)) if i not in set(turn_idxs)]
+                except Exception:
+                    turn_idxs = []
+                    other_idxs = list(range(int(B0)))
+
+            chosen = (turn_idxs + other_idxs)[: int(tb_num_samples)]
             samples: list[dict[str, Any]] = []
-            for i in range(min(tb_num_samples, B0)):
+            for i in chosen:
                 s: dict[str, Any] = {}
                 for k, v in _batch.items():
                     if torch.is_tensor(v):
@@ -405,6 +461,49 @@ def train_loop_paper_dit_xstart(
 
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
+
+    def _maybe_mask_ego_history_inplace(batch_d: dict[str, Any]) -> int:
+        """Mask ego-history conditioning features in-place (train only).
+
+        Our exported feature layout uses neighbor_agents_past with slot 0 reserved for ego.
+        We mask slot-0 past timesteps (optionally keeping the last timestep) with probability p.
+        """
+
+        p = float(getattr(cfg, "mask_ego_history_prob", 0.0) or 0.0)
+        if p <= 0.0:
+            return 0
+        keep_last = bool(getattr(cfg, "mask_ego_history_keep_last", True))
+
+        nb = batch_d.get("neighbor_agents_past")
+        if not torch.is_tensor(nb):
+            return 0
+        if nb.ndim != 4 or nb.shape[0] <= 0:
+            return 0
+
+        B = int(nb.shape[0])
+        # per-sample mask
+        m = (torch.rand((B,), device=nb.device, dtype=torch.float32) < p)
+        if not bool(m.any().item()):
+            return 0
+        idx = m.nonzero(as_tuple=False).squeeze(1)
+
+        # Mask only ego slot (0). Keep the last timestep (current) by default.
+        if keep_last and int(nb.shape[2]) >= 2:
+            nb[idx, 0, :-1, :] = 0.0
+        else:
+            nb[idx, 0, :, :] = 0.0
+        batch_d["neighbor_agents_past"] = nb
+
+        # If an explicit ego_past exists in this loader (not required for paper training), mask it too.
+        ego_past = batch_d.get("ego_past")
+        if torch.is_tensor(ego_past) and ego_past.ndim == 3 and int(ego_past.shape[0]) == B:
+            if keep_last and int(ego_past.shape[1]) >= 2:
+                ego_past[idx, :-1, :] = 0.0
+            else:
+                ego_past[idx, :, :] = 0.0
+            batch_d["ego_past"] = ego_past
+
+        return int(idx.numel())
 
     # -----------------
     # fast validation
@@ -934,6 +1033,13 @@ def train_loop_paper_dit_xstart(
         t_seg = time.perf_counter()
         batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
         breakdown["to_device_s"] = float(time.perf_counter() - t_seg)
+
+        # optional: ego-history masking augmentation (train only)
+        t_seg = time.perf_counter()
+        n_masked = _maybe_mask_ego_history_inplace(batch)
+        breakdown["mask_ego_history_s"] = float(time.perf_counter() - t_seg)
+        if n_masked:
+            breakdown["mask_ego_history_n"] = int(n_masked)
 
         # build + diffusion setup (count as misc, but keep a couple sub-keys for debugging)
         t_seg = time.perf_counter()
