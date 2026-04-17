@@ -688,6 +688,17 @@ def main() -> None:
         model = EpsMLP(x_dim=ds.x_dim, T=ds.y_T)
         exp_dir = train_loop_diffusion_eps(cfg=cfg, model=model, train_loader=dl)
     elif args.mode == "paper_dit_dpm":
+        # Normalization is mandatory for paper_dit_dpm.
+        # Without observation normalization, training/TB sampling can drift badly and become misleading.
+        norm_path = getattr(args, "normalization_file", None)
+        if not norm_path:
+            raise SystemExit(
+                "paper_dit_dpm requires --normalization-file (precomputed stats). "
+                "Example: --normalization-file outputs/cache/normalization_ours_bos150w_vegas_pgh.json"
+            )
+        if not Path(str(norm_path)).expanduser().is_file():
+            raise SystemExit(f"--normalization-file not found: {norm_path}")
+
         # Infer feature shapes from dataset to avoid hard-coded mismatches.
         s0 = ds[0]
         nb = s0["neighbor_agents_past"]
@@ -712,20 +723,20 @@ def main() -> None:
             future_len=future_len,
         )
 
-        # Optional: load normalization stats computed from training cache.
-        norm_path = getattr(args, "normalization_file", None)
-        if norm_path:
-            data = json.loads(Path(norm_path).read_text())
-            if "ego" in data and "neighbor" in data:
-                ego_mean = data["ego"]["mean"]
-                ego_std = data["ego"]["std"]
-                nb_mean = data["neighbor"]["mean"]
-                nb_std = data["neighbor"]["std"]
-                paper_cfg.state_mean = [[ego_mean]] + [[nb_mean]] * int(paper_cfg.predicted_neighbor_num)
-                paper_cfg.state_std = [[ego_std]] + [[nb_std]] * int(paper_cfg.predicted_neighbor_num)
-            # ObservationNormalizer consumes everything except ego/neighbor.
-            obs_norm = {k: v for k, v in data.items() if k not in ("ego", "neighbor")}
-            paper_cfg.observation_norm = obs_norm if obs_norm else None
+        # Load normalization stats computed from training cache.
+        data = json.loads(Path(norm_path).read_text())
+        if "ego" in data and "neighbor" in data:
+            ego_mean = data["ego"]["mean"]
+            ego_std = data["ego"]["std"]
+            nb_mean = data["neighbor"]["mean"]
+            nb_std = data["neighbor"]["std"]
+            paper_cfg.state_mean = [[ego_mean]] + [[nb_mean]] * int(paper_cfg.predicted_neighbor_num)
+            paper_cfg.state_std = [[ego_std]] + [[nb_std]] * int(paper_cfg.predicted_neighbor_num)
+        # ObservationNormalizer consumes everything except ego/neighbor.
+        obs_norm = {k: v for k, v in data.items() if k not in ("ego", "neighbor")}
+        paper_cfg.observation_norm = obs_norm if obs_norm else None
+        if paper_cfg.observation_norm is None:
+            raise SystemExit(f"Invalid normalization JSON (empty observation_norm): {norm_path}")
 
         model = PaperDiffusionPlanner(paper_cfg)
         exp_dir = train_loop_paper_dit_xstart(
