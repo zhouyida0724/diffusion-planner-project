@@ -295,6 +295,28 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--tb-image-size", type=int, default=800, help="Best-effort render size for TB images.")
 
+    # ego-history masking augmentation (paper_dit_dpm)
+    p.add_argument(
+        "--mask-ego-history-prob",
+        type=float,
+        default=0.0,
+        help="With probability p (per-sample), mask ego history in conditioning features (default: 0).",
+    )
+    p.add_argument(
+        "--mask-ego-history-keep-last",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="When masking, keep the last timestep (current) and only mask the past. 1=yes (default), 0=no.",
+    )
+    p.add_argument(
+        "--tb-prefer-turn",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="When pre-sampling TB examples, prefer turning-tagged samples if available. 1=yes (default), 0=no.",
+    )
+
     # loss spike dump (diagnosis)
     p.add_argument("--spike-dump", action="store_true", help="Dump top-k samples when train loss spikes.")
     p.add_argument("--spike-start", type=int, default=2000, help="Start dumping spikes after this step.")
@@ -464,6 +486,38 @@ def main() -> None:
     fast_eval_exclude_keys: set[tuple[str, int]] = set()
 
     if args.mode == "paper_dit_dpm":
+        def _feature_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+            """Custom collate for feature dataset.
+
+            Default PyTorch collation fails on variable-length `meta.tags` (list-of-strings).
+            We stack tensor fields normally, but keep meta fields as python lists.
+            """
+
+            if not batch:
+                return {}
+
+            out: dict[str, Any] = {}
+            # tensor keys
+            for k, v0 in batch[0].items():
+                if k == "meta":
+                    continue
+                if torch.is_tensor(v0):
+                    out[k] = torch.cat([b[k] for b in batch], dim=0)
+                else:
+                    out[k] = [b.get(k) for b in batch]
+
+            # meta: keep as dict of lists (not recursively collated)
+            metas = [b.get("meta") or {} for b in batch]
+            meta_keys: set[str] = set()
+            for m in metas:
+                if isinstance(m, dict):
+                    meta_keys |= set(m.keys())
+            meta_out: dict[str, Any] = {}
+            for mk in sorted(meta_keys):
+                meta_out[mk] = [(m.get(mk) if isinstance(m, dict) else None) for m in metas]
+            out["meta"] = meta_out
+            return out
+
         # Multi-city fast evaluation (equal status) + strict blacklist isolation.
         # We build fast-eval subsets first, then blacklist them from the training dataset.
         if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
@@ -493,6 +547,7 @@ def main() -> None:
                     num_workers=int(getattr(args, "fast_eval_num_workers", None) or args.fast_val_num_workers),
                     pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
                     drop_last=False,
+                    collate_fn=_feature_collate,
                 )
 
             _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
@@ -521,6 +576,7 @@ def main() -> None:
             num_workers=args.num_workers,
             pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
             drop_last=True,
+            collate_fn=_feature_collate,
         )
 
         # Optional fast validation loader (deterministic prefix subset).
@@ -539,6 +595,7 @@ def main() -> None:
                     num_workers=int(args.fast_val_num_workers),
                     pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
                     drop_last=False,
+                    collate_fn=_feature_collate,
                 )
                 print(f"Fast-val dataset size: {len(fv_ds)} kept samples | every={int(args.fast_val_every)}")
             else:
@@ -594,6 +651,12 @@ def main() -> None:
         tb_denoise_mode=str(getattr(args, "tb_denoise_mode", "t_sweep")),
         tb_sampler_steps=int(getattr(args, "tb_sampler_steps", args.tb_denoise_k)),
         tb_image_size=int(args.tb_image_size),
+
+        tb_prefer_turn=bool(int(getattr(args, "tb_prefer_turn", 1))),
+
+        # ego-history masking augmentation
+        mask_ego_history_prob=float(getattr(args, "mask_ego_history_prob", 0.0) or 0.0),
+        mask_ego_history_keep_last=bool(int(getattr(args, "mask_ego_history_keep_last", 1))),
 
         # spike dump
         spike_dump=bool(getattr(args, "spike_dump", False)),
