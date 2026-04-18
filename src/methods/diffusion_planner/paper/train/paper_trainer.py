@@ -1649,11 +1649,11 @@ def train_loop_paper_dit_xstart(
                                         return_intermediate=True,
                                     )
 
-                                    t0 = 1.0 / float(noise_schedule.total_N)
+                                    t0_eps = 1.0 / float(noise_schedule.total_N)
                                     timesteps = dpm_solver.get_time_steps(
                                         skip_type="logSNR",
                                         t_T=float(noise_schedule.T),
-                                        t_0=float(t0),
+                                        t_0=float(t0_eps),
                                         N=tb_sampler_steps,
                                         device=device,
                                     )
@@ -1661,10 +1661,10 @@ def train_loop_paper_dit_xstart(
                                     for j in range(1, int(timesteps.shape[0])):
                                         t_labels.append(float(timesteps[j].item()))
                                     if len(inter) == len(t_labels) + 1:
-                                        t_labels.append(float(t0))
+                                        t_labels.append(float(t0_eps))
 
                                     # Pick 4 snapshots close to t≈[1.0,0.5,0.1,t0].
-                                    targets = [1.0, 0.5, 0.1, float(t0)]
+                                    targets = [1.0, 0.5, 0.1, float(t0_eps)]
                                     idxs = []
                                     for tt in targets:
                                         best_i, best_d = 0, 1e9
@@ -1718,18 +1718,18 @@ def train_loop_paper_dit_xstart(
                                             tags1 = meta1.get("tags")
                                         # Collated meta.tags can be list[list[str]] or list[str] depending on DataLoader.
                                         if isinstance(tags1, list) and len(tags1) >= 1:
-                                            t0 = tags1[0]
-                                            if isinstance(t0, list):
-                                                if "starting_left_turn" in t0:
+                                            tag0 = tags1[0]
+                                            if isinstance(tag0, list):
+                                                if "starting_left_turn" in tag0:
                                                     man = "left"
-                                                elif "starting_right_turn" in t0:
+                                                elif "starting_right_turn" in tag0:
                                                     man = "right"
-                                                elif any((t in {"starting_left_turn","starting_right_turn","starting_high_speed_turn","starting_low_speed_turn","starting_protected_noncross_turn","starting_unprotected_cross_turn"}) for t in t0):
+                                                elif any((t in {"starting_left_turn","starting_right_turn","starting_high_speed_turn","starting_low_speed_turn","starting_protected_noncross_turn","starting_unprotected_cross_turn"}) for t in tag0):
                                                     man = "turn"
-                                            elif isinstance(t0, str):
-                                                if t0 == "starting_left_turn":
+                                            elif isinstance(tag0, str):
+                                                if tag0 == "starting_left_turn":
                                                     man = "left"
-                                                elif t0 == "starting_right_turn":
+                                                elif tag0 == "starting_right_turn":
                                                     man = "right"
                                     except Exception:
                                         man = "other"
