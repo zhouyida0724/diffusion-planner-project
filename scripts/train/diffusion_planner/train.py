@@ -521,9 +521,32 @@ def main() -> None:
 
         # Multi-city fast evaluation (equal status) + strict blacklist isolation.
         # We build fast-eval subsets first, then blacklist them from the training dataset.
-        if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
+        #
+        # NOTE: Even if fast-eval itself is disabled (fast_eval_every=0), we still
+        # want stable, per-city TensorBoard visualization examples when TB image
+        # logging is enabled. Without per-city loaders, TB falls back to sampling
+        # from the mixed-city training batch, which can easily produce "all straight"
+        # panels and mis-labeled city sections.
+        need_fast_eval_loaders = (int(getattr(args, "fast_eval_every", 0) or 0) > 0) or bool(getattr(args, "tb_enable", False))
+
+        if need_fast_eval_loaders:
             n_city = int(getattr(args, "fast_eval_n", 1024) or 1024)
             seed_city = int(getattr(args, "fast_eval_seed", 0) or 0)
+
+            # If user did not explicitly provide per-city roots, infer them from
+            # the expanded training roots by substring match.
+            tr_lower = [str(r).lower() for r in train_roots]
+            infer_boston = [r for r, rl in zip(train_roots, tr_lower) if "boston" in rl]
+            infer_pgh = [r for r, rl in zip(train_roots, tr_lower) if "pittsburgh" in rl]
+            infer_vegas = [r for r, rl in zip(train_roots, tr_lower) if "vegas" in rl]
+
+            if getattr(args, "fast_eval_boston_roots", None) is None and infer_boston:
+                args.fast_eval_boston_roots = list(infer_boston)
+                args.fast_eval_boston_slices = None
+            if getattr(args, "fast_eval_pittsburgh_roots", None) is None and infer_pgh:
+                args.fast_eval_pittsburgh_roots = list(infer_pgh)
+            if getattr(args, "fast_eval_vegas_roots", None) is None and infer_vegas:
+                args.fast_eval_vegas_roots = list(infer_vegas)
 
             def _maybe_add_city(city: str, roots: list[str] | None, slices: list[str] | None = None) -> None:
                 nonlocal fast_eval_exclude_keys
