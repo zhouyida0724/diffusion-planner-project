@@ -296,18 +296,10 @@ def train_loop_paper_dit_xstart(
                 try:
                     tags = meta.get("tags") if isinstance(meta, dict) else None
                     if isinstance(tags, list) and len(tags) == int(B0):
-                        # Strong preference: include both left+right turns when available.
-                        # (This keeps TB panels informative and avoids sampling only one direction.)
-                        left_idxs = [
-                            i
-                            for i, tlist in enumerate(tags)
-                            if isinstance(tlist, list) and ("starting_left_turn" in tlist)
-                        ]
-                        right_idxs = [
-                            i
-                            for i, tlist in enumerate(tags)
-                            if isinstance(tlist, list) and ("starting_right_turn" in tlist)
-                        ]
+                        # Strong preference: include multiple left+right turns when available.
+                        # (Keeps TB panels informative and avoids sampling only one direction.)
+                        left_idxs = [i for i, tlist in enumerate(tags) if isinstance(tlist, list) and ("starting_left_turn" in tlist)]
+                        right_idxs = [i for i, tlist in enumerate(tags) if isinstance(tlist, list) and ("starting_right_turn" in tlist)]
                         any_turn_idxs = [
                             i
                             for i, tlist in enumerate(tags)
@@ -316,12 +308,16 @@ def train_loop_paper_dit_xstart(
 
                         # Stable, unique ordering.
                         chosen_turn: list[int] = []
-                        if left_idxs:
-                            chosen_turn.append(int(left_idxs[0]))
-                        if right_idxs:
-                            ri = int(right_idxs[0])
-                            if ri not in chosen_turn:
-                                chosen_turn.append(ri)
+                        # Heuristic: try to allocate at least 2 left + 2 right when tb_num_samples allows.
+                        want_lr = 2 if int(tb_num_samples) >= 4 else 1
+                        for i in left_idxs[:want_lr]:
+                            ii = int(i)
+                            if ii not in chosen_turn:
+                                chosen_turn.append(ii)
+                        for i in right_idxs[:want_lr]:
+                            ii = int(i)
+                            if ii not in chosen_turn:
+                                chosen_turn.append(ii)
                         for i in any_turn_idxs:
                             ii = int(i)
                             if ii not in chosen_turn:
@@ -541,11 +537,15 @@ def train_loop_paper_dit_xstart(
             n_total = 0
             sum_metrics: dict[str, float] = {}
 
-            # Turn/straight breakdown (GT-based)
+            # Turn/straight + left/right breakdown (GT-based, with tags preferred when configured)
             n_turn_total = 0
             n_straight_total = 0
+            n_left_total = 0
+            n_right_total = 0
             sum_turn: dict[str, float] = {}
             sum_straight: dict[str, float] = {}
+            sum_left: dict[str, float] = {}
+            sum_right: dict[str, float] = {}
 
             # Precompute horizon tags once.
             horizon_tags: list[tuple[int, str]] = []
@@ -570,6 +570,68 @@ def train_loop_paper_dit_xstart(
                 "starting_protected_noncross_turn",
                 "starting_unprotected_cross_turn",
             }
+
+            _LEFT_TAGS = {
+                "starting_left_turn",
+            }
+            _RIGHT_TAGS = {
+                "starting_right_turn",
+            }
+
+            def _lr_masks_from_tags(meta_obj: Any, B: int, device: torch.device) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+                """Best-effort left/right masks from manifest tags.
+
+                Returns:
+                  left_mask, right_mask: each is [B] bool or None.
+                """
+
+                if not isinstance(meta_obj, dict):
+                    return None, None
+                tags = meta_obj.get("tags")
+                if tags is None:
+                    return None, None
+                if not isinstance(tags, list) or len(tags) != B:
+                    return None, None
+                left = []
+                right = []
+                for tlist in tags:
+                    if not isinstance(tlist, list):
+                        left.append(False)
+                        right.append(False)
+                        continue
+                    left.append(any((t in _LEFT_TAGS) for t in tlist))
+                    right.append(any((t in _RIGHT_TAGS) for t in tlist))
+                return torch.tensor(left, dtype=torch.bool, device=device), torch.tensor(right, dtype=torch.bool, device=device)
+
+            def _lr_masks_from_gt(gt_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                """Classify left/right/straight from GT future xy.
+
+                Turning is defined by travel + total heading change threshold.
+                Left vs right is determined by the sign of unwrapped heading delta.
+
+                Returns:
+                  left_mask, right_mask, straight_mask: each [B] bool.
+                """
+
+                assert gt_xy.ndim == 3 and gt_xy.shape[-1] == 2
+                dxy = gt_xy[:, 1:, :] - gt_xy[:, :-1, :]
+                step_dist = torch.linalg.norm(dxy, dim=-1)
+                travel = step_dist.sum(dim=-1)
+
+                heading = torch.atan2(dxy[..., 1], dxy[..., 0])
+                if heading.shape[-1] >= 2:
+                    dh = torch.diff(heading, dim=-1)
+                    dh = torch.remainder(dh + torch.pi, 2.0 * torch.pi) - torch.pi
+                    heading_unwrap = torch.cat([heading[:, :1], heading[:, :1] + torch.cumsum(dh, dim=-1)], dim=-1)
+                    delta = heading_unwrap[:, -1] - heading_unwrap[:, 0]
+                else:
+                    delta = torch.zeros((gt_xy.shape[0],), device=gt_xy.device, dtype=gt_xy.dtype)
+
+                is_turn = (travel >= float(turn_min_travel_m)) & (torch.abs(delta) >= float(turn_angle_thr))
+                left_mask = is_turn & (delta > 0)
+                right_mask = is_turn & (delta < 0)
+                straight_mask = ~is_turn
+                return left_mask, right_mask, straight_mask
 
             def _turn_mask_from_tags(meta_obj: Any, B: int, device: torch.device) -> Optional[torch.Tensor]:
                 """Best-effort turning mask from manifest tags.
@@ -721,6 +783,11 @@ def train_loop_paper_dit_xstart(
                     # turning classification: tags preferred (if configured), with optional GT fallback
                     turn_mask_tags = _turn_mask_from_tags(batch.get("meta"), B, gt_ego_xy.device)
                     turn_mask_gt = _turn_mask_from_gt(gt_ego_xy)
+
+                    # left/right classification: tags preferred (if configured), with optional GT fallback
+                    left_tags, right_tags = _lr_masks_from_tags(batch.get("meta"), B, gt_ego_xy.device)
+                    left_gt, right_gt, straight_gt = _lr_masks_from_gt(gt_ego_xy)
+
                     if turn_source == "tags":
                         turn_mask = turn_mask_tags if turn_mask_tags is not None else torch.zeros((B,), dtype=torch.bool, device=gt_ego_xy.device)
                     elif turn_source == "gt":
@@ -731,12 +798,41 @@ def train_loop_paper_dit_xstart(
                         else:
                             # If tags say turning, trust it; otherwise fall back to GT heuristic.
                             turn_mask = turn_mask_tags | ((~turn_mask_tags) & turn_mask_gt)
+
+                    # Compose left/right masks consistent with selected turn_source.
+                    if turn_source == "tags":
+                        left_mask = left_tags if left_tags is not None else torch.zeros((B,), dtype=torch.bool, device=gt_ego_xy.device)
+                        right_mask = right_tags if right_tags is not None else torch.zeros((B,), dtype=torch.bool, device=gt_ego_xy.device)
+                        # If tags are missing, fall back to straight/turn from chosen turn_mask.
+                        if left_tags is None or right_tags is None:
+                            left_mask = left_gt & turn_mask
+                            right_mask = right_gt & turn_mask
+                    elif turn_source == "gt":
+                        left_mask = left_gt
+                        right_mask = right_gt
+                    else:  # tags_or_gt
+                        if left_tags is None or right_tags is None:
+                            left_mask = left_gt
+                            right_mask = right_gt
+                        else:
+                            # Trust explicit left/right tags, else fall back to GT.
+                            left_mask = left_tags | ((~left_tags) & left_gt)
+                            right_mask = right_tags | ((~right_tags) & right_gt)
+                    # Enforce exclusivity: left/right are subsets of turning.
+                    left_mask = left_mask & turn_mask
+                    right_mask = right_mask & turn_mask & (~left_mask)
+                    straight_mask = ~turn_mask
+
                     n_turn_b = int(turn_mask.detach().long().sum().cpu().item())
                     n_straight_b = int(B - n_turn_b)
+                    n_left_b = int(left_mask.detach().long().sum().cpu().item())
+                    n_right_b = int(right_mask.detach().long().sum().cpu().item())
 
                     ade_fde: dict[str, float] = {}
                     turn_metrics: dict[str, float] = {}
                     straight_metrics: dict[str, float] = {}
+                    left_metrics: dict[str, float] = {}
+                    right_metrics: dict[str, float] = {}
                     for hh, tag in horizon_tags:
                         if hh < 0 or hh >= int(d.shape[1]):
                             continue
@@ -751,11 +847,20 @@ def train_loop_paper_dit_xstart(
                             turn_metrics[f"ade_{tag}_turn"] = float(ade_t.detach().float().cpu().item())
                             turn_metrics[f"fde_{tag}_turn"] = float(fde_t.detach().float().cpu().item())
                         if n_straight_b > 0:
-                            m = ~turn_mask
-                            ade_s = d[m, : hh + 1].mean()
-                            fde_s = d[m, hh].mean()
+                            ade_s = d[straight_mask, : hh + 1].mean()
+                            fde_s = d[straight_mask, hh].mean()
                             straight_metrics[f"ade_{tag}_straight"] = float(ade_s.detach().float().cpu().item())
                             straight_metrics[f"fde_{tag}_straight"] = float(fde_s.detach().float().cpu().item())
+                        if n_left_b > 0:
+                            ade_l = d[left_mask, : hh + 1].mean()
+                            fde_l = d[left_mask, hh].mean()
+                            left_metrics[f"ade_{tag}_left"] = float(ade_l.detach().float().cpu().item())
+                            left_metrics[f"fde_{tag}_left"] = float(fde_l.detach().float().cpu().item())
+                        if n_right_b > 0:
+                            ade_r = d[right_mask, : hh + 1].mean()
+                            fde_r = d[right_mask, hh].mean()
+                            right_metrics[f"ade_{tag}_right"] = float(ade_r.detach().float().cpu().item())
+                            right_metrics[f"fde_{tag}_right"] = float(fde_r.detach().float().cpu().item())
 
                     metrics_batch: dict[str, float] = {
                         "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()) if torch.is_tensor(val_loss_proxy) else float("nan"),
@@ -765,10 +870,16 @@ def train_loop_paper_dit_xstart(
                     # Accumulate turn/straight means (weighted by subset counts).
                     n_turn_total += n_turn_b
                     n_straight_total += n_straight_b
+                    n_left_total += n_left_b
+                    n_right_total += n_right_b
                     for k, v in turn_metrics.items():
                         sum_turn[k] = sum_turn.get(k, 0.0) + float(v) * float(n_turn_b)
                     for k, v in straight_metrics.items():
                         sum_straight[k] = sum_straight.get(k, 0.0) + float(v) * float(n_straight_b)
+                    for k, v in left_metrics.items():
+                        sum_left[k] = sum_left.get(k, 0.0) + float(v) * float(n_left_b)
+                    for k, v in right_metrics.items():
+                        sum_right[k] = sum_right.get(k, 0.0) + float(v) * float(n_right_b)
 
                     n_total += B
                     for k, v in metrics_batch.items():
@@ -782,7 +893,11 @@ def train_loop_paper_dit_xstart(
             # Always include breakdown keys for stable logging.
             metrics["n_turn"] = int(n_turn_total)
             metrics["n_straight"] = int(n_straight_total)
+            metrics["n_left"] = int(n_left_total)
+            metrics["n_right"] = int(n_right_total)
             metrics["turn_ratio"] = float(n_turn_total / max(n_total, 1))
+            metrics["left_ratio"] = float(n_left_total / max(n_total, 1))
+            metrics["right_ratio"] = float(n_right_total / max(n_total, 1))
 
             for _hh, tag in horizon_tags:
                 # turning
@@ -797,6 +912,20 @@ def train_loop_paper_dit_xstart(
                     k = f"{base}_{tag}_straight"
                     if n_straight_total > 0 and k in sum_straight:
                         metrics[k] = float(sum_straight[k] / n_straight_total)
+                    else:
+                        metrics[k] = float("nan")
+                # left
+                for base in ("ade", "fde"):
+                    k = f"{base}_{tag}_left"
+                    if n_left_total > 0 and k in sum_left:
+                        metrics[k] = float(sum_left[k] / n_left_total)
+                    else:
+                        metrics[k] = float("nan")
+                # right
+                for base in ("ade", "fde"):
+                    k = f"{base}_{tag}_right"
+                    if n_right_total > 0 and k in sum_right:
+                        metrics[k] = float(sum_right[k] / n_right_total)
                     else:
                         metrics[k] = float("nan")
             return metrics, n_total
@@ -1580,16 +1709,40 @@ def train_loop_paper_dit_xstart(
                                     x0_view = x0_flat.reshape(1, P, Tf + 1, 4)
                                     x0_inv = model.config.state_normalizer.inverse(x0_view)
                                     pred_xy = x0_inv[0, 0, 1:, :2]
+                                    # Best-effort maneuver label for clearer TB panels.
+                                    man = "other"
+                                    try:
+                                        meta1 = batch1.get("meta")
+                                        tags1 = None
+                                        if isinstance(meta1, dict):
+                                            tags1 = meta1.get("tags")
+                                        # Collated meta.tags can be list[list[str]] or list[str] depending on DataLoader.
+                                        if isinstance(tags1, list) and len(tags1) >= 1:
+                                            t0 = tags1[0]
+                                            if isinstance(t0, list):
+                                                if "starting_left_turn" in t0:
+                                                    man = "left"
+                                                elif "starting_right_turn" in t0:
+                                                    man = "right"
+                                                elif any((t in {"starting_left_turn","starting_right_turn","starting_high_speed_turn","starting_low_speed_turn","starting_protected_noncross_turn","starting_unprotected_cross_turn"}) for t in t0):
+                                                    man = "turn"
+                                            elif isinstance(t0, str):
+                                                if t0 == "starting_left_turn":
+                                                    man = "left"
+                                                elif t0 == "starting_right_turn":
+                                                    man = "right"
+                                    except Exception:
+                                        man = "other"
                                     scene_img = render_npz_style_scene(
                                         batch1,
                                         sample_idx=0,
                                         ego_future_xy=pred_xy,
-                                        title=f"viz | step={step} city={city} slot={slot}",
+                                        title=f"viz | step={step} city={city} slot={slot} man={man}",
                                         image_size=tb_image_size,
                                     )
                                     if scene_img is not None:
                                         tb.add_image(
-                                            f"viz/{city}/sample_{slot}",
+                                            f"viz/{city}/sample_{slot}_{man}",
                                             torch.from_numpy(scene_img).permute(2, 0, 1),
                                             int(step),
                                         )
