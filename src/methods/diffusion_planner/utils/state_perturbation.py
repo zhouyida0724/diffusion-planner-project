@@ -120,8 +120,7 @@ class StatePerturbation:
 
         ego_cs = batch.get("ego_current_state")
         ego_fut = batch.get("ego_agent_future")
-        nb_fut = batch.get("neighbor_agents_future")
-        if not (torch.is_tensor(ego_cs) and torch.is_tensor(ego_fut) and torch.is_tensor(nb_fut)):
+        if not (torch.is_tensor(ego_cs) and torch.is_tensor(ego_fut)):
             return batch
 
         B = int(ego_cs.shape[0])
@@ -129,6 +128,8 @@ class StatePerturbation:
             return batch
 
         # Decide per-sample application.
+        # NOTE: We interpret `prob` literally as P(apply). The reference Diffusion-Planner
+        # implementation uses `rand >= augment_prob` (inverted semantics except at 0.5).
         apply = (torch.rand((B,), device=ego_cs.device) < float(self.cfg.prob))
         if float(self.cfg.min_vx_mps) > 0:
             apply = apply & ~(torch.abs(ego_cs[:, 4]) < float(self.cfg.min_vx_mps))
@@ -138,7 +139,11 @@ class StatePerturbation:
         # Clone the tensors we mutate.
         ego_cs = ego_cs.clone()
         ego_fut = ego_fut.clone()
-        nb_fut = nb_fut.clone()
+
+        # Optional tensors (we'll transform them if present).
+        nb_fut = batch.get("neighbor_agents_future")
+        if torch.is_tensor(nb_fut):
+            nb_fut = nb_fut.clone()
 
         # -----------------
         # 1) Perturb ego_current_state.
@@ -177,6 +182,29 @@ class StatePerturbation:
         ego_cs[:, 8] = state1[:, 7]
         ego_cs[:, 9] = state1[:, 8]
 
+        # Optional kinematic consistency step (matches the open-source Diffusion-Planner):
+        # recompute steering angle from yaw_rate and forward velocity.
+        # This is effectively a no-op under the default bounds (steer/yaw_rate deltas are 0),
+        # but makes non-zero bounds safer.
+        try:
+            from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+
+            wheel_base = float(get_pacifica_parameters().wheel_base)
+            cur_v = ego_cs[:, 4]
+            yaw_rate = ego_cs[:, 9]
+            steer = torch.zeros_like(cur_v)
+            new_yaw_rate = torch.zeros_like(yaw_rate)
+            ok = torch.abs(cur_v) >= 0.2
+            if bool(ok.any().item()):
+                steer[ok] = torch.atan(yaw_rate[ok] * wheel_base / torch.abs(cur_v[ok]))
+                steer[ok] = torch.clamp(steer[ok], -2.0 / 3.0 * torch.pi, 2.0 / 3.0 * torch.pi)
+                new_yaw_rate[ok] = yaw_rate[ok]
+            ego_cs[:, 8] = steer
+            ego_cs[:, 9] = new_yaw_rate
+        except Exception:
+            # If nuPlan isn't available, skip this safety step.
+            pass
+
         # -----------------
         # 2) Quintic spline: regenerate first ~2s of ego future.
         # -----------------
@@ -188,7 +216,8 @@ class StatePerturbation:
         batch = dict(batch)
         batch["ego_current_state"] = ego_cs
         batch["ego_agent_future"] = ego_fut
-        batch["neighbor_agents_future"] = nb_fut
+        if torch.is_tensor(nb_fut):
+            batch["neighbor_agents_future"] = nb_fut
         batch = self._centric_transform_inplace(batch)
 
         return batch
@@ -228,6 +257,7 @@ class StatePerturbation:
         # neighbor past: [B,*,Tp,D] where xy/cos-sin/v are first dims.
         nb_past = batch.get("neighbor_agents_past")
         if torch.is_tensor(nb_past) and nb_past.ndim == 4 and nb_past.shape[-1] >= 6:
+            nb_past = nb_past.clone()
             # mask of rows that are fully zero (keep consistent with reference)
             mask = (torch.sum(torch.ne(nb_past[..., :6], 0.0), dim=-1) == 0)
             nb_past[..., :2] = _vector_transform(nb_past[..., :2], rot, center_xy)
@@ -239,6 +269,7 @@ class StatePerturbation:
         # neighbor future: [B,*,Tf,3]
         nb_fut = batch.get("neighbor_agents_future")
         if torch.is_tensor(nb_fut) and nb_fut.ndim == 4 and nb_fut.shape[-1] >= 3:
+            nb_fut = nb_fut.clone()
             mask = (torch.sum(torch.ne(nb_fut[..., :2], 0.0), dim=-1) == 0)
             nb_fut[..., :2] = _vector_transform(nb_fut[..., :2], rot, center_xy)
             nb_fut[..., 2] = _heading_transform(nb_fut[..., 2], rot)
@@ -250,6 +281,7 @@ class StatePerturbation:
             lane = batch.get(k)
             if not (torch.is_tensor(lane) and lane.ndim == 4 and lane.shape[-1] >= 8):
                 continue
+            lane = lane.clone()
             mask = (torch.sum(torch.ne(lane[..., :8], 0.0), dim=-1) == 0)
             lane[..., :2] = _vector_transform(lane[..., :2], rot, center_xy)
             lane[..., 2:4] = _vector_transform(lane[..., 2:4], rot)
@@ -261,6 +293,7 @@ class StatePerturbation:
         # static objects: [B,S,10] (we only transform xy, and (cos,sin) if present)
         so = batch.get("static_objects")
         if torch.is_tensor(so) and so.ndim == 3 and so.shape[-1] >= 2:
+            so = so.clone()
             mask = (torch.sum(torch.ne(so[..., :10] if so.shape[-1] >= 10 else so, 0.0), dim=-1) == 0)
             so[..., :2] = _vector_transform(so[..., :2], rot, center_xy)
             if so.shape[-1] >= 4:
@@ -340,4 +373,3 @@ class StatePerturbation:
 
         refined = torch.cat([traj_x, traj_y, traj_h[..., None]], dim=-1)  # [B,P,3]
         return torch.cat([refined, ego_future[:, P:, :]], dim=1)
-

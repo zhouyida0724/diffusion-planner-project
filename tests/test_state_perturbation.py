@@ -83,3 +83,21 @@ def test_state_perturbation_shapes_and_determinism():
         if torch.is_tensor(v):
             assert torch.equal(v, o2[k]), f"non-deterministic for key={k}"
 
+
+def test_state_perturbation_does_not_mutate_input_batch_inplace():
+    """Augmentation should not mutate the caller-provided batch tensors in-place."""
+
+    from src.methods.diffusion_planner.utils.state_perturbation import StatePerturbation, StatePerturbationConfig
+
+    cfg = StatePerturbationConfig(enabled=True, prob=1.0, min_vx_mps=0.0)
+    aug = StatePerturbation(cfg, device=torch.device("cpu"))
+
+    torch.manual_seed(0)
+    batch = _make_batch(B=2)
+    # Keep copies of tensors we expect the augmentation to transform.
+    saved = {k: v.clone() for k, v in batch.items() if torch.is_tensor(v)}
+
+    _ = aug(batch)
+
+    for k, v in saved.items():
+        assert torch.equal(batch[k], v), f"input batch mutated in-place for key={k}"
