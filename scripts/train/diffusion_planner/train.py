@@ -309,6 +309,37 @@ def parse_args() -> argparse.Namespace:
         choices=[0, 1],
         help="When masking, keep the last timestep (current) and only mask the past. 1=yes (default), 0=no.",
     )
+
+    # state perturbation augmentation (paper_dit_dpm; Diffusion-Planner style)
+    p.add_argument(
+        "--state-perturbation-enable",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Enable Diffusion-Planner-style state perturbation augmentation (default: 0).",
+    )
+    p.add_argument(
+        "--state-perturbation-prob",
+        type=float,
+        default=0.0,
+        help="Per-sample probability of applying state perturbation (default: 0).",
+    )
+    p.add_argument(
+        "--state-perturbation-low",
+        type=float,
+        nargs=9,
+        default=None,
+        metavar=("DX", "DY", "DYAW", "DVX", "DVY", "DAX", "DAY", "DSTEER", "DYAW_RATE"),
+        help="Lower bounds (9 floats) for [x,y,yaw,vx,vy,ax,ay,steer,yaw_rate] additive perturbations.",
+    )
+    p.add_argument(
+        "--state-perturbation-high",
+        type=float,
+        nargs=9,
+        default=None,
+        metavar=("DX", "DY", "DYAW", "DVX", "DVY", "DAX", "DAY", "DSTEER", "DYAW_RATE"),
+        help="Upper bounds (9 floats) for [x,y,yaw,vx,vy,ax,ay,steer,yaw_rate] additive perturbations.",
+    )
     p.add_argument(
         "--tb-prefer-turn",
         type=int,
@@ -681,6 +712,12 @@ def main() -> None:
         # ego-history masking augmentation
         mask_ego_history_prob=float(getattr(args, "mask_ego_history_prob", 0.0) or 0.0),
         mask_ego_history_keep_last=bool(int(getattr(args, "mask_ego_history_keep_last", 1))),
+
+        # state perturbation augmentation
+        state_perturbation_enable=bool(int(getattr(args, "state_perturbation_enable", 0))),
+        state_perturbation_prob=float(getattr(args, "state_perturbation_prob", 0.0) or 0.0),
+        state_perturbation_low=tuple(getattr(args, "state_perturbation_low", None) or TrainConfig.state_perturbation_low),
+        state_perturbation_high=tuple(getattr(args, "state_perturbation_high", None) or TrainConfig.state_perturbation_high),
 
         # spike dump
         spike_dump=bool(getattr(args, "spike_dump", False)),

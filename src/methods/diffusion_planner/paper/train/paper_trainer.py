@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
 from src.methods.diffusion_planner.paper.model.diffusion_utils import dpm_solver_pytorch as dpm
+from src.methods.diffusion_planner.utils.state_perturbation import StatePerturbation, StatePerturbationConfig
 from .tb_visualizer import render_npz_style_scene, render_xy_scatter, render_xy_scatter_with_context, stitch_montage
 
 
@@ -371,6 +372,127 @@ def train_loop_paper_dit_xstart(
 
                 return left_samples, right_samples
 
+            def _classify_lrs_from_batch(batch: dict[str, Any]) -> tuple[list[int], list[int], list[int]]:
+                """Return (left_idxs, right_idxs, straight_idxs) for this batch.
+
+                We trust tags for left/right when available, but we always compute straight from GT,
+                since a universal "straight" tag is not reliable across caches.
+                """
+
+                B = None
+                for _v in batch.values():
+                    if torch.is_tensor(_v):
+                        B = int(_v.shape[0])
+                        break
+                if B is None or B <= 0:
+                    return [], [], []
+
+                fut = batch.get("ego_agent_future")
+                if not (torch.is_tensor(fut) and fut.ndim >= 3 and int(fut.shape[0]) == int(B)):
+                    return [], [], []
+
+                # GT-based maneuver classifier (consistent with fast-eval):
+                # turning if abs(delta_heading) >= thr AND travel >= min_travel.
+                xy = fut[:, :, :2]
+                dxy = xy[:, 1:, :] - xy[:, :-1, :]
+                keep = (dxy.abs().sum(dim=-1) > 1e-4)  # [B,T-1]
+                headings = torch.atan2(dxy[..., 1], dxy[..., 0])
+                dh = headings[:, 1:] - headings[:, :-1]
+                dh = (dh + torch.pi) % (2 * torch.pi) - torch.pi
+                valid = keep[:, 1:] & keep[:, :-1]
+                dh = dh * valid.to(dtype=dh.dtype)
+
+                seg = torch.linalg.norm(dxy, dim=-1)
+                travel = (seg * keep.to(dtype=seg.dtype)).sum(dim=1)
+
+                turn_angle_deg = float(getattr(cfg, "fast_eval_turn_angle_deg", 15.0) or 15.0)
+                turn_min_travel_m = float(getattr(cfg, "fast_eval_turn_min_travel_m", 5.0) or 5.0)
+                thr = (turn_angle_deg * float(torch.pi)) / 180.0
+                total = dh.sum(dim=1)
+                mag = dh.abs().sum(dim=1)
+                is_turn = (travel >= float(turn_min_travel_m)) & (mag >= float(thr))
+                left_gt = is_turn & (total > 0)
+                right_gt = is_turn & (total < 0)
+                straight_gt = ~is_turn
+
+                straight_idxs = [int(i) for i in straight_gt.nonzero(as_tuple=False).flatten().tolist()]
+
+                # left/right: prefer tags if present
+                meta = batch.get("meta")
+                tags = meta.get("tags") if isinstance(meta, dict) else None
+                if isinstance(tags, list) and len(tags) == int(B):
+                    left_tag = [i for i, tlist in enumerate(tags) if isinstance(tlist, list) and ("starting_left_turn" in tlist)]
+                    right_tag = [i for i, tlist in enumerate(tags) if isinstance(tlist, list) and ("starting_right_turn" in tlist)]
+                    if left_tag or right_tag:
+                        left_idxs = [int(i) for i in left_tag]
+                        right_idxs = [int(i) for i in right_tag]
+                        return left_idxs, right_idxs, straight_idxs
+
+                left_idxs = [int(i) for i in left_gt.nonzero(as_tuple=False).flatten().tolist()]
+                right_idxs = [int(i) for i in right_gt.nonzero(as_tuple=False).flatten().tolist()]
+                return left_idxs, right_idxs, straight_idxs
+
+            def _gather_lrs_samples_from_loader(
+                ldr: Any,
+                *,
+                want_left: int,
+                want_right: int,
+                want_straight: int,
+                max_batches: int = 200,
+            ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+                left_samples: list[dict[str, Any]] = []
+                right_samples: list[dict[str, Any]] = []
+                straight_samples: list[dict[str, Any]] = []
+
+                for bi, batch in enumerate(ldr):
+                    if bi >= int(max_batches):
+                        break
+                    B = None
+                    for _v in batch.values():
+                        if torch.is_tensor(_v):
+                            B = int(_v.shape[0])
+                            break
+                    if B is None or B <= 0:
+                        continue
+
+                    li, ri, si = _classify_lrs_from_batch(batch)
+                    li = [int(i) for i in li if 0 <= int(i) < int(B)]
+                    ri = [int(i) for i in ri if 0 <= int(i) < int(B)]
+                    si = [int(i) for i in si if 0 <= int(i) < int(B)]
+
+                    def _make_sample(idx: int, man: str) -> dict[str, Any]:
+                        s: dict[str, Any] = {"tb_man": str(man)}
+                        for k, v in batch.items():
+                            if torch.is_tensor(v):
+                                s[k] = v[idx : idx + 1].to(device=device, dtype=torch.float32)
+                            elif k == "meta":
+                                s[k] = _slice_meta(v, idx=int(idx), B=int(B))
+                            else:
+                                s[k] = v
+                        return s
+
+                    for i in li:
+                        if len(left_samples) >= int(want_left):
+                            break
+                        left_samples.append(_make_sample(int(i), "left"))
+                    for i in ri:
+                        if len(right_samples) >= int(want_right):
+                            break
+                        right_samples.append(_make_sample(int(i), "right"))
+                    for i in si:
+                        if len(straight_samples) >= int(want_straight):
+                            break
+                        straight_samples.append(_make_sample(int(i), "straight"))
+
+                    if (
+                        len(left_samples) >= int(want_left)
+                        and len(right_samples) >= int(want_right)
+                        and len(straight_samples) >= int(want_straight)
+                    ):
+                        break
+
+                return left_samples, right_samples, straight_samples
+
             try:
                 _batch = next(iter(_ldr))
             except Exception:
@@ -512,9 +634,43 @@ def train_loop_paper_dit_xstart(
                     except Exception:
                         pass
 
-            # Strong mode: when tb_num_samples is even and prefer_turn is enabled,
-            # we try to guarantee left/right split by scanning multiple batches.
-            # This avoids the "all straight" failure mode.
+            # Strong mode (preferred): when tb_num_samples is a multiple of 3 (e.g. 9) and prefer_turn is enabled,
+            # try to guarantee a balanced left/right/straight split by scanning multiple batches.
+            strict_lrs = prefer_turn and (int(tb_num_samples) % 3 == 0) and int(tb_num_samples) >= 9
+            if strict_lrs:
+                want_total = int(tb_num_samples)
+                want_each = want_total // 3
+                want_left = want_each
+                want_right = want_each
+                want_straight = want_total - want_left - want_right
+                try:
+                    left_samples, right_samples, straight_samples = _gather_lrs_samples_from_loader(
+                        _ldr,
+                        want_left=want_left,
+                        want_right=want_right,
+                        want_straight=want_straight,
+                        max_batches=200,
+                    )
+                    if (
+                        len(left_samples) >= want_left
+                        and len(right_samples) >= want_right
+                        and len(straight_samples) >= want_straight
+                    ):
+                        tb_vis_by_city[str(_city)] = (
+                            left_samples[:want_left] + right_samples[:want_right] + straight_samples[:want_straight]
+                        )
+                        continue
+                    else:
+                        print(
+                            f"[tb] warning: strict left/right/straight selection failed for city={_city}: "
+                            f"left={len(left_samples)}/{want_left} right={len(right_samples)}/{want_right} straight={len(straight_samples)}/{want_straight}; "
+                            "falling back to best-effort",
+                            flush=True,
+                        )
+                except Exception as e:
+                    print(f"[tb] warning: strict left/right/straight selection failed for city={_city}: {e}", flush=True)
+
+            # Legacy strong mode: left/right only.
             strict_lr = prefer_turn and (int(tb_num_samples) % 2 == 0) and int(tb_num_samples) >= 4
             if strict_lr:
                 want_total = int(tb_num_samples)
@@ -667,6 +823,28 @@ def train_loop_paper_dit_xstart(
 
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
+
+    # Optional: Diffusion-Planner-style state perturbation augmentation (train only).
+    state_aug: StatePerturbation | None = None
+    if bool(getattr(cfg, "state_perturbation_enable", False)) and float(getattr(cfg, "state_perturbation_prob", 0.0) or 0.0) > 0.0:
+        try:
+            state_aug = StatePerturbation(
+                StatePerturbationConfig(
+                    enabled=True,
+                    prob=float(getattr(cfg, "state_perturbation_prob", 0.0) or 0.0),
+                    low=tuple(getattr(cfg, "state_perturbation_low", StatePerturbationConfig.low)),
+                    high=tuple(getattr(cfg, "state_perturbation_high", StatePerturbationConfig.high)),
+                ),
+                device=device,
+            )
+            print(
+                f"[aug] state_perturbation enabled: prob={float(getattr(cfg,'state_perturbation_prob',0.0) or 0.0):g} "
+                f"low={getattr(cfg,'state_perturbation_low', None)} high={getattr(cfg,'state_perturbation_high', None)}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[aug] state_perturbation requested but failed to init: {e}", flush=True)
+            state_aug = None
 
     def _maybe_mask_ego_history_inplace(batch_d: dict[str, Any]) -> int:
         """Mask ego-history conditioning features in-place (train only).
@@ -1372,6 +1550,12 @@ def train_loop_paper_dit_xstart(
         t_seg = time.perf_counter()
         batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
         breakdown["to_device_s"] = float(time.perf_counter() - t_seg)
+
+        # optional: state perturbation augmentation (train only)
+        t_seg = time.perf_counter()
+        if state_aug is not None:
+            batch = state_aug(batch)
+        breakdown["state_perturb_s"] = float(time.perf_counter() - t_seg)
 
         # optional: ego-history masking augmentation (train only)
         t_seg = time.perf_counter()
