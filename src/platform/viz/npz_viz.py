@@ -114,6 +114,14 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     npz_path = Path(npz_path)
     data = np.load(npz_path)
 
+    def _squeeze1(x: np.ndarray) -> np.ndarray:
+        """Handle both unbatched NPZ (legacy) and batched NPZ with leading dim=1."""
+
+        x = np.asarray(x)
+        if x.ndim >= 1 and x.shape[0] == 1:
+            return x[0]
+        return x
+
     token = str(data.get("token", "scene"))
     if output_path is None:
         output_path = f"{token}_viz.png"
@@ -141,8 +149,8 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     ax.axvline(x=0, color="k", linestyle="-", linewidth=0.5)
 
     # ========== 1. Lanes (boundaries only, no centerline) ==========
-    lanes = data["lanes"]  # (70, 20, 12)
-    route_lanes = data.get("route_lanes", None)
+    lanes = _squeeze1(data["lanes"])  # (70, 20, 12)
+    route_lanes = _squeeze1(data["route_lanes"]) if ("route_lanes" in data.files) else None
 
     # Only draw normal lane boundaries
     for lane_idx in range(lanes.shape[0]):
@@ -174,7 +182,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     # Route lanes visualization (light yellow solid lines with gold arrows)
     # ============================================================
     if route_lanes is not None:
-        route_lanes_avails = data.get("route_lanes_avails")
+        route_lanes_avails = _squeeze1(data.get("route_lanes_avails")) if ("route_lanes_avails" in data.files) else None
         for rlane_idx in range(route_lanes.shape[0]):
             lane_x = route_lanes[rlane_idx, :, 0]
             lane_y = route_lanes[rlane_idx, :, 1]
@@ -243,7 +251,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                     pass
 
     # ========== 2. Ego (arrow at origin) ==========
-    ego_state = data["ego_current_state"]
+    ego_state = _squeeze1(data["ego_current_state"])
     cos_h, sin_h = ego_state[2], ego_state[3]
     ego_heading = np.arctan2(sin_h, cos_h)
 
@@ -262,13 +270,13 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     ego_circle = patches.Circle((0, 0), radius=1.5, facecolor="red", edgecolor="darkred", linewidth=2)
     ax.add_patch(ego_circle)
 
-    ego_future = data["ego_agent_future"]
+    ego_future = _squeeze1(data["ego_agent_future"])
     if ego_future is not None:
         ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8)
 
     # ========== 2.1 Ego past trajectory ==========
     if "ego_past" in data.files:
-        ego_past = data["ego_past"]
+        ego_past = _squeeze1(data["ego_past"])
         valid_mask = (ego_past[:, 0] != 0) | (ego_past[:, 1] != 0)
         if np.any(valid_mask):
             ax.plot(
@@ -281,8 +289,8 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             )
 
     # Load neighbor agents data
-    neighbor_past = data["neighbor_agents_past"]
-    neighbor_future = data.get("neighbor_agents_future")
+    neighbor_past = _squeeze1(data["neighbor_agents_past"])
+    neighbor_future = _squeeze1(data["neighbor_agents_future"]) if ("neighbor_agents_future" in data.files) else None
 
     if show_acc:
         try:
@@ -448,11 +456,11 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             ax.add_patch(diamond)
 
     # ========== 6. Static objects ==========
-    static_objs = data.get("static_objects")
+    static_objs = _squeeze1(data.get("static_objects")) if ("static_objects" in data.files) else None
     if static_objs is not None and len(static_objs) > 0:
         for obj_idx in range(static_objs.shape[0]):
             x, y = static_objs[obj_idx, 0], static_objs[obj_idx, 1]
-            if x == 0 and y == 0:
+            if float(x) == 0.0 and float(y) == 0.0:
                 continue
             if abs(x) > 50 or abs(y) > 50:
                 continue
