@@ -229,28 +229,6 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="When --fast-eval-mode=sampler, number of DPM sampler steps.",
     )
-
-    p.add_argument(
-        "--fast-eval-turn-source",
-        type=str,
-        default="tags_or_gt",
-        choices=["tags_or_gt", "tags", "gt"],
-        help="How to classify turning for fast-eval breakdown.",
-    )
-
-    # Fast-eval turn/straight breakdown (GT-based)
-    p.add_argument(
-        "--fast-eval-turn-angle-deg",
-        type=float,
-        default=15.0,
-        help="Turning threshold in degrees based on GT heading change (default: 15deg).",
-    )
-    p.add_argument(
-        "--fast-eval-turn-min-travel-m",
-        type=float,
-        default=5.0,
-        help="Min GT travel distance (meters) before classifying turning (default: 5m).",
-    )
     p.add_argument(
         "--fast-eval-batch-size",
         type=int,
@@ -294,59 +272,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of DPM-Solver steps for sampler TensorBoard intermediates.",
     )
     p.add_argument("--tb-image-size", type=int, default=800, help="Best-effort render size for TB images.")
-
-    # ego-history masking augmentation (paper_dit_dpm)
-    p.add_argument(
-        "--mask-ego-history-prob",
-        type=float,
-        default=0.0,
-        help="With probability p (per-sample), mask ego history in conditioning features (default: 0).",
-    )
-    p.add_argument(
-        "--mask-ego-history-keep-last",
-        type=int,
-        default=1,
-        choices=[0, 1],
-        help="When masking, keep the last timestep (current) and only mask the past. 1=yes (default), 0=no.",
-    )
-
-    # state perturbation augmentation (paper_dit_dpm; Diffusion-Planner style)
-    p.add_argument(
-        "--state-perturbation-enable",
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help="Enable Diffusion-Planner-style state perturbation augmentation (default: 0).",
-    )
-    p.add_argument(
-        "--state-perturbation-prob",
-        type=float,
-        default=0.0,
-        help="Per-sample probability of applying state perturbation (default: 0).",
-    )
-    p.add_argument(
-        "--state-perturbation-low",
-        type=float,
-        nargs=9,
-        default=None,
-        metavar=("DX", "DY", "DYAW", "DVX", "DVY", "DAX", "DAY", "DSTEER", "DYAW_RATE"),
-        help="Lower bounds (9 floats) for [x,y,yaw,vx,vy,ax,ay,steer,yaw_rate] additive perturbations.",
-    )
-    p.add_argument(
-        "--state-perturbation-high",
-        type=float,
-        nargs=9,
-        default=None,
-        metavar=("DX", "DY", "DYAW", "DVX", "DVY", "DAX", "DAY", "DSTEER", "DYAW_RATE"),
-        help="Upper bounds (9 floats) for [x,y,yaw,vx,vy,ax,ay,steer,yaw_rate] additive perturbations.",
-    )
-    p.add_argument(
-        "--tb-prefer-turn",
-        type=int,
-        default=1,
-        choices=[0, 1],
-        help="When pre-sampling TB examples, prefer turning-tagged samples if available. 1=yes (default), 0=no.",
-    )
 
     # loss spike dump (diagnosis)
     p.add_argument("--spike-dump", action="store_true", help="Dump top-k samples when train loss spikes.")
@@ -517,67 +442,11 @@ def main() -> None:
     fast_eval_exclude_keys: set[tuple[str, int]] = set()
 
     if args.mode == "paper_dit_dpm":
-        def _feature_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-            """Custom collate for feature dataset.
-
-            Default PyTorch collation fails on variable-length `meta.tags` (list-of-strings).
-            We stack tensor fields normally, but keep meta fields as python lists.
-            """
-
-            if not batch:
-                return {}
-
-            out: dict[str, Any] = {}
-            # tensor keys
-            for k, v0 in batch[0].items():
-                if k == "meta":
-                    continue
-                if torch.is_tensor(v0):
-                    # Dataset returns per-sample tensors (no batch dim). Stack into [B, ...].
-                    out[k] = torch.stack([b[k] for b in batch], dim=0)
-                else:
-                    out[k] = [b.get(k) for b in batch]
-
-            # meta: keep as dict of lists (not recursively collated)
-            metas = [b.get("meta") or {} for b in batch]
-            meta_keys: set[str] = set()
-            for m in metas:
-                if isinstance(m, dict):
-                    meta_keys |= set(m.keys())
-            meta_out: dict[str, Any] = {}
-            for mk in sorted(meta_keys):
-                meta_out[mk] = [(m.get(mk) if isinstance(m, dict) else None) for m in metas]
-            out["meta"] = meta_out
-            return out
-
         # Multi-city fast evaluation (equal status) + strict blacklist isolation.
         # We build fast-eval subsets first, then blacklist them from the training dataset.
-        #
-        # NOTE: Even if fast-eval itself is disabled (fast_eval_every=0), we still
-        # want stable, per-city TensorBoard visualization examples when TB image
-        # logging is enabled. Without per-city loaders, TB falls back to sampling
-        # from the mixed-city training batch, which can easily produce "all straight"
-        # panels and mis-labeled city sections.
-        need_fast_eval_loaders = (int(getattr(args, "fast_eval_every", 0) or 0) > 0) or bool(getattr(args, "tb_enable", False))
-
-        if need_fast_eval_loaders:
+        if int(getattr(args, "fast_eval_every", 0) or 0) > 0:
             n_city = int(getattr(args, "fast_eval_n", 1024) or 1024)
             seed_city = int(getattr(args, "fast_eval_seed", 0) or 0)
-
-            # If user did not explicitly provide per-city roots, infer them from
-            # the expanded training roots by substring match.
-            tr_lower = [str(r).lower() for r in train_roots]
-            infer_boston = [r for r, rl in zip(train_roots, tr_lower) if "boston" in rl]
-            infer_pgh = [r for r, rl in zip(train_roots, tr_lower) if "pittsburgh" in rl]
-            infer_vegas = [r for r, rl in zip(train_roots, tr_lower) if "vegas" in rl]
-
-            if getattr(args, "fast_eval_boston_roots", None) is None and infer_boston:
-                args.fast_eval_boston_roots = list(infer_boston)
-                args.fast_eval_boston_slices = None
-            if getattr(args, "fast_eval_pittsburgh_roots", None) is None and infer_pgh:
-                args.fast_eval_pittsburgh_roots = list(infer_pgh)
-            if getattr(args, "fast_eval_vegas_roots", None) is None and infer_vegas:
-                args.fast_eval_vegas_roots = list(infer_vegas)
 
             def _maybe_add_city(city: str, roots: list[str] | None, slices: list[str] | None = None) -> None:
                 nonlocal fast_eval_exclude_keys
@@ -602,7 +471,6 @@ def main() -> None:
                     num_workers=int(getattr(args, "fast_eval_num_workers", None) or args.fast_val_num_workers),
                     pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
                     drop_last=False,
-                    collate_fn=_feature_collate,
                 )
 
             _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
@@ -631,7 +499,6 @@ def main() -> None:
             num_workers=args.num_workers,
             pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
             drop_last=True,
-            collate_fn=_feature_collate,
         )
 
         # Optional fast validation loader (deterministic prefix subset).
@@ -650,7 +517,6 @@ def main() -> None:
                     num_workers=int(args.fast_val_num_workers),
                     pin_memory=(args.device == "cuda" and torch.cuda.is_available()),
                     drop_last=False,
-                    collate_fn=_feature_collate,
                 )
                 print(f"Fast-val dataset size: {len(fv_ds)} kept samples | every={int(args.fast_val_every)}")
             else:
@@ -707,18 +573,6 @@ def main() -> None:
         tb_sampler_steps=int(getattr(args, "tb_sampler_steps", args.tb_denoise_k)),
         tb_image_size=int(args.tb_image_size),
 
-        tb_prefer_turn=bool(int(getattr(args, "tb_prefer_turn", 1))),
-
-        # ego-history masking augmentation
-        mask_ego_history_prob=float(getattr(args, "mask_ego_history_prob", 0.0) or 0.0),
-        mask_ego_history_keep_last=bool(int(getattr(args, "mask_ego_history_keep_last", 1))),
-
-        # state perturbation augmentation
-        state_perturbation_enable=bool(int(getattr(args, "state_perturbation_enable", 0))),
-        state_perturbation_prob=float(getattr(args, "state_perturbation_prob", 0.0) or 0.0),
-        state_perturbation_low=tuple(getattr(args, "state_perturbation_low", None) or TrainConfig.state_perturbation_low),
-        state_perturbation_high=tuple(getattr(args, "state_perturbation_high", None) or TrainConfig.state_perturbation_high),
-
         # spike dump
         spike_dump=bool(getattr(args, "spike_dump", False)),
         spike_start=int(getattr(args, "spike_start", 2000) or 2000),
@@ -728,9 +582,6 @@ def main() -> None:
         # fast-eval behavior
         fast_eval_mode=str(getattr(args, "fast_eval_mode", "proxy") or "proxy"),
         fast_eval_diffusion_steps=int(getattr(args, "fast_eval_diffusion_steps", 10) or 10),
-        fast_eval_turn_source=str(getattr(args, "fast_eval_turn_source", "tags_or_gt") or "tags_or_gt"),
-        fast_eval_turn_angle_deg=float(getattr(args, "fast_eval_turn_angle_deg", 15.0) or 15.0),
-        fast_eval_turn_min_travel_m=float(getattr(args, "fast_eval_turn_min_travel_m", 5.0) or 5.0),
 
         # resume
         resume_ckpt=str(getattr(args, "resume_ckpt", None)) if getattr(args, "resume_ckpt", None) else None,
@@ -748,17 +599,6 @@ def main() -> None:
         model = EpsMLP(x_dim=ds.x_dim, T=ds.y_T)
         exp_dir = train_loop_diffusion_eps(cfg=cfg, model=model, train_loader=dl)
     elif args.mode == "paper_dit_dpm":
-        # Normalization is mandatory for paper_dit_dpm.
-        # Without observation normalization, training/TB sampling can drift badly and become misleading.
-        norm_path = getattr(args, "normalization_file", None)
-        if not norm_path:
-            raise SystemExit(
-                "paper_dit_dpm requires --normalization-file (precomputed stats). "
-                "Example: --normalization-file outputs/cache/normalization_ours_bos150w_vegas_pgh.json"
-            )
-        if not Path(str(norm_path)).expanduser().is_file():
-            raise SystemExit(f"--normalization-file not found: {norm_path}")
-
         # Infer feature shapes from dataset to avoid hard-coded mismatches.
         s0 = ds[0]
         nb = s0["neighbor_agents_past"]
@@ -783,20 +623,20 @@ def main() -> None:
             future_len=future_len,
         )
 
-        # Load normalization stats computed from training cache.
-        data = json.loads(Path(norm_path).read_text())
-        if "ego" in data and "neighbor" in data:
-            ego_mean = data["ego"]["mean"]
-            ego_std = data["ego"]["std"]
-            nb_mean = data["neighbor"]["mean"]
-            nb_std = data["neighbor"]["std"]
-            paper_cfg.state_mean = [[ego_mean]] + [[nb_mean]] * int(paper_cfg.predicted_neighbor_num)
-            paper_cfg.state_std = [[ego_std]] + [[nb_std]] * int(paper_cfg.predicted_neighbor_num)
-        # ObservationNormalizer consumes everything except ego/neighbor.
-        obs_norm = {k: v for k, v in data.items() if k not in ("ego", "neighbor")}
-        paper_cfg.observation_norm = obs_norm if obs_norm else None
-        if paper_cfg.observation_norm is None:
-            raise SystemExit(f"Invalid normalization JSON (empty observation_norm): {norm_path}")
+        # Optional: load normalization stats computed from training cache.
+        norm_path = getattr(args, "normalization_file", None)
+        if norm_path:
+            data = json.loads(Path(norm_path).read_text())
+            if "ego" in data and "neighbor" in data:
+                ego_mean = data["ego"]["mean"]
+                ego_std = data["ego"]["std"]
+                nb_mean = data["neighbor"]["mean"]
+                nb_std = data["neighbor"]["std"]
+                paper_cfg.state_mean = [[ego_mean]] + [[nb_mean]] * int(paper_cfg.predicted_neighbor_num)
+                paper_cfg.state_std = [[ego_std]] + [[nb_std]] * int(paper_cfg.predicted_neighbor_num)
+            # ObservationNormalizer consumes everything except ego/neighbor.
+            obs_norm = {k: v for k, v in data.items() if k not in ("ego", "neighbor")}
+            paper_cfg.observation_norm = obs_norm if obs_norm else None
 
         model = PaperDiffusionPlanner(paper_cfg)
         exp_dir = train_loop_paper_dit_xstart(
