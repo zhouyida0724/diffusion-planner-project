@@ -7,6 +7,7 @@ Keep behavior stable: the CLI script remains the entrypoint.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +47,52 @@ def angle_difference_radians(angle1_rad: float, angle2_rad: float) -> float:
     return (2 * math.pi) - normalized_diff if normalized_diff > math.pi else normalized_diff
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _tl_color_from_onehot(onehot: np.ndarray) -> str:
+    """Map traffic light onehot [g,y,r,unk] to a matplotlib color."""
+
+    if onehot is None or len(onehot) < 4:
+        return "#AAAAAA"
+    i = int(np.argmax(onehot[:4]))
+    if i == 0:
+        return "#00AA00"  # green
+    if i == 1:
+        return "#CCAA00"  # yellow
+    if i == 2:
+        return "#CC0000"  # red
+    return "#AAAAAA"  # unknown
+
+
+def _draw_dir_arrows(ax, xs: np.ndarray, ys: np.ndarray, dxs: np.ndarray, dys: np.ndarray, *, color: str, every: int = 4):
+    """Draw short direction arrows at sampled points."""
+
+    if xs.size == 0:
+        return
+    every = max(1, int(every))
+    for i in range(0, int(xs.shape[0]), every):
+        x = float(xs[i])
+        y = float(ys[i])
+        dx = float(dxs[i])
+        dy = float(dys[i])
+        n = (dx * dx + dy * dy) ** 0.5
+        if not np.isfinite(n) or n < 1e-6:
+            continue
+        dx /= n
+        dy /= n
+        # scale arrow length to be visible but not overwhelming
+        L = 3.0
+        ax.annotate(
+            "",
+            xy=(x + L * dx, y + L * dy),
+            xytext=(x, y),
+            arrowprops=dict(arrowstyle="->", color=color, lw=1.2, alpha=0.85),
+        )
+
+
 def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None) -> Path:
     """Render a single-row NPZ export as a PNG.
 
@@ -67,6 +114,14 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     npz_path = Path(npz_path)
     data = np.load(npz_path)
 
+    def _squeeze1(x: np.ndarray) -> np.ndarray:
+        """Handle both unbatched NPZ (legacy) and batched NPZ with leading dim=1."""
+
+        x = np.asarray(x)
+        if x.ndim >= 1 and x.shape[0] == 1:
+            return x[0]
+        return x
+
     token = str(data.get("token", "scene"))
     if output_path is None:
         output_path = f"{token}_viz.png"
@@ -74,6 +129,12 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     output_path = Path(output_path)
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    # Debug overlay toggles (default OFF to keep legacy images stable)
+    show_lane_dir = _env_flag("NPZ_VIZ_SHOW_LANE_DIR", "0")
+    show_tl = _env_flag("NPZ_VIZ_SHOW_TRAFFIC_LIGHTS", "0")
+    show_neighbor_heading = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_HEADING", "0")
+    show_acc = _env_flag("NPZ_VIZ_SHOW_ACC", "0")
 
     # Set range [-50, 50] for both axes
     ax.set_xlim(-50, 50)
@@ -88,8 +149,8 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     ax.axvline(x=0, color="k", linestyle="-", linewidth=0.5)
 
     # ========== 1. Lanes (boundaries only, no centerline) ==========
-    lanes = data["lanes"]  # (70, 20, 12)
-    route_lanes = data.get("route_lanes", None)
+    lanes = _squeeze1(data["lanes"])  # (70, 20, 12)
+    route_lanes = _squeeze1(data["route_lanes"]) if ("route_lanes" in data.files) else None
 
     # Only draw normal lane boundaries
     for lane_idx in range(lanes.shape[0]):
@@ -121,7 +182,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     # Route lanes visualization (light yellow solid lines with gold arrows)
     # ============================================================
     if route_lanes is not None:
-        route_lanes_avails = data.get("route_lanes_avails")
+        route_lanes_avails = _squeeze1(data.get("route_lanes_avails")) if ("route_lanes_avails" in data.files) else None
         for rlane_idx in range(route_lanes.shape[0]):
             lane_x = route_lanes[rlane_idx, :, 0]
             lane_y = route_lanes[rlane_idx, :, 1]
@@ -151,7 +212,18 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             if len(x_coords) == 0:
                 continue
 
-            ax.plot(x_coords, y_coords, "-", color="#FFFF99", alpha=0.9, linewidth=2)
+            # Optional: color route lanes by traffic light state stored in lane_feature[:,8:12]
+            lane_color = "#FFFF99"
+            if show_tl:
+                try:
+                    # Use the first valid point as representative.
+                    j0 = int(np.argmax(valid_mask))
+                    onehot = route_lanes[rlane_idx, j0, 8:12]
+                    lane_color = _tl_color_from_onehot(onehot)
+                except Exception:
+                    lane_color = "#AAAAAA"
+
+            ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=0.9, linewidth=2)
 
             # Plot gold direction arrows every few points
             arrow_interval = max(1, len(x_coords) // 5)  # ~5 arrows per lane
@@ -168,8 +240,18 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                             arrowprops=dict(arrowstyle="->", color="#FFD700", lw=1.5),
                         )
 
+            # Optional: visualize the *exported* lane direction vectors (route_lanes[:,:,2:4]).
+            # This is useful for debugging coordinate-frame contract mismatches.
+            if show_lane_dir:
+                try:
+                    dxs = route_lanes[rlane_idx, :, 2][valid_mask]
+                    dys = route_lanes[rlane_idx, :, 3][valid_mask]
+                    _draw_dir_arrows(ax, x_coords, y_coords, dxs, dys, color="#AA00FF", every=max(1, len(x_coords) // 6))
+                except Exception:
+                    pass
+
     # ========== 2. Ego (arrow at origin) ==========
-    ego_state = data["ego_current_state"]
+    ego_state = _squeeze1(data["ego_current_state"])
     cos_h, sin_h = ego_state[2], ego_state[3]
     ego_heading = np.arctan2(sin_h, cos_h)
 
@@ -188,13 +270,13 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     ego_circle = patches.Circle((0, 0), radius=1.5, facecolor="red", edgecolor="darkred", linewidth=2)
     ax.add_patch(ego_circle)
 
-    ego_future = data["ego_agent_future"]
+    ego_future = _squeeze1(data["ego_agent_future"])
     if ego_future is not None:
         ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8)
 
     # ========== 2.1 Ego past trajectory ==========
     if "ego_past" in data.files:
-        ego_past = data["ego_past"]
+        ego_past = _squeeze1(data["ego_past"])
         valid_mask = (ego_past[:, 0] != 0) | (ego_past[:, 1] != 0)
         if np.any(valid_mask):
             ax.plot(
@@ -207,8 +289,24 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             )
 
     # Load neighbor agents data
-    neighbor_past = data["neighbor_agents_past"]
-    neighbor_future = data.get("neighbor_agents_future")
+    neighbor_past = _squeeze1(data["neighbor_agents_past"])
+    neighbor_future = _squeeze1(data["neighbor_agents_future"]) if ("neighbor_agents_future" in data.files) else None
+
+    if show_acc:
+        try:
+            ax.text(
+                0.02,
+                0.98,
+                f"ego_ax={float(ego_state[6]):.3f}, ego_ay={float(ego_state[7]):.3f}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=10,
+                color="#333333",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.8),
+            )
+        except Exception:
+            pass
 
     agent_id = 0
     agent_ids: dict[int, int] = {}
@@ -250,6 +348,21 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         ax.plot(past[start_idx:, 0], past[start_idx:, 1], "b-", linewidth=3, alpha=0.8)
         ax.plot(start_x, start_y, "s", markersize=8, color="blue", markeredgecolor="darkblue", markeredgewidth=2)
         ax.plot(curr_x, curr_y, "o", markersize=8, color="blue", markeredgecolor="darkblue", markeredgewidth=2)
+
+        if show_neighbor_heading and neighbor_past.shape[-1] >= 4:
+            try:
+                cos_h = float(neighbor_past[agent_idx, -1, 2])
+                sin_h = float(neighbor_past[agent_idx, -1, 3])
+                h = float(np.arctan2(sin_h, cos_h))
+                L = 4.0
+                ax.annotate(
+                    "",
+                    xy=(float(curr_x + L * np.cos(h)), float(curr_y + L * np.sin(h))),
+                    xytext=(float(curr_x), float(curr_y)),
+                    arrowprops=dict(arrowstyle="->", color="#00AAFF", lw=2.0, alpha=0.9),
+                )
+            except Exception:
+                pass
 
     # ========== 4. Neighbor agents future trajectories ==========
     if neighbor_future is not None:
@@ -343,11 +456,11 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             ax.add_patch(diamond)
 
     # ========== 6. Static objects ==========
-    static_objs = data.get("static_objects")
+    static_objs = _squeeze1(data.get("static_objects")) if ("static_objects" in data.files) else None
     if static_objs is not None and len(static_objs) > 0:
         for obj_idx in range(static_objs.shape[0]):
             x, y = static_objs[obj_idx, 0], static_objs[obj_idx, 1]
-            if x == 0 and y == 0:
+            if float(x) == 0.0 and float(y) == 0.0:
                 continue
             if abs(x) > 50 or abs(y) > 50:
                 continue
