@@ -278,9 +278,6 @@ def build_nuplan_scenario_from_db(
     db_path: str,
     scene_token_hex: str,
     map_name: str,
-    *,
-    map_root: str | None = None,
-    map_version: str | None = None,
 ) -> NuPlanScenario:
     cursor = conn.cursor()
     scene_token_bytes = bytes.fromhex(scene_token_hex)
@@ -303,17 +300,14 @@ def build_nuplan_scenario_from_db(
 
     data_root = os.path.dirname(db_path)
 
-    map_root = str(map_root or MAP_ROOT)
-    map_version = str(map_version or MAP_VERSION)
-
     return NuPlanScenario(
         data_root=data_root,
         log_file_load_path=db_path,
         initial_lidar_token=initial_lidar_token_hex,
         initial_lidar_timestamp=initial_lidar_timestamp,
         scenario_type=scenario_type,
-        map_root=map_root,
-        map_version=map_version,
+        map_root=MAP_ROOT,
+        map_version=MAP_VERSION,
         map_name=map_name,
         scenario_extraction_info=None,
         ego_vehicle_parameters=get_pacifica_parameters(),
@@ -327,18 +321,8 @@ def get_pruned_route_roadblock_ids(
     scene_token_hex: str,
     map_api,
     map_name: str,
-    *,
-    map_root: str | None = None,
-    map_version: str | None = None,
 ) -> list[str]:
-    scenario = build_nuplan_scenario_from_db(
-        conn,
-        db_path,
-        scene_token_hex,
-        map_name,
-        map_root=map_root,
-        map_version=map_version,
-    )
+    scenario = build_nuplan_scenario_from_db(conn, db_path, scene_token_hex, map_name)
     route_roadblock_ids = list(scenario.get_route_roadblock_ids())
 
     try:
@@ -1225,8 +1209,6 @@ def extract_features(
     *,
     debug_log: bool = True,
     routing_mode: str = "auto",
-    map_root: str | None = None,
-    map_version: str | None = None,
 ) -> dict[str, np.ndarray]:
     """Pure feature extraction.
 
@@ -1264,19 +1246,9 @@ def extract_features(
 
     routing_mode = (routing_mode or "auto").strip().lower()
 
-    map_root = str(map_root or MAP_ROOT)
-    map_version = str(map_version or MAP_VERSION)
-
     with _timing_ctx(timing, "get_raw_route_roadblock_ids"):
         try:
-            scenario = build_nuplan_scenario_from_db(
-                conn,
-                db_path,
-                scenario_token_hex,
-                map_name,
-                map_root=map_root,
-                map_version=map_version,
-            )
+            scenario = build_nuplan_scenario_from_db(conn, db_path, scenario_token_hex, map_name)
             route_roadblock_ids_raw = list(scenario.get_route_roadblock_ids())
         except Exception:
             route_roadblock_ids_raw = []
@@ -1284,15 +1256,7 @@ def extract_features(
     if routing_mode == "auto":
         with _timing_ctx(timing, "get_pruned_route_roadblock_ids"):
             try:
-                route_roadblock_ids = get_pruned_route_roadblock_ids(
-                    conn,
-                    db_path,
-                    scenario_token_hex,
-                    map_api,
-                    map_name,
-                    map_root=map_root,
-                    map_version=map_version,
-                )
+                route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
             except Exception:
                 route_roadblock_ids = None
     else:
