@@ -640,7 +640,9 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
     neighbor_past = np.zeros((MAX_NEIGHBORS, NEIGHBOR_HISTORY_LEN, 11), dtype=np.float32)
 
     for i in range(NEIGHBOR_HISTORY_LEN):
-        idx = center_idx - (NEIGHBOR_HISTORY_LEN - 1 - i)
+        # ego_pose is 100Hz; neighbor_agents_past is defined at 10Hz (2s @ 10Hz),
+        # so we downsample by 10 frames per step (see mds/FEATURE_EXTRACTION_GUIDE.md).
+        idx = center_idx - (NEIGHBOR_HISTORY_LEN - 1 - i) * 10
         if idx >= 0:
             past_row = all_poses[idx]
             dx, dy = transform_to_ego_frame(past_row["x"], past_row["y"], ego_x, ego_y, ego_heading)
