@@ -110,6 +110,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
     from matplotlib.patches import FancyArrowPatch
+    from matplotlib import transforms
 
     npz_path = Path(npz_path)
     data = np.load(npz_path)
@@ -433,7 +434,8 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
 
         cos_h = neighbor_past[agent_idx, -1, 2]
         sin_h = neighbor_past[agent_idx, -1, 3]
-        neighbor_heading = angle_difference_radians(ego_heading, np.arctan2(sin_h, cos_h))
+        # neighbor_agents_past stores ego-relative heading as cos/sin.
+        neighbor_heading = float(np.arctan2(sin_h, cos_h))
 
         if width == 0:
             width = 2.0
@@ -441,16 +443,17 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             length = 4.0
 
         if agent_type == "Vehicle":
+            # Matplotlib Rectangle rotates about its lower-left corner; rotate around box center.
             rect = patches.Rectangle(
                 (curr_x - length / 2, curr_y - width / 2),
                 length,
                 width,
-                angle=math.degrees(neighbor_heading),
                 facecolor=color,
                 edgecolor="black",
                 linewidth=1,
                 alpha=0.7,
             )
+            rect.set_transform(transforms.Affine2D().rotate_around(curr_x, curr_y, neighbor_heading) + ax.transData)
             ax.add_patch(rect)
         elif agent_type == "Pedestrian":
             radius = max(width, length) / 2
