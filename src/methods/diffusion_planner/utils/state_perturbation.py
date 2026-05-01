@@ -80,6 +80,8 @@ class StatePerturbationConfig:
     num_refine: int = 20
     # (optional) only apply when abs(vx) >= this threshold (matches reference behavior)
     min_vx_mps: float = 2.0
+    # NOTE: This implementation operates in the *cached feature frame* (already ego-centered/ego-rotated
+    # for XY-like quantities) and must preserve that convention.
 
 
 class StatePerturbation:
@@ -145,15 +147,29 @@ class StatePerturbation:
         if torch.is_tensor(nb_fut):
             nb_fut = nb_fut.clone()
 
-        # -----------------
-        # 1) Perturb ego_current_state.
-        # -----------------
+        # Sample perturbations.
         noise_u = torch.rand((B, 9), device=ego_cs.device, dtype=torch.float32)
         delta = self._low + (self._high - self._low) * noise_u  # [B,9] via broadcast
         # Keep deltas for non-applied samples as 0.
         delta = delta * apply[:, None].to(delta.dtype)
 
-        # Compose into state vector [x,y,yaw,vx,vy,ax,ay,steer,yaw_rate].
+        # -----------------
+        # 1) Coordinate transform FIRST (keep consistent with the cached feature frame).
+        # -----------------
+        batch = dict(batch)
+        batch["ego_current_state"] = ego_cs
+        batch["ego_agent_future"] = ego_fut
+        if torch.is_tensor(nb_fut):
+            batch["neighbor_agents_future"] = nb_fut
+        batch = self._apply_pose_perturb_inplace(batch, delta=delta)
+
+        # Refresh local refs after in-place ops.
+        ego_cs = batch["ego_current_state"]
+        ego_fut = batch["ego_agent_future"]
+
+        # -----------------
+        # 2) Perturb ego_current_state (in the already-transformed frame).
+        # -----------------
         yaw0 = torch.atan2(ego_cs[:, 3], ego_cs[:, 2])
         state0 = torch.stack(
             [
@@ -170,55 +186,118 @@ class StatePerturbation:
             dim=-1,
         )
         state1 = state0 + delta
-        # Simple safety clamps (match reference intent): v>=0, yaw_rate in [-0.85,0.85]
-        state1[:, 3] = torch.clamp(state1[:, 3], min=0.0)
-        state1[:, 8] = torch.clamp(state1[:, 8], -0.85, 0.85)
+        # IMPORTANT: Do NOT apply DP-reference clamps here.
         state1[:, 2] = _normalize_angle(state1[:, 2])
 
-        ego_cs[:, 0:2] = state1[:, 0:2]
+        # Preserve cached convention: ego x,y remain 0.
+        ego_cs[:, 0:2] = 0.0
         ego_cs[:, 2] = torch.cos(state1[:, 2])
         ego_cs[:, 3] = torch.sin(state1[:, 2])
         ego_cs[:, 4:8] = state1[:, 3:7]
         ego_cs[:, 8] = state1[:, 7]
         ego_cs[:, 9] = state1[:, 8]
-
-        # Optional kinematic consistency step (matches the open-source Diffusion-Planner):
-        # recompute steering angle from yaw_rate and forward velocity.
-        # This is effectively a no-op under the default bounds (steer/yaw_rate deltas are 0),
-        # but makes non-zero bounds safer.
-        try:
-            from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
-
-            wheel_base = float(get_pacifica_parameters().wheel_base)
-            cur_v = ego_cs[:, 4]
-            yaw_rate = ego_cs[:, 9]
-            steer = torch.zeros_like(cur_v)
-            new_yaw_rate = torch.zeros_like(yaw_rate)
-            ok = torch.abs(cur_v) >= 0.2
-            if bool(ok.any().item()):
-                steer[ok] = torch.atan(yaw_rate[ok] * wheel_base / torch.abs(cur_v[ok]))
-                steer[ok] = torch.clamp(steer[ok], -2.0 / 3.0 * torch.pi, 2.0 / 3.0 * torch.pi)
-                new_yaw_rate[ok] = yaw_rate[ok]
-            ego_cs[:, 8] = steer
-            ego_cs[:, 9] = new_yaw_rate
-        except Exception:
-            # If nuPlan isn't available, skip this safety step.
-            pass
-
-        # -----------------
-        # 2) Quintic spline: regenerate first ~2s of ego future.
-        # -----------------
-        ego_fut = self._interpolate_ego_future(ego_cs, ego_fut)
-
-        # -----------------
-        # 3) Ego-centric transform of all relevant inputs.
-        # -----------------
-        batch = dict(batch)
         batch["ego_current_state"] = ego_cs
-        batch["ego_agent_future"] = ego_fut
-        if torch.is_tensor(nb_fut):
+
+        # -----------------
+        # 3) Quintic spline: regenerate first ~2s of ego future.
+        # -----------------
+        # IMPORTANT: Only apply spline refinement to samples where augmentation was applied.
+        # Otherwise we would silently change supervision targets for non-augmented samples.
+        ego_fut_interp = self._interpolate_ego_future(ego_cs, ego_fut)
+        if apply.dtype != torch.bool:
+            apply_mask = apply.to(torch.bool)
+        else:
+            apply_mask = apply
+        if bool(apply_mask.all().item()):
+            batch["ego_agent_future"] = ego_fut_interp
+        else:
+            m = apply_mask[:, None, None]
+            batch["ego_agent_future"] = torch.where(m, ego_fut_interp, ego_fut)
+
+        return batch
+
+    def _apply_pose_perturb_inplace(self, batch: dict[str, Any], *, delta: torch.Tensor) -> dict[str, Any]:
+        """Apply pose-perturbation SE(2) to XY-like cached features.
+
+        delta: [B,9] additive perturbations in the feature frame for [x,y,yaw,vx,vy,ax,ay,steer,yaw_rate].
+        Only x,y,yaw are used here.
+        """
+
+        ego_cs = batch["ego_current_state"]
+        B = int(ego_cs.shape[0])
+        dxy = delta[:, 0:2]
+        dyaw = delta[:, 2]
+
+        # rot = R(-dyaw)
+        c = torch.cos(-dyaw)
+        s = torch.sin(-dyaw)
+        rot = torch.stack([torch.stack([c, -s], dim=-1), torch.stack([s, c], dim=-1)], dim=-2)  # [B,2,2]
+
+        # Ego x,y in caches should remain 0.
+        ego_cs[:, 0:2] = 0.0
+        batch["ego_current_state"] = ego_cs
+
+        def _apply_xy(xy: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            return _vector_transform(xy, rot, bias)
+
+        # ego future: [B,T,3]
+        ego_fut = batch.get("ego_agent_future")
+        if torch.is_tensor(ego_fut) and ego_fut.ndim == 3 and ego_fut.shape[-1] >= 2:
+            ego_fut = ego_fut.clone()
+            ego_fut[..., :2] = _apply_xy(ego_fut[..., :2], dxy)
+            # heading dim is relative heading in caches (dheading), rotate frame => subtract dyaw
+            if ego_fut.shape[-1] >= 3:
+                ego_fut[..., 2] = _normalize_angle(ego_fut[..., 2] - dyaw[:, None])
+            batch["ego_agent_future"] = ego_fut
+
+        # neighbor past: [B,*,Tp,D]
+        nb_past = batch.get("neighbor_agents_past")
+        if torch.is_tensor(nb_past) and nb_past.ndim == 4 and nb_past.shape[-1] >= 2:
+            nb_past = nb_past.clone()
+            # Keep consistent with the dataset convention: rows that are entirely empty are all-zeros
+            # across the core state dims (xy, cos-sin, vxy). Do NOT treat ego-slot rows (xy==0 but
+            # other dims non-zero) as empty.
+            core = 6 if nb_past.shape[-1] >= 6 else 2
+            mask = (torch.sum(torch.ne(nb_past[..., :core], 0.0), dim=-1) == 0)
+            nb_past[..., :2] = _apply_xy(nb_past[..., :2], dxy)
+            nb_past[mask] = 0.0
+            batch["neighbor_agents_past"] = nb_past
+
+        # neighbor future: [B,*,Tf,3]
+        nb_fut = batch.get("neighbor_agents_future")
+        if torch.is_tensor(nb_fut) and nb_fut.ndim == 4 and nb_fut.shape[-1] >= 2:
+            nb_fut = nb_fut.clone()
+            mask = (torch.sum(torch.ne(nb_fut[..., :2], 0.0), dim=-1) == 0)
+            nb_fut[..., :2] = _apply_xy(nb_fut[..., :2], dxy)
+            # heading (if relative): subtract dyaw
+            if nb_fut.shape[-1] >= 3:
+                nb_fut[..., 2] = _normalize_angle(nb_fut[..., 2] - dyaw[:, None, None])
+            nb_fut[mask] = 0.0
             batch["neighbor_agents_future"] = nb_fut
-        batch = self._centric_transform_inplace(batch)
+
+        # lanes / route_lanes: [B,L,N,12]
+        for k in ("lanes", "route_lanes"):
+            lane = batch.get(k)
+            if not (torch.is_tensor(lane) and lane.ndim == 4 and lane.shape[-1] >= 2):
+                continue
+            lane = lane.clone()
+            core = 8 if lane.shape[-1] >= 8 else 2
+            mask = (torch.sum(torch.ne(lane[..., :core], 0.0), dim=-1) == 0)
+            lane[..., :2] = _apply_xy(lane[..., :2], dxy)
+            # If lane dir is stored as a 2D vector in the same XY frame, rotate it too.
+            if lane.shape[-1] >= 4:
+                lane[..., 2:4] = _apply_xy(lane[..., 2:4], torch.zeros_like(dxy))
+            lane[mask] = 0.0
+            batch[k] = lane
+
+        # static objects: [B,S,D]
+        so = batch.get("static_objects")
+        if torch.is_tensor(so) and so.ndim == 3 and so.shape[-1] >= 2:
+            so = so.clone()
+            mask = (torch.sum(torch.ne(so[..., :2], 0.0), dim=-1) == 0)
+            so[..., :2] = _apply_xy(so[..., :2], dxy)
+            so[mask] = 0.0
+            batch["static_objects"] = so
 
         return batch
 

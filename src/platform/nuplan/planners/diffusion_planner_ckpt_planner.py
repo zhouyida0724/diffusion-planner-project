@@ -31,6 +31,7 @@ import torch
 
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner, PlannerInitialization, PlannerInput
@@ -52,6 +53,7 @@ from src.platform.nuplan.features.extract_single_frame import (
 )
 
 from src.platform.nuplan.features.feature_contract import maybe_check_feature_contract
+from src.platform.nuplan.trajectory_selector import CandidateTrajectory, EgoPose2D, PrefixSelectorConfig, PrefixTrajectorySelector, SelectionContext
 
 
 @dataclass
@@ -105,6 +107,36 @@ def _ego_kinematics(ego: EgoState) -> _EgoKinematics:
         pass
 
     return _EgoKinematics(x=x, y=y, heading=heading, vx=vx, vy=vy, ax=ax, ay=ay)
+
+
+def _local_xyh_to_world_xyh(local_xyh: np.ndarray, ego: _EgoKinematics) -> np.ndarray:
+    out = np.asarray(local_xyh, dtype=np.float32).copy()
+    rot = _rot2d(ego.heading)
+    out[:, :2] = (rot @ out[:, :2].T).T + np.array([ego.x, ego.y], dtype=np.float64)
+    out[:, 2] = out[:, 2] + float(ego.heading)
+    return out.astype(np.float32, copy=False)
+
+
+def _world_xyh_to_local_xyh(world_xyh: np.ndarray, ego: _EgoKinematics) -> np.ndarray:
+    out = np.asarray(world_xyh, dtype=np.float32).copy()
+    rot = _rot2d(-ego.heading)
+    out[:, :2] = (rot @ (out[:, :2] - np.array([ego.x, ego.y], dtype=np.float64)).T).T
+    out[:, 2] = np.asarray([_wrap_pi(float(h) - float(ego.heading)) for h in out[:, 2]], dtype=np.float32)
+    return out.astype(np.float32, copy=False)
+
+
+def _route_centerlines_from_local_features(route_lanes: np.ndarray, route_lanes_avails: np.ndarray) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    lanes = np.asarray(route_lanes)
+    avails = np.asarray(route_lanes_avails)
+    for i in range(int(lanes.shape[0])):
+        valid = avails[i] > 0
+        if not np.any(valid):
+            continue
+        center = np.asarray(lanes[i, valid, :2], dtype=np.float32)
+        if len(center) >= 2:
+            out.append(center)
+    return out
 
 
 def _ego_center_kinematics(ego: EgoState) -> _EgoKinematics:
@@ -555,6 +587,15 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         device: str = "cpu",
         enable_ema: bool = True,  # accepted for hydra compatibility (unused)
         sampling_steps: int = 10,
+        trajectory_selector_enable: Optional[bool] = None,
+        trajectory_selector_num_samples: Optional[int] = None,
+        trajectory_selector_seed_base: Optional[int] = None,
+        trajectory_selector_prefix_seconds: Optional[float] = None,
+        trajectory_selector_consistency_seconds: Optional[float] = None,
+        trajectory_selector_max_prefix_offroad_steps: Optional[int] = None,
+        trajectory_selector_min_prefix_progress_m: Optional[float] = None,
+        trajectory_selector_max_prefix_end_lateral_error_m: Optional[float] = None,
+        trajectory_selector_debug: Optional[bool] = None,
         **_: object,
     ):
         self._scenario = scenario
@@ -611,6 +652,28 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         self._T = int(self._future_trajectory_sampling.num_poses)
         self._future_horizon = float(self._future_trajectory_sampling.time_horizon)
         self._step_interval = self._future_horizon / self._T
+
+        env_selector_enable = os.getenv("DP_TRAJ_SELECTOR_ENABLE", "0") not in ("", "0", "false", "False")
+        env_selector_debug = os.getenv("DP_TRAJ_SELECTOR_DEBUG", "0") not in ("", "0", "false", "False")
+
+        def _coalesce(value: object | None, fallback: object) -> object:
+            return fallback if value is None else value
+
+        self._selector_enabled = bool(_coalesce(trajectory_selector_enable, env_selector_enable))
+        self._selector_num_samples = max(1, int(_coalesce(trajectory_selector_num_samples, int(os.getenv("DP_TRAJ_SELECTOR_SAMPLES", "10") or 10))))
+        self._selector_seed_base = int(_coalesce(trajectory_selector_seed_base, int(os.getenv("DP_TRAJ_SELECTOR_SEED_BASE", "0") or 0)))
+        self._selector_debug = bool(_coalesce(trajectory_selector_debug, env_selector_debug))
+        self._selector_tick = 0
+        self._prev_selected_world_xyh: Optional[np.ndarray] = None
+        self._trajectory_selector = PrefixTrajectorySelector(
+            PrefixSelectorConfig(
+                prefix_seconds=float(_coalesce(trajectory_selector_prefix_seconds, float(os.getenv("DP_TRAJ_SELECTOR_PREFIX_SECONDS", "3.0") or 3.0))),
+                consistency_seconds=float(_coalesce(trajectory_selector_consistency_seconds, float(os.getenv("DP_TRAJ_SELECTOR_CONSISTENCY_SECONDS", "2.0") or 2.0))),
+                max_prefix_offroad_steps=int(_coalesce(trajectory_selector_max_prefix_offroad_steps, int(os.getenv("DP_TRAJ_SELECTOR_MAX_PREFIX_OFFROAD_STEPS", "0") or 0))),
+                min_prefix_progress_m=float(_coalesce(trajectory_selector_min_prefix_progress_m, float(os.getenv("DP_TRAJ_SELECTOR_MIN_PREFIX_PROGRESS_M", "1.0") or 1.0))),
+                max_prefix_end_lateral_error_m=float(_coalesce(trajectory_selector_max_prefix_end_lateral_error_m, float(os.getenv("DP_TRAJ_SELECTOR_MAX_PREFIX_END_LAT_M", "3.0") or 3.0))),
+            )
+        )
 
         self._load_checkpoint_or_raise()
 
@@ -778,6 +841,25 @@ class DiffusionPlannerCkpt(AbstractPlanner):
         if Pn > 0:
             neighbor_agents_past[0] = ego_slot0
 
+        # Optional: inference-time ego-history masking to match training ablations.
+        # Training uses `mask_ego_history_prob` / `mask_ego_history_keep_last` to zero out
+        # ego past (slot 0) with some probability. Inference should apply the same masking
+        # deterministically when prob>=1 to avoid train/infer mismatch for those runs.
+        try:
+            p = float(getattr(cfg, "mask_ego_history_prob", 0.0) or 0.0)
+            keep_last = bool(getattr(cfg, "mask_ego_history_keep_last", True))
+        except Exception:
+            p, keep_last = 0.0, True
+        if p > 0.0 and Pn > 0:
+            # Deterministic semantics:
+            # - if p >= 1.0: always mask
+            # - else: do not mask (we avoid stochasticity in closed-loop eval)
+            if p >= 1.0:
+                if keep_last and V >= 2:
+                    neighbor_agents_past[0, :-1, :] = 0.0
+                else:
+                    neighbor_agents_past[0, :, :] = 0.0
+
         feats = {
             "ego_current_state": ego_current_state.astype(np.float32, copy=False),
             "ego_past": ego_past.astype(np.float32, copy=False),
@@ -839,10 +921,105 @@ class DiffusionPlannerCkpt(AbstractPlanner):
 
         return feats
 
+    def _sample_paper_candidates(self, inputs: dict[str, torch.Tensor], num_samples: int) -> list[np.ndarray]:
+        assert isinstance(self._model, PaperDiffusionPlanner)
+        cpu_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if self._device == "cuda" and torch.cuda.is_available() else None
+        out: list[np.ndarray] = []
+        try:
+            for i in range(int(num_samples)):
+                seed = int(self._selector_seed_base) + int(self._selector_tick) * 1009 + int(i)
+                torch.manual_seed(seed)
+                if cuda_states is not None:
+                    torch.cuda.manual_seed_all(seed)
+                y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)
+                out.append(y.detach().cpu().numpy().astype(np.float32))
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+        return out
+
+    def _make_selector_context(self, feats_np: dict[str, np.ndarray], ego_history: Deque[EgoState]) -> SelectionContext:
+        cur = _ego_kinematics(ego_history[-1])
+        prev_local = None
+        if self._prev_selected_world_xyh is not None and len(self._prev_selected_world_xyh) >= 2:
+            prev_local = _world_xyh_to_local_xyh(self._prev_selected_world_xyh[1:], cur)
+        route_centerlines_local = _route_centerlines_from_local_features(feats_np["route_lanes"], feats_np["route_lanes_avails"])
+
+        try:
+            vp = ego_history[-1].car_footprint.vehicle_parameters
+            half_l = float(vp.half_length)
+            half_w = float(vp.half_width)
+            rear_axle_to_center = float(ego_history[-1].car_footprint.rear_axle_to_center_dist)
+        except Exception:
+            half_l, half_w = 2.5, 1.15
+            rear_axle_to_center = 1.46
+
+        def _drivable_checker(world_points_xy: np.ndarray) -> np.ndarray:
+            flags = []
+            for pt in np.asarray(world_points_xy, dtype=np.float64):
+                ok = False
+                try:
+                    ok = bool(self._map_api.is_in_layer(Point2D(float(pt[0]), float(pt[1])), SemanticMapLayer.DRIVABLE_AREA))
+                except Exception:
+                    ok = True
+                flags.append(ok)
+            return np.asarray(flags, dtype=bool)
+
+        return SelectionContext(
+            ego_pose=EgoPose2D(x=cur.x, y=cur.y, heading=cur.heading),
+            route_centerlines_local=route_centerlines_local,
+            drivable_checker=_drivable_checker,
+            vehicle_half_length=half_l,
+            vehicle_half_width=half_w,
+            rear_axle_to_center_dist=rear_axle_to_center,
+            dt=float(self._step_interval),
+            previous_selected_local=prev_local,
+        )
+
+    def _select_candidate_trajectory(self, feats_np: dict[str, np.ndarray], ego_history: Deque[EgoState], candidates_local_xyh: list[np.ndarray]) -> np.ndarray:
+        if len(candidates_local_xyh) == 1:
+            chosen = candidates_local_xyh[0]
+        else:
+            context = self._make_selector_context(feats_np, ego_history)
+            result = self._trajectory_selector.select(
+                [CandidateTrajectory(local_xyh=np.asarray(c, dtype=np.float32)) for c in candidates_local_xyh],
+                context,
+            )
+            chosen = np.asarray(candidates_local_xyh[result.best_index], dtype=np.float32)
+            if self._selector_debug:
+                try:
+                    d = result.diagnostics[result.best_index]
+                    print(
+                        "[DP_TRAJ_SELECTOR] tick={} best={} samples={} survivors={} fallback={} prefix_off={} late_off={} prefix_prog={:.3f} prefix_lat={:.3f} consistency={:.3f} score={:.3f}".format(
+                            int(self._selector_tick),
+                            int(result.best_index),
+                            len(candidates_local_xyh),
+                            result.survivor_indices,
+                            int(result.used_fallback),
+                            int(d.prefix_offroad_steps),
+                            int(d.late_offroad_steps),
+                            float(d.prefix_progress_m),
+                            float(d.prefix_end_lateral_error_m),
+                            float(d.consistency_l2),
+                            float(d.final_score),
+                        )
+                    )
+                except Exception:
+                    pass
+
+        cur = _ego_kinematics(ego_history[-1])
+        self._prev_selected_world_xyh = _local_xyh_to_world_xyh(chosen, cur)
+        self._selector_tick += 1
+        return chosen
+
     def initialize(self, initialization: PlannerInitialization) -> None:
         # Save map + route for runtime feature extraction.
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
+        self._prev_selected_world_xyh = None
+        self._selector_tick = 0
         self._init_done = True
         return
 
@@ -923,29 +1100,39 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             ego_x0 = ego_y0 = ego_cos0 = ego_sin0 = None
             ego_pred_norm = None  # normalized-space prediction if DP_NORM_DEBUG=1 and decoder exposes it
 
-            with torch.no_grad():
-                if norm_dbg_should_print or self._debug_sampler:
-                    # Run full forward pass to access decoder prediction [B,P,T,4].
-                    self._model.eval()
-                    _enc, dec = self._model(inputs)
-                    pred = dec.get("prediction")
-                    if pred is None:
-                        raise RuntimeError("Paper model decoder did not return prediction")
+            selector_active = self._selector_enabled and self._selector_num_samples > 1 and not norm_dbg_should_print and not self._debug_sampler
+            if selector_active:
+                candidates_local = self._sample_paper_candidates(inputs, self._selector_num_samples)
+                y_np = self._select_candidate_trajectory(feats_np, ego_history, candidates_local)
+                y = torch.from_numpy(y_np)
+            else:
+                with torch.no_grad():
+                    if norm_dbg_should_print or self._debug_sampler:
+                        # Run full forward pass to access decoder prediction [B,P,T,4].
+                        self._model.eval()
+                        _enc, dec = self._model(inputs)
+                        pred = dec.get("prediction")
+                        if pred is None:
+                            raise RuntimeError("Paper model decoder did not return prediction")
 
-                    if norm_dbg_should_print:
-                        ego_pred_norm = dec.get("prediction_norm")
+                        if norm_dbg_should_print:
+                            ego_pred_norm = dec.get("prediction_norm")
 
-                    ego = pred[:, 0]  # [B,T,4] in meters
-                    ego_x0 = ego[..., 0]
-                    ego_y0 = ego[..., 1]
-                    ego_cos0 = ego[..., 2]
-                    ego_sin0 = ego[..., 3]
-                    ego_heading = torch.atan2(ego_sin0, ego_cos0)
-                    y = torch.stack([ego_x0[0], ego_y0[0], ego_heading[0]], dim=-1)  # [T,3]
-                else:
-                    y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
+                        ego = pred[:, 0]  # [B,T,4] in meters
+                        ego_x0 = ego[..., 0]
+                        ego_y0 = ego[..., 1]
+                        ego_cos0 = ego[..., 2]
+                        ego_sin0 = ego[..., 3]
+                        ego_heading = torch.atan2(ego_sin0, ego_cos0)
+                        y = torch.stack([ego_x0[0], ego_y0[0], ego_heading[0]], dim=-1)  # [T,3]
+                    else:
+                        y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)  # [T,3]
 
-            y_np = y.detach().cpu().numpy().astype(np.float32)
+                y_np = y.detach().cpu().numpy().astype(np.float32)
+                if self._selector_enabled:
+                    cur = _ego_kinematics(ego_history[-1])
+                    self._prev_selected_world_xyh = _local_xyh_to_world_xyh(y_np, cur)
+                    self._selector_tick += 1
 
             # --- Normalization debug: compare normalized-space vs inverse-normalized (meters) predictions ---
             if norm_dbg_should_print:
