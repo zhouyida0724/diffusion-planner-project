@@ -573,29 +573,19 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
     ego_x = ego_row["x"]
     ego_y = ego_row["y"]
     ego_heading = quaternion_to_heading(ego_row["qw"], ego_row["qx"], ego_row["qy"], ego_row["qz"])
-    ego_vx = ego_row["vx"]
-    ego_vy = ego_row["vy"]
-    ego_ax = ego_row["acceleration_x"]
-    ego_ay = ego_row["acceleration_y"]
 
+    # IMPORTANT CONTRACT:
+    # - Features are represented in the *current ego frame*.
+    # - neighbor_agents_past[0] (ego slot0) is the single source of truth for ego history,
+    #   including v_local computed by finite-difference.
+    #
+    # Therefore ego_current_state must also be ego-frame / ego-relative:
+    # - heading should be 0 (cos=1, sin=0)
+    # - v_local / accel should match ego slot0 at the current timestep.
     R = get_rotation_matrix_2d(-ego_heading)
-    v_local = R @ np.array([ego_vx, ego_vy])
 
-    ego_current_state = np.array(
-        [
-            0.0,
-            0.0,
-            np.cos(ego_heading),
-            np.sin(ego_heading),
-            v_local[0],
-            v_local[1],
-            ego_ax,
-            ego_ay,
-            1.0,
-            1.0,
-        ],
-        dtype=np.float32,
-    )
+    # We will fill ego_current_state after constructing ego slot0 history.
+    ego_current_state = np.zeros((10,), dtype=np.float32)
 
     ego_future = np.zeros((EGO_FUTURE_LEN, 3), dtype=np.float32)
     for i in range(EGO_FUTURE_LEN):
@@ -618,9 +608,10 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
 
     neighbor_past = np.zeros((MAX_NEIGHBORS, NEIGHBOR_HISTORY_LEN, 11), dtype=np.float32)
 
-    # For ego slot0, use finite-difference velocity in ego frame to avoid coordinate/semantic
-    # ambiguity of ego_pose.vx/vy. neighbor_agents_past is sampled at 10Hz => dt=0.1s.
+    # For ego slot0, use finite-difference velocity/acceleration in ego frame.
+    # neighbor_agents_past is sampled at 10Hz => dt=0.1s.
     _slot0_prev_xy = None  # type: ignore
+    _slot0_prev_v = None  # type: ignore
 
     for i in range(NEIGHBOR_HISTORY_LEN):
         # ego_pose is 100Hz; neighbor_agents_past is defined at 10Hz (2s @ 10Hz),
@@ -642,7 +633,6 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
                 dheading -= 2 * np.pi
             while dheading < -np.pi:
                 dheading += 2 * np.pi
-            v_local = R @ np.array([past_row["vx"], past_row["vy"]])
             neighbor_past[0, i] = [
                 dx,
                 dy,
@@ -650,8 +640,8 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
                 np.sin(dheading),
                 0.0,
                 0.0,
-                past_row["acceleration_x"],
-                past_row["acceleration_y"],
+                0.0,
+                0.0,
                 1.8,
                 4.5,
                 1.0,
@@ -660,13 +650,41 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
             try:
                 if _slot0_prev_xy is not None:
                     dt = 0.1
-                    neighbor_past[0, i, 4] = float((dx - _slot0_prev_xy[0]) / dt)
-                    neighbor_past[0, i, 5] = float((dy - _slot0_prev_xy[1]) / dt)
+                    vx = float((dx - _slot0_prev_xy[0]) / dt)
+                    vy = float((dy - _slot0_prev_xy[1]) / dt)
+                    neighbor_past[0, i, 4] = vx
+                    neighbor_past[0, i, 5] = vy
+
+                    if _slot0_prev_v is not None:
+                        ax = float((vx - _slot0_prev_v[0]) / dt)
+                        ay = float((vy - _slot0_prev_v[1]) / dt)
+                        neighbor_past[0, i, 6] = ax
+                        neighbor_past[0, i, 7] = ay
+
+                    _slot0_prev_v = (vx, vy)
+                else:
+                    # First valid point: initialize prev_v so next step can compute acceleration.
+                    _slot0_prev_v = (float(neighbor_past[0, i, 4]), float(neighbor_past[0, i, 5]))
                 _slot0_prev_xy = (float(dx), float(dy))
             except Exception:
                 pass
         else:
             neighbor_past[0, i, -1] = 0.0
+
+    # Fill ego_current_state from ego slot0 current timestep (last history index).
+    # This guarantees ego_current_state is consistent with neighbor_agents_past[0].
+    ego_current_state[:] = [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        float(neighbor_past[0, -1, 4]),
+        float(neighbor_past[0, -1, 5]),
+        float(neighbor_past[0, -1, 6]),
+        float(neighbor_past[0, -1, 7]),
+        1.0,
+        1.0,
+    ]
 
     # NOTE: ego_past is intentionally not exported anymore. The model consumes ego history via
     # neighbor_agents_past[0] (ego slot0), which is the single source of truth.
@@ -728,6 +746,7 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
         if min_diff > 100000000:
             continue
 
+        _prev_v_local = None  # type: ignore
         for i in range(NEIGHBOR_HISTORY_LEN):
             # lidar_box is 20Hz; neighbor past contract is 10Hz (21 points over 2s)
             # => sample every 2 frames from lidar_box.
@@ -743,6 +762,16 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
                 while heading < -np.pi:
                     heading += 2 * np.pi
                 v_local = R @ np.array([box["vx"], box["vy"]])
+                ax = 0.0
+                ay = 0.0
+                try:
+                    if _prev_v_local is not None:
+                        dt = 0.1  # neighbor past is 10Hz
+                        ax = float((v_local[0] - _prev_v_local[0]) / dt)
+                        ay = float((v_local[1] - _prev_v_local[1]) / dt)
+                    _prev_v_local = (float(v_local[0]), float(v_local[1]))
+                except Exception:
+                    pass
                 neighbor_past[agent_idx + 1, i] = [
                     dx,
                     dy,
@@ -750,8 +779,8 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
                     np.sin(heading),
                     v_local[0],
                     v_local[1],
-                    0.0,
-                    0.0,
+                    ax,
+                    ay,
                     box["width"],
                     box["length"],
                     1.0,
@@ -857,6 +886,11 @@ def extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading):
 
     for i, box in enumerate(boxes[:MAX_STATIC_OBJECTS]):
         dx, dy = transform_to_ego_frame(box["x"], box["y"], ego_x, ego_y, ego_heading)
+        yaw = box["yaw"] - ego_heading
+        while yaw > np.pi:
+            yaw -= 2 * np.pi
+        while yaw < -np.pi:
+            yaw += 2 * np.pi
         static_objects[i] = [
             dx,
             dy,
@@ -864,7 +898,7 @@ def extract_static_objects(conn, center_timestamp, ego_x, ego_y, ego_heading):
             box["width"],
             box["length"],
             box["height"],
-            box["yaw"],
+            yaw,
             0.0,
             0.0,
             1.0,
