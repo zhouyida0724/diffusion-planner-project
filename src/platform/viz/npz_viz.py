@@ -55,12 +55,14 @@ def _env_flag(name: str, default: str = "0") -> bool:
 def _tl_color_from_onehot(onehot: np.ndarray) -> str:
     """Map traffic light onehot [g,y,r,unk] to a matplotlib color."""
 
+    # When TL is unavailable/unknown, keep route lane color as the default light yellow
+    # (so the map doesn't turn into an all-gray image).
     if onehot is None or len(onehot) < 4:
-        return "#AAAAAA"
+        return "#FFFF99"
     v = np.asarray(onehot[:4], dtype=np.float32)
     # Guard against malformed vectors like [0,0,0,0] (argmax would incorrectly map to green).
     if not np.all(np.isfinite(v)) or float(np.max(v)) < 0.5:
-        return "#AAAAAA"
+        return "#FFFF99"
     i = int(np.argmax(v))
     if i == 0:
         return "#00AA00"  # green
@@ -68,7 +70,7 @@ def _tl_color_from_onehot(onehot: np.ndarray) -> str:
         return "#CCAA00"  # yellow
     if i == 2:
         return "#CC0000"  # red
-    return "#AAAAAA"  # unknown
+    return "#FFFF99"  # unknown
 
 
 def _draw_dir_arrows(ax, xs: np.ndarray, ys: np.ndarray, dxs: np.ndarray, dys: np.ndarray, *, color: str, every: int = 4):
