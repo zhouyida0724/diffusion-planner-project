@@ -707,7 +707,13 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
             if idx >= 0:
                 box = boxes[idx]
                 dx, dy = transform_to_ego_frame(box["x"], box["y"], ego_x, ego_y, ego_heading)
-                heading = box["yaw"]
+                # lidar_box.yaw is in world frame; neighbor_agents_past contract uses ego frame.
+                # Store heading as ego-relative (dheading) to be consistent with dx/dy and v_local.
+                heading = box["yaw"] - ego_heading
+                while heading > np.pi:
+                    heading -= 2 * np.pi
+                while heading < -np.pi:
+                    heading += 2 * np.pi
                 v_local = R @ np.array([box["vx"], box["vy"]])
                 neighbor_past[agent_idx + 1, i] = [
                     dx,
