@@ -102,6 +102,14 @@ class TrainConfig:
     # Path to a checkpoint payload produced by this trainer, e.g. checkpoint_step_XXXXXX.pt
     resume_ckpt: str | None = None
 
+    # -----------------
+    # training-time state perturbation augmentation (paper_dit_dpm)
+    # -----------------
+    # NOTE: This is intended for training only; it should not affect inference unless explicitly wired.
+    state_perturb_enabled: bool = False
+    state_perturb_prob: float = 0.0
+    state_perturb_min_vx_mps: float = 2.0
+
 
 def seed_everything(seed: int) -> None:
     import random
