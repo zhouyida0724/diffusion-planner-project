@@ -7,6 +7,7 @@ Keep behavior stable: the CLI script remains the entrypoint.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +47,52 @@ def angle_difference_radians(angle1_rad: float, angle2_rad: float) -> float:
     return (2 * math.pi) - normalized_diff if normalized_diff > math.pi else normalized_diff
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = os.environ.get(name, default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _tl_color_from_onehot(onehot: np.ndarray) -> str:
+    """Map traffic light onehot [g,y,r,unk] to a matplotlib color."""
+
+    if onehot is None or len(onehot) < 4:
+        return "#AAAAAA"
+    i = int(np.argmax(onehot[:4]))
+    if i == 0:
+        return "#00AA00"  # green
+    if i == 1:
+        return "#CCAA00"  # yellow
+    if i == 2:
+        return "#CC0000"  # red
+    return "#AAAAAA"  # unknown
+
+
+def _draw_dir_arrows(ax, xs: np.ndarray, ys: np.ndarray, dxs: np.ndarray, dys: np.ndarray, *, color: str, every: int = 4):
+    """Draw short direction arrows at sampled points."""
+
+    if xs.size == 0:
+        return
+    every = max(1, int(every))
+    for i in range(0, int(xs.shape[0]), every):
+        x = float(xs[i])
+        y = float(ys[i])
+        dx = float(dxs[i])
+        dy = float(dys[i])
+        n = (dx * dx + dy * dy) ** 0.5
+        if not np.isfinite(n) or n < 1e-6:
+            continue
+        dx /= n
+        dy /= n
+        # scale arrow length to be visible but not overwhelming
+        L = 3.0
+        ax.annotate(
+            "",
+            xy=(x + L * dx, y + L * dy),
+            xytext=(x, y),
+            arrowprops=dict(arrowstyle="->", color=color, lw=1.2, alpha=0.85),
+        )
+
+
 def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None) -> Path:
     """Render a single-row NPZ export as a PNG.
 
@@ -74,6 +121,12 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     output_path = Path(output_path)
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    # Debug overlay toggles (default OFF to keep legacy images stable)
+    show_lane_dir = _env_flag("NPZ_VIZ_SHOW_LANE_DIR", "0")
+    show_tl = _env_flag("NPZ_VIZ_SHOW_TRAFFIC_LIGHTS", "0")
+    show_neighbor_heading = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_HEADING", "0")
+    show_acc = _env_flag("NPZ_VIZ_SHOW_ACC", "0")
 
     # Set range [-50, 50] for both axes
     ax.set_xlim(-50, 50)
@@ -151,7 +204,18 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             if len(x_coords) == 0:
                 continue
 
-            ax.plot(x_coords, y_coords, "-", color="#FFFF99", alpha=0.9, linewidth=2)
+            # Optional: color route lanes by traffic light state stored in lane_feature[:,8:12]
+            lane_color = "#FFFF99"
+            if show_tl:
+                try:
+                    # Use the first valid point as representative.
+                    j0 = int(np.argmax(valid_mask))
+                    onehot = route_lanes[rlane_idx, j0, 8:12]
+                    lane_color = _tl_color_from_onehot(onehot)
+                except Exception:
+                    lane_color = "#AAAAAA"
+
+            ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=0.9, linewidth=2)
 
             # Plot gold direction arrows every few points
             arrow_interval = max(1, len(x_coords) // 5)  # ~5 arrows per lane
@@ -167,6 +231,16 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                             xytext=(x_coords[i], y_coords[i]),
                             arrowprops=dict(arrowstyle="->", color="#FFD700", lw=1.5),
                         )
+
+            # Optional: visualize the *exported* lane direction vectors (route_lanes[:,:,2:4]).
+            # This is useful for debugging coordinate-frame contract mismatches.
+            if show_lane_dir:
+                try:
+                    dxs = route_lanes[rlane_idx, :, 2][valid_mask]
+                    dys = route_lanes[rlane_idx, :, 3][valid_mask]
+                    _draw_dir_arrows(ax, x_coords, y_coords, dxs, dys, color="#AA00FF", every=max(1, len(x_coords) // 6))
+                except Exception:
+                    pass
 
     # ========== 2. Ego (arrow at origin) ==========
     ego_state = data["ego_current_state"]
@@ -210,6 +284,22 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     neighbor_past = data["neighbor_agents_past"]
     neighbor_future = data.get("neighbor_agents_future")
 
+    if show_acc:
+        try:
+            ax.text(
+                0.02,
+                0.98,
+                f"ego_ax={float(ego_state[6]):.3f}, ego_ay={float(ego_state[7]):.3f}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=10,
+                color="#333333",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.8),
+            )
+        except Exception:
+            pass
+
     agent_id = 0
     agent_ids: dict[int, int] = {}
 
@@ -250,6 +340,21 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         ax.plot(past[start_idx:, 0], past[start_idx:, 1], "b-", linewidth=3, alpha=0.8)
         ax.plot(start_x, start_y, "s", markersize=8, color="blue", markeredgecolor="darkblue", markeredgewidth=2)
         ax.plot(curr_x, curr_y, "o", markersize=8, color="blue", markeredgecolor="darkblue", markeredgewidth=2)
+
+        if show_neighbor_heading and neighbor_past.shape[-1] >= 4:
+            try:
+                cos_h = float(neighbor_past[agent_idx, -1, 2])
+                sin_h = float(neighbor_past[agent_idx, -1, 3])
+                h = float(np.arctan2(sin_h, cos_h))
+                L = 4.0
+                ax.annotate(
+                    "",
+                    xy=(float(curr_x + L * np.cos(h)), float(curr_y + L * np.sin(h))),
+                    xytext=(float(curr_x), float(curr_y)),
+                    arrowprops=dict(arrowstyle="->", color="#00AAFF", lw=2.0, alpha=0.9),
+                )
+            except Exception:
+                pass
 
     # ========== 4. Neighbor agents future trajectories ==========
     if neighbor_future is not None:
