@@ -17,6 +17,12 @@ set -euo pipefail
 #   EXPORT_FRAME_INDEX_MODE (default scene_lidar)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
+# If invoked from within the repo, prefer the actual git root (more robust).
+if command -v git >/dev/null 2>&1; then
+  if git_root=$(cd "$REPO_ROOT" && git rev-parse --show-toplevel 2>/dev/null); then
+    REPO_ROOT="$git_root"
+  fi
+fi
 OUT_ROOT="${1:-/media/zhouyida/新加卷1/exports_stride16_v0.1}"
 
 LIMIT_PER_SHARD="${LIMIT_PER_SHARD:-200000}"
