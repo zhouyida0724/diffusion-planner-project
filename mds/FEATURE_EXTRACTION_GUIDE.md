@@ -38,7 +38,6 @@ docker exec -it nuplan-simulation bash
 | 特征 | Shape | 说明 |
 |------|-------|------|
 | ego_current_state | (10,) | 自车当前状态 |
-| ego_past | (21, 3) | 自车历史轨迹 (2秒 @ 10Hz) |
 | ego_agent_future | (80, 3) | 自车未来轨迹 (8秒 @ 10Hz) |
 | neighbor_agents_past | (32, 21, 11) | 邻居历史轨迹 |
 | neighbor_agents_future | (32, 81, 3) | 邻居未来轨迹 |
@@ -77,8 +76,9 @@ python3 /workspace/scripts/visualize_npz.py \
 - 80 点，10Hz，8秒
 - 从 ego_pose (100Hz) 每 10 帧取 1 帧
 
-### ego_past (历史轨迹)
+### ego history (历史轨迹)
 - 21 点，10Hz，2秒
+- **单一真源**：`neighbor_agents_past[0]`（ego slot0）
 - 从 ego_pose (100Hz) 每 10 帧取 1 帧
 
 ### neighbor_future (未来轨迹)
@@ -173,7 +173,6 @@ for i in range(last_valid_idx + 1, target_len):
 ```python
 {
     'ego_current_state': (10,),
-    'ego_past': (21, 3),
     'ego_agent_future': (80, 3),
     'neighbor_agents_past': (32, 21, 11),
     'neighbor_agents_future': (32, 81, 3),
@@ -187,7 +186,7 @@ for i in range(last_valid_idx + 1, target_len):
 - 蓝/红色虚线：车道边界
 - 浅黄色实线：route lane 中心线
 - 金色箭头：route lane 方向
-- 绿色虚线：ego 历史轨迹
+- 绿色虚线：ego 历史轨迹（来自 `neighbor_agents_past[0]`）
 - 蓝色实线：ego 未来轨迹
 - 绿色实线：邻居未来轨迹
 
