@@ -349,6 +349,8 @@ def main() -> int:
                                     'route_len_new',
                                     'avails_sum_old',
                                     'avails_sum_new',
+                                    # Optional TL debug (may be the only key when profiling is disabled).
+                                    'route_lane_tl_debug',
                                 ]
                                 if k in pf
                             }

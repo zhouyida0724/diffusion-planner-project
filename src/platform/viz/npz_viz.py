@@ -55,9 +55,14 @@ def _env_flag(name: str, default: str = "0") -> bool:
 def _tl_color_from_onehot(onehot: np.ndarray) -> str:
     """Map traffic light onehot [g,y,r,unk] to a matplotlib color."""
 
+    # When TL is unavailable/unknown, render as gray (so unknown is visually distinct).
     if onehot is None or len(onehot) < 4:
         return "#AAAAAA"
-    i = int(np.argmax(onehot[:4]))
+    v = np.asarray(onehot[:4], dtype=np.float32)
+    # Guard against malformed vectors like [0,0,0,0] (argmax would incorrectly map to green).
+    if not np.all(np.isfinite(v)) or float(np.max(v)) < 0.5:
+        return "#AAAAAA"
+    i = int(np.argmax(v))
     if i == 0:
         return "#00AA00"  # green
     if i == 1:
@@ -183,6 +188,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     # Route lanes visualization (light yellow solid lines with gold arrows)
     # ============================================================
     if route_lanes is not None:
+        tl_counts = {"g": 0, "y": 0, "r": 0, "unk": 0}
         route_lanes_avails = _squeeze1(data.get("route_lanes_avails")) if ("route_lanes_avails" in data.files) else None
         for rlane_idx in range(route_lanes.shape[0]):
             lane_x = route_lanes[rlane_idx, :, 0]
@@ -215,16 +221,50 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
 
             # Optional: color route lanes by traffic light state stored in lane_feature[:,8:12]
             lane_color = "#FFFF99"
+            lane_lw = 2.0
+            lane_alpha = 0.9
             if show_tl:
                 try:
                     # Use the first valid point as representative.
                     j0 = int(np.argmax(valid_mask))
                     onehot = route_lanes[rlane_idx, j0, 8:12]
                     lane_color = _tl_color_from_onehot(onehot)
+                    # Make TL coloring visually obvious.
+                    lane_lw = 4.0
+                    lane_alpha = 1.0
                 except Exception:
                     lane_color = "#AAAAAA"
+                    lane_lw = 4.0
+                    lane_alpha = 1.0
 
-            ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=0.9, linewidth=2)
+                # Track counts for a quick sanity check on the image.
+                if lane_color == "#00AA00":
+                    tl_counts["g"] += 1
+                elif lane_color == "#CCAA00":
+                    tl_counts["y"] += 1
+                elif lane_color == "#CC0000":
+                    tl_counts["r"] += 1
+                else:
+                    tl_counts["unk"] += 1
+
+            ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=lane_alpha, linewidth=lane_lw)
+
+            # Extra emphasis: draw colored dots along the route lane when TL is enabled.
+            if show_tl:
+                try:
+                    step = max(1, len(x_coords) // 12)  # ~12 dots per lane
+                    ax.scatter(
+                        x_coords[::step],
+                        y_coords[::step],
+                        s=22,
+                        c=lane_color,
+                        edgecolors="#222222",
+                        linewidths=0.3,
+                        alpha=0.95,
+                        zorder=5,
+                    )
+                except Exception:
+                    pass
 
             # Plot gold direction arrows every few points
             arrow_interval = max(1, len(x_coords) // 5)  # ~5 arrows per lane
@@ -250,6 +290,19 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                     _draw_dir_arrows(ax, x_coords, y_coords, dxs, dys, color="#AA00FF", every=max(1, len(x_coords) // 6))
                 except Exception:
                     pass
+
+        if show_tl:
+            ax.text(
+                0.02,
+                0.02,
+                f"route_lanes TL count: g={tl_counts['g']} y={tl_counts['y']} r={tl_counts['r']} unk={tl_counts['unk']}",
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=10,
+                color="#333333",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+            )
 
     # ========== 2. Ego (arrow at origin) ==========
     ego_state = _squeeze1(data["ego_current_state"])

@@ -24,6 +24,10 @@ import time
 from collections import Counter
 
 import numpy as np
+
+
+# Optional debug: populated by extract_route_lanes() for manifest introspection.
+_LAST_ROUTE_LANE_TL_DEBUG: dict | None = None
 from shapely import LineString
 
 from nuplan.common.actor_state.state_representation import Point2D
@@ -504,23 +508,27 @@ def get_traffic_lights_at_timestamp(conn, timestamp, map_name):
     cursor = conn.cursor()
 
     try:
+        # IMPORTANT: pull TL states for the single latest lidar_pc frame <= timestamp.
+        # The previous implementation limited to 50 rows ordered by timestamp, which can
+        # drop many lane_connector_ids (especially at intersections) and makes most lanes
+        # appear "unknown".
         cursor.execute(
-            """
-            SELECT tls.status, tls.lane_connector_id, lp.timestamp
-            FROM traffic_light_status tls
-            JOIN lidar_pc lp ON tls.lidar_pc_token = lp.token
-            WHERE lp.timestamp <= ?
-            ORDER BY lp.timestamp DESC
-            LIMIT 50
-        """,
+            "SELECT token, timestamp FROM lidar_pc WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
             (timestamp,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        lidar_pc_token = row[0]
+
+        cursor.execute(
+            "SELECT lane_connector_id, status FROM traffic_light_status WHERE lidar_pc_token = ?",
+            (lidar_pc_token,),
         )
         results = cursor.fetchall()
 
-        traffic_lights = {}
-        for row in results:
-            lane_id = row[1]
-            state = row[0]
+        traffic_lights: dict[int, str] = {}
+        for lane_id, state in results:
             traffic_lights[lane_id] = state
 
         return traffic_lights
@@ -1037,8 +1045,9 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
         left_boundary_coords = lane_data["left"]
         right_boundary_coords = lane_data["right"]
 
-        lane_id = lane_obj.id
-        traffic_light_state = traffic_light_lookup.get(lane_id, [0, 0, 0, 1])
+        # NOTE: `traffic_light_lookup` is keyed by string lane_connector_id from DB.
+        lane_id_str = str(lane_obj.id)
+        traffic_light_state = traffic_light_lookup.get(lane_id_str, [0, 0, 0, 1])
 
         lane_feature, avails = _lane_polyline_process_with_avails(
             lane_obj,
@@ -1151,6 +1160,7 @@ def extract_route_lanes(
                 all_lanes.append(
                     {
                         "obj": lane_obj,
+                        "layer_type": layer_type,
                         "centerline": centerline_coords,
                         "left": left_boundary_coords,
                         "right": right_boundary_coords,
@@ -1163,17 +1173,26 @@ def extract_route_lanes(
     all_lanes.sort(key=lambda x: x["dist"])
 
     route_idx = 0
+    dbg_selected_connectors = 0
+    dbg_selected_connectors_in_tl = 0
     for lane_data in all_lanes[:max_route_lanes]:
         if route_idx >= max_route_lanes:
             break
 
         lane_obj = lane_data["obj"]
+        layer_type = lane_data.get("layer_type")
         centerline_coords = lane_data["centerline"]
         left_boundary_coords = lane_data["left"]
         right_boundary_coords = lane_data["right"]
 
-        lane_id = lane_obj.id
-        traffic_light_state = traffic_light_lookup.get(lane_id, [0, 0, 0, 1])
+        # NOTE: `traffic_light_lookup` is keyed by string lane_connector_id from DB.
+        lane_id_str = str(lane_obj.id)
+        traffic_light_state = traffic_light_lookup.get(lane_id_str, [0, 0, 0, 1])
+
+        if layer_type == SemanticMapLayer.LANE_CONNECTOR:
+            dbg_selected_connectors += 1
+            if lane_id_str in traffic_light_lookup:
+                dbg_selected_connectors_in_tl += 1
 
         lane_feature, avails = _lane_polyline_process_with_avails(
             lane_obj,
@@ -1206,6 +1225,13 @@ def extract_route_lanes(
             )
         except Exception as e:
             DEBUG_LOGGER.warning(f"route_lanes debug log failed: {e}")
+
+    global _LAST_ROUTE_LANE_TL_DEBUG
+    _LAST_ROUTE_LANE_TL_DEBUG = {
+        "selected_connectors": int(dbg_selected_connectors),
+        "selected_connectors_in_tl": int(dbg_selected_connectors_in_tl),
+        "traffic_light_dict_size": int(len(traffic_light_lookup)),
+    }
 
     return route_lanes, route_lanes_avails, route_speed_limits, route_has_speed_limits
 
@@ -1608,5 +1634,24 @@ def extract_features(
             "proximal_rb_count": proximal_rb_count,
             "proximal_overlap_count": proximal_overlap_count,
         }
+
+        # Optional TL debug: quantify whether selected route_lanes contain TL-controlled connectors.
+        # Enable with EXPORT_TL_DEBUG=1.
+        if os.environ.get("EXPORT_TL_DEBUG", "0") == "1":
+            try:
+                out["_profile_flags"]["route_lane_tl_debug"] = (
+                    dict(_LAST_ROUTE_LANE_TL_DEBUG) if _LAST_ROUTE_LANE_TL_DEBUG is not None else None
+                )
+            except Exception:
+                out["_profile_flags"]["route_lane_tl_debug"] = None
+
+    # If profiling is disabled, still allow TL debug export when explicitly requested.
+    if timing is None and os.environ.get("EXPORT_TL_DEBUG", "0") == "1":
+        try:
+            out["_profile_flags"] = {
+                "route_lane_tl_debug": (dict(_LAST_ROUTE_LANE_TL_DEBUG) if _LAST_ROUTE_LANE_TL_DEBUG is not None else None)
+            }
+        except Exception:
+            out["_profile_flags"] = {"route_lane_tl_debug": None}
 
     return out
