@@ -16,12 +16,16 @@ set -euo pipefail
 #   EXTRACT_SINGLE_FRAME_IMPL must be 'py' (guarded in extractor)
 #   EXPORT_FRAME_INDEX_MODE (default scene_lidar)
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
-# If invoked from within the repo, prefer the actual git root (more robust).
+# Resolve repo root robustly.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if command -v git >/dev/null 2>&1; then
-  if git_root=$(cd "$REPO_ROOT" && git rev-parse --show-toplevel 2>/dev/null); then
+  if git_root=$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel 2>/dev/null); then
     REPO_ROOT="$git_root"
+  else
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
   fi
+else
+  REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 fi
 OUT_ROOT="${1:-/media/zhouyida/新加卷1/exports_stride16_v0.1}"
 
