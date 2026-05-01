@@ -941,8 +941,12 @@ def _lane_polyline_process_with_avails(
             if vec_len > 0:
                 vec_dx /= vec_len
                 vec_dy /= vec_len
-            lane_feature[i, 2] = vec_dx
-            lane_feature[i, 3] = vec_dy
+            # IMPORTANT: lane_feature[:,2:4] must be in ego frame (consistent with xy and offsets).
+            # vec_{dx,dy} above is a world-frame unit vector; rotate by -ego_heading into ego.
+            c = np.cos(-ego_heading)
+            s = np.sin(-ego_heading)
+            lane_feature[i, 2] = c * vec_dx - s * vec_dy
+            lane_feature[i, 3] = s * vec_dx + c * vec_dy
 
         lx, ly = left_sampled[i]
         ldx, ldy = transform_to_ego_frame(lx, ly, ego_point.x, ego_point.y, ego_heading)
