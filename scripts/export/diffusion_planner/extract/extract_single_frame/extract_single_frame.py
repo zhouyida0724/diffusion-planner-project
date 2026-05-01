@@ -49,18 +49,17 @@ _impl = os.environ.get("EXTRACT_SINGLE_FRAME_IMPL", "auto").strip().lower()
 if _impl not in {"py", "cy", "auto"}:
     _impl = "auto"
 
-if _impl == "py":
-    core = _core_py
-elif _impl == "cy":
-    if _core_cy is None:
-        raise ImportError(
-            "EXTRACT_SINGLE_FRAME_IMPL=cy requested but Cython/fast implementation failed to import. "
-            "Ensure src/platform/fast_geometry is built and importable. "
-            f"Original error: {_core_cy_err}"
-        )
-    core = _core_cy
-else:  # auto
-    core = _core_cy if _core_cy is not None else _core_py
+# Guardrail: we currently do NOT allow using the cython/fast implementation for exports.
+# The py and cy cores are not guaranteed contract-equivalent, and silent drift is expensive.
+# Force users to be explicit and safe.
+if _impl != "py":
+    raise RuntimeError(
+        "Cython/auto extractor is disabled for exports. "
+        "Set EXTRACT_SINGLE_FRAME_IMPL=py. "
+        f"Got EXTRACT_SINGLE_FRAME_IMPL={_impl!r}."
+    )
+
+core = _core_py
 
 # --------------------------------------------------------------------------------------
 # Public constants (kept for backwards compatibility with other scripts/tests)
