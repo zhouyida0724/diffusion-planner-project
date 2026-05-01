@@ -618,6 +618,10 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
 
     neighbor_past = np.zeros((MAX_NEIGHBORS, NEIGHBOR_HISTORY_LEN, 11), dtype=np.float32)
 
+    # For ego slot0, use finite-difference velocity in ego frame to avoid coordinate/semantic
+    # ambiguity of ego_pose.vx/vy. neighbor_agents_past is sampled at 10Hz => dt=0.1s.
+    _slot0_prev_xy = None  # type: ignore
+
     for i in range(NEIGHBOR_HISTORY_LEN):
         # ego_pose is 100Hz; neighbor_agents_past is defined at 10Hz (2s @ 10Hz),
         # so we downsample by 10 frames per step (see mds/FEATURE_EXTRACTION_GUIDE.md).
@@ -631,20 +635,36 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
                 past_row["qy"],
                 past_row["qz"],
             )
+            # Ego history is stored in the *current ego frame*.
+            # dx/dy and v_local are already ego-frame, so make heading ego-relative too.
+            dheading = past_heading - ego_heading
+            while dheading > np.pi:
+                dheading -= 2 * np.pi
+            while dheading < -np.pi:
+                dheading += 2 * np.pi
             v_local = R @ np.array([past_row["vx"], past_row["vy"]])
             neighbor_past[0, i] = [
                 dx,
                 dy,
-                np.cos(past_heading),
-                np.sin(past_heading),
-                v_local[0],
-                v_local[1],
+                np.cos(dheading),
+                np.sin(dheading),
+                0.0,
+                0.0,
                 past_row["acceleration_x"],
                 past_row["acceleration_y"],
                 1.8,
                 4.5,
                 1.0,
             ]
+
+            try:
+                if _slot0_prev_xy is not None:
+                    dt = 0.1
+                    neighbor_past[0, i, 4] = float((dx - _slot0_prev_xy[0]) / dt)
+                    neighbor_past[0, i, 5] = float((dy - _slot0_prev_xy[1]) / dt)
+                _slot0_prev_xy = (float(dx), float(dy))
+            except Exception:
+                pass
         else:
             neighbor_past[0, i, -1] = 0.0
 

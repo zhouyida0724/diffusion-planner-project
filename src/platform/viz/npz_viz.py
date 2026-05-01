@@ -140,6 +140,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     show_lane_dir = _env_flag("NPZ_VIZ_SHOW_LANE_DIR", "0")
     show_tl = _env_flag("NPZ_VIZ_SHOW_TRAFFIC_LIGHTS", "0")
     show_neighbor_heading = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_HEADING", "0")
+    show_neighbor_vdir = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_VDIR", "0")
     show_acc = _env_flag("NPZ_VIZ_SHOW_ACC", "0")
 
     # Set range [-50, 50] for both axes
@@ -385,7 +386,8 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         curr_y = neighbor_past[agent_idx, -1, 1]
         past = neighbor_past[agent_idx, :, 0:2]
 
-        if abs(curr_x) < 0.1 and abs(curr_y) < 0.1:
+        # NOTE: do not skip ego slot0 when heading debug is enabled; otherwise its arrow is never shown.
+        if agent_idx != 0 and abs(curr_x) < 0.1 and abs(curr_y) < 0.1:
             continue
         if abs(curr_x) > 50 or abs(curr_y) > 50:
             continue
@@ -423,11 +425,62 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                 sin_h = float(neighbor_past[agent_idx, -1, 3])
                 h = float(np.arctan2(sin_h, cos_h))
                 L = 4.0
+                # Make ego slot0 heading arrow very obvious (it overlaps ego arrow at origin).
+                color = "#00AAFF"
+                lw = 2.0
+                alpha = 0.9
+                z = None
+                if agent_idx == 0:
+                    color = "#7A00FF"  # purple
+                    lw = 3.5
+                    alpha = 1.0
                 ax.annotate(
                     "",
                     xy=(float(curr_x + L * np.cos(h)), float(curr_y + L * np.sin(h))),
                     xytext=(float(curr_x), float(curr_y)),
-                    arrowprops=dict(arrowstyle="->", color="#00AAFF", lw=2.0, alpha=0.9),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=lw, alpha=alpha),
+                )
+            except Exception:
+                pass
+
+        # Optional: visualize velocity direction (ego frame) using v_local (dims 4:6).
+        if show_neighbor_vdir and neighbor_past.shape[-1] >= 6:
+            try:
+                vx = float(neighbor_past[agent_idx, -1, 4])
+                vy = float(neighbor_past[agent_idx, -1, 5])
+                n = float((vx * vx + vy * vy) ** 0.5)
+                if n > 1e-3:
+                    vx /= n
+                    vy /= n
+                    L = 4.0
+                    ax.annotate(
+                        "",
+                        xy=(float(curr_x + L * vx), float(curr_y + L * vy)),
+                        xytext=(float(curr_x), float(curr_y)),
+                        arrowprops=dict(arrowstyle="->", color="#FF00AA", lw=2.0, alpha=0.85),
+                    )
+            except Exception:
+                pass
+
+        # Optional: print ego slot0 heading/vdir angles for unambiguous debugging.
+        if agent_idx == 0 and (show_neighbor_heading or show_neighbor_vdir):
+            try:
+                cos_h = float(neighbor_past[0, -1, 2])
+                sin_h = float(neighbor_past[0, -1, 3])
+                h = float(np.arctan2(sin_h, cos_h))
+                vx = float(neighbor_past[0, -1, 4])
+                vy = float(neighbor_past[0, -1, 5])
+                vdir = float(np.arctan2(vy, vx))
+                ax.text(
+                    0.02,
+                    0.92,
+                    f"slot0 heading={h:.3f} rad, vdir={vdir:.3f} rad",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=10,
+                    color="#222222",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
                 )
             except Exception:
                 pass
