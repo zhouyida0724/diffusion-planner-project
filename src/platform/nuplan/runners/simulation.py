@@ -18,12 +18,24 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 
-DEFAULT_SCENARIO_FILTER_CONFIG_FILE = (
-    "/workspace/nuplan-visualization/nuplan/planning/script/config/common/"
-    "scenario_filter/one_hand_picked_scenario.yaml"
+# diffusion-planner-project repo root
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+
+# Default to the repo-local nuPlan vendor config so the runner works both on
+# host and inside containers (no hard-coded /workspace dependency).
+DEFAULT_SCENARIO_FILTER_CONFIG_FILE = str(
+    _REPO_ROOT
+    / "nuplan-visualization"
+    / "nuplan"
+    / "planning"
+    / "script"
+    / "config"
+    / "common"
+    / "scenario_filter"
+    / "one_hand_picked_scenario.yaml"
 )
 
-DEFAULT_DATA_ROOT = "/workspace/data/nuplan/data/cache/mini"
+DEFAULT_DATA_ROOT = str(_REPO_ROOT / "data" / "nuplan" / "data" / "cache" / "mini")
 
 
 @dataclass(frozen=True)
@@ -57,6 +69,10 @@ def write_scenario_filter_yaml_for_tokens(
 ) -> None:
     ensure_parent_dir(config_file)
     tokens_yaml = "\n".join([f"  - '{t}'" for t in scenario_tokens])
+    # nuPlan ScenarioFilter applies `num_scenarios_per_type` even when selecting by tokens.
+    # If all selected tokens share the same scenario_type, leaving this at 1 will truncate
+    # to a single scenario. Use a high enough limit to keep all provided tokens.
+    n = int(len(scenario_tokens))
     Path(config_file).write_text(
         """_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
 scenario_types: null
@@ -65,8 +81,12 @@ scenario_tokens:
         + (tokens_yaml + "\n" if tokens_yaml else "")
         + """log_names: null
 map_names: null
-num_scenarios_per_type: 1
-limit_total_scenarios: null
+num_scenarios_per_type: """
+        + str(max(1, n))
+        + """
+limit_total_scenarios: """
+        + str(n if n > 0 else "null")
+        + """
 timestamp_threshold_s: null
 ego_displacement_minimum_m: null
 expand_scenarios: false

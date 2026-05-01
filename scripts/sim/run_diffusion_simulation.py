@@ -5,6 +5,7 @@ CLI is kept stable; implementation uses `src.platform.nuplan` helpers.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -56,12 +57,18 @@ def main() -> None:
         default=10,
         help="Diffusion sampling steps used by the planner (paper_dit_dpm). Default: 10.",
     )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=DEFAULT_DATA_ROOT,
+        help=f"nuPlan data root containing log DBs (default: {DEFAULT_DATA_ROOT}).",
+    )
     args = parser.parse_args()
 
     # Ensure both nuPlan vendor code and our repo code are importable in the simulation subprocess.
     # Put repo root first so `src.*` is always resolvable.
     repo_root = Path(__file__).resolve().parents[2]
-    pythonpath = f"{repo_root}:/workspace/nuplan-visualization"
+    pythonpath = f"{repo_root}:{repo_root / 'nuplan-visualization'}"
 
     planner_key = args.planner
     if planner_key in {"idm", "idm_planner"}:
@@ -95,7 +102,7 @@ def main() -> None:
         cmd = build_run_simulation_cmd(
             planner_overrides=planner_overrides,
             scenario_filter="one_hand_picked_scenario",
-            data_root=DEFAULT_DATA_ROOT,
+            data_root=str(args.data_root),
         )
 
     elif args.scenario:
@@ -103,14 +110,14 @@ def main() -> None:
         cmd = build_run_simulation_cmd(
             planner_overrides=planner_overrides,
             scenario_filter="one_hand_picked_scenario",
-            data_root=DEFAULT_DATA_ROOT,
+            data_root=str(args.data_root),
         )
 
     elif args.num:
         cmd = build_run_simulation_cmd(
             planner_overrides=planner_overrides,
             scenario_filter="simulation_test_split",
-            data_root=DEFAULT_DATA_ROOT,
+            data_root=str(args.data_root),
             extra_overrides=[f"scenario_filter.limit_total_scenarios={args.num}"],
         )
 
@@ -118,12 +125,22 @@ def main() -> None:
         cmd = build_run_simulation_cmd(
             planner_overrides=planner_overrides,
             scenario_filter="simulation_test_split",
-            data_root=DEFAULT_DATA_ROOT,
+            data_root=str(args.data_root),
             extra_overrides=["scenario_filter.limit_total_scenarios=1"],
         )
 
     print(f"Running: {' '.join(cmd)}")
-    invocation = make_invocation(cmd=cmd, pythonpath=pythonpath)
+    # nuPlan Hydra configs rely on these env vars for maps/data/exp roots.
+    base_env = dict(os.environ)
+    base_env.setdefault("NUPLAN_MAPS_ROOT", str(repo_root / "data" / "nuplan" / "maps"))
+    base_env.setdefault("NUPLAN_DATA_ROOT", str(repo_root / "data" / "nuplan" / "data"))
+
+    invocation = make_invocation(
+        cmd=cmd,
+        base_env=base_env,
+        pythonpath=pythonpath,
+        nuplan_exp_root=repo_root / "data" / "nuplan" / "exp",
+    )
     raise SystemExit(run(invocation))
 
 
