@@ -26,6 +26,8 @@ import numpy as np
 
 # Optional debug: populated by extract_route_lanes() for manifest introspection.
 _LAST_ROUTE_LANE_TL_DEBUG: dict | None = None
+# Optional debug: misc per-sample flags for manifest introspection (frame debug, etc.).
+_LAST_ROUTE_LANES_DEBUG: dict | None = None
 from shapely import LineString
 
 from nuplan.common.actor_state.state_representation import Point2D
@@ -451,12 +453,64 @@ def bfs_bridge_route_if_needed(
 def get_target_frame(conn, scenario_token, frame_index):
     cursor = conn.cursor()
 
+    # NOTE ABOUT frame_index CONTRACT
+    # Historically, frame_index was interpreted as an index into ego_pose (100Hz) for the log.
+    # However, most downstream semantics (lidar_box, traffic_light_status, scene boundaries)
+    # are keyed to lidar_pc (20Hz) within the scene.
+    #
+    # When frame_index exceeds the number of lidar frames in the scene (common for random sampling),
+    # the old behavior can select a timestamp that does NOT belong to the requested scene_token.
+    # That produces visually-plausible but semantically-wrong samples (e.g., TL lookup becomes empty).
+    #
+    # To make this explicit and safe, we provide an opt-in mode that interprets frame_index as
+    # a scene-local lidar_pc index.
+    # Default to scene-local lidar_pc indexing for correctness.
+    # Set EXPORT_FRAME_INDEX_MODE=ego_pose to recover legacy behavior.
+    frame_mode = os.environ.get("EXPORT_FRAME_INDEX_MODE", "scene_lidar").strip().lower()
+
     try:
         scenario_token_bytes = bytes.fromhex(scenario_token)
         cursor.execute("SELECT token FROM scene WHERE token = ?", (scenario_token_bytes,))
         scenario = cursor.fetchone()
 
         if scenario:
+            if frame_mode in {"lidar", "scene_lidar", "lidar_pc"}:
+                # Interpret frame_index as an index into lidar_pc timestamps within this scene.
+                cursor.execute(
+                    "SELECT timestamp FROM lidar_pc WHERE scene_token=? ORDER BY timestamp LIMIT 1 OFFSET ?",
+                    (scenario_token_bytes, int(frame_index)),
+                )
+                lr = cursor.fetchone()
+                if lr is not None:
+                    lidar_ts = int(lr[0])
+                else:
+                    # Out of range: clamp to last lidar_pc in scene.
+                    cursor.execute(
+                        "SELECT timestamp FROM lidar_pc WHERE scene_token=? ORDER BY timestamp DESC LIMIT 1",
+                        (scenario_token_bytes,),
+                    )
+                    lr2 = cursor.fetchone()
+                    if lr2 is None:
+                        raise RuntimeError("scene has no lidar_pc")
+                    lidar_ts = int(lr2[0])
+
+                # Map the lidar timestamp to the closest ego_pose at-or-before it (same log_token).
+                cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
+                log_token = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT ep.token, ep.timestamp
+                    FROM ego_pose ep
+                    WHERE ep.log_token = ? AND ep.timestamp <= ?
+                    ORDER BY ep.timestamp DESC
+                    LIMIT 1
+                    """,
+                    (log_token, lidar_ts),
+                )
+                er = cursor.fetchone()
+                if er is not None:
+                    return er[0], er[1], er[0]
+
             # First get log_token from scene (matching extract_ego_data approach)
             cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
             log_token = cursor.fetchone()[0]
@@ -1317,6 +1371,36 @@ def extract_features(
     with _timing_ctx(timing, "get_traffic_lights_at_timestamp"):
         traffic_light_data = get_traffic_lights_at_timestamp(conn, center_timestamp, map_name)
 
+    # Debug: verify the lidar frame used by TL/neighbor lookup belongs to the requested scene.
+    # This helps catch plan frame_index misinterpretation and other timestamp drift.
+    # Enable by setting EXPORT_FRAME_DEBUG=1 (does not affect NPZ buffers).
+    global _LAST_ROUTE_LANES_DEBUG
+    if os.environ.get("EXPORT_FRAME_DEBUG", "0") in {"1", "true", "yes", "y"}:
+        try:
+            cur = conn.cursor()
+            st = bytes.fromhex(str(scenario_token_hex))
+            cur.execute(
+                "SELECT token, timestamp, scene_token FROM lidar_pc WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+                (int(center_timestamp),),
+            )
+            lr = cur.fetchone()
+            if lr is not None:
+                picked_scene_hex = None
+                try:
+                    picked_scene_hex = bytes(lr[2]).hex() if lr[2] is not None else None
+                except Exception:
+                    picked_scene_hex = None
+                _LAST_ROUTE_LANES_DEBUG = dict(_LAST_ROUTE_LANES_DEBUG or {})
+                _LAST_ROUTE_LANES_DEBUG.update(
+                    {
+                        "picked_lidar_timestamp": int(lr[1]),
+                        "picked_lidar_scene_token_hex": picked_scene_hex,
+                        "picked_lidar_scene_matches": bool(picked_scene_hex == scenario_token_hex),
+                    }
+                )
+        except Exception:
+            pass
+
     with _timing_ctx(timing, "extract_neighbor_agents"):
         neighbor_past_agents, neighbor_future = extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading)
 
@@ -1677,12 +1761,21 @@ def extract_features(
             except Exception:
                 out["_profile_flags"]["route_lane_tl_debug"] = None
 
-    # If profiling is disabled, still allow TL debug export when explicitly requested.
-    if timing is None and os.environ.get("EXPORT_TL_DEBUG", "0") == "1":
+        # Optional frame debug (picked lidar scene/timestamp).
+        try:
+            if _LAST_ROUTE_LANES_DEBUG is not None:
+                out["_profile_flags"].update(dict(_LAST_ROUTE_LANES_DEBUG))
+        except Exception:
+            pass
+
+    # If profiling is disabled, still allow debug export when explicitly requested.
+    if timing is None and (os.environ.get("EXPORT_TL_DEBUG", "0") == "1" or os.environ.get("EXPORT_FRAME_DEBUG", "0") == "1"):
         try:
             out["_profile_flags"] = {
                 "route_lane_tl_debug": (dict(_LAST_ROUTE_LANE_TL_DEBUG) if _LAST_ROUTE_LANE_TL_DEBUG is not None else None)
             }
+            if _LAST_ROUTE_LANES_DEBUG is not None:
+                out["_profile_flags"].update(dict(_LAST_ROUTE_LANES_DEBUG))
         except Exception:
             out["_profile_flags"] = {"route_lane_tl_debug": None}
 
