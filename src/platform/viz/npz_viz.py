@@ -142,6 +142,9 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     show_neighbor_heading = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_HEADING", "0")
     show_neighbor_vdir = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_VDIR", "0")
     show_acc = _env_flag("NPZ_VIZ_SHOW_ACC", "0")
+    show_ego_state_text = _env_flag("NPZ_VIZ_SHOW_EGO_STATE_TEXT", "0")
+    show_speed_text = _env_flag("NPZ_VIZ_SHOW_SPEED_LIMIT_TEXT", "0")
+    show_static_yaw = _env_flag("NPZ_VIZ_SHOW_STATIC_YAW", "0")
 
     # Set range [-50, 50] for both axes
     ax.set_xlim(-50, 50)
@@ -361,18 +364,23 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     except Exception:
         pass
 
-    if show_acc:
+    if show_ego_state_text:
         try:
+            ego_h = float(np.arctan2(float(ego_state[3]), float(ego_state[2])))
             ax.text(
                 0.02,
                 0.98,
-                f"ego_ax={float(ego_state[6]):.3f}, ego_ay={float(ego_state[7]):.3f}",
+                "ego_current_state\n"
+                + f"heading(rad)={ego_h:+.3f}\n"
+                + f"v_local=[{float(ego_state[4]):+.3f},{float(ego_state[5]):+.3f}]\n"
+                + f"a_local=[{float(ego_state[6]):+.3f},{float(ego_state[7]):+.3f}]\n"
+                + f"valid={float(ego_state[8]):.1f},{float(ego_state[9]):.1f}",
                 transform=ax.transAxes,
                 ha="left",
                 va="top",
                 fontsize=10,
-                color="#333333",
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.8),
+                color="#222222",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
             )
         except Exception:
             pass
@@ -458,6 +466,25 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                         xy=(float(curr_x + L * vx), float(curr_y + L * vy)),
                         xytext=(float(curr_x), float(curr_y)),
                         arrowprops=dict(arrowstyle="->", color="#FF00AA", lw=2.0, alpha=0.85),
+                    )
+            except Exception:
+                pass
+
+        # Optional: visualize acceleration direction (ego frame) using a_local (dims 6:8).
+        if show_acc and neighbor_past.shape[-1] >= 8:
+            try:
+                axv = float(neighbor_past[agent_idx, -1, 6])
+                ayv = float(neighbor_past[agent_idx, -1, 7])
+                n = float((axv * axv + ayv * ayv) ** 0.5)
+                if n > 1e-3 and np.isfinite(n):
+                    axv /= n
+                    ayv /= n
+                    L = 3.5
+                    ax.annotate(
+                        "",
+                        xy=(float(curr_x + L * axv), float(curr_y + L * ayv)),
+                        xytext=(float(curr_x), float(curr_y)),
+                        arrowprops=dict(arrowstyle="->", color="#FF8800", lw=2.0, alpha=0.85),
                     )
             except Exception:
                 pass
@@ -588,6 +615,59 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             if abs(x) > 50 or abs(y) > 50:
                 continue
             ax.plot(x, y, color="red", marker="^", markersize=20, alpha=0.7)
+
+            if show_static_yaw and static_objs.shape[-1] >= 7:
+                try:
+                    yaw = float(static_objs[obj_idx, 6])
+                    if np.isfinite(yaw):
+                        dx = math.cos(yaw)
+                        dy = math.sin(yaw)
+                        L = 5.0
+                        ax.annotate(
+                            "",
+                            xy=(float(x + L * dx), float(y + L * dy)),
+                            xytext=(float(x), float(y)),
+                            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.8, alpha=0.85),
+                        )
+                except Exception:
+                    pass
+
+    # Speed limit text dump (for manual review).
+    if show_speed_text:
+        try:
+            lanes_sl = _squeeze1(data.get("lanes_speed_limit")) if ("lanes_speed_limit" in data.files) else None
+            lanes_has = _squeeze1(data.get("lanes_has_speed_limit")) if ("lanes_has_speed_limit" in data.files) else None
+            r_sl = _squeeze1(data.get("route_lanes_speed_limit")) if ("route_lanes_speed_limit" in data.files) else None
+            r_has = _squeeze1(data.get("route_lanes_has_speed_limit")) if ("route_lanes_has_speed_limit" in data.files) else None
+
+            def _fmt(sl, has, name: str) -> str:
+                if sl is None or has is None:
+                    return f"{name}: <missing>"
+                pairs = []
+                for i in range(int(sl.shape[0])):
+                    if float(has[i]) < 0.5:
+                        continue
+                    pairs.append(f"{i}:{float(sl[i]):.2f}")
+                    if len(pairs) >= 12:
+                        break
+                if not pairs:
+                    return f"{name}: <none>"
+                return f"{name} (first12): " + ", ".join(pairs)
+
+            txt = _fmt(lanes_sl, lanes_has, "lanes_speed_limit") + "\n" + _fmt(r_sl, r_has, "route_lanes_speed_limit")
+            ax.text(
+                0.02,
+                0.02,
+                txt,
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=9,
+                color="#222222",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+            )
+        except Exception:
+            pass
 
     ax.legend(loc="upper right")
     plt.tight_layout()
