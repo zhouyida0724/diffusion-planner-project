@@ -26,11 +26,15 @@ for ((SID=0; SID<NUM_SHARDS; SID++)); do
   echo "[launch] shard=$SID -> $OUT_DIR"
   (
     # Run from repo root (works on host; container can still bind-mount repo to /workspace).
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if command -v git >/dev/null 2>&1; then
-      if git_root=$(cd "$REPO_ROOT" && git rev-parse --show-toplevel 2>/dev/null); then
+      if git_root=$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel 2>/dev/null); then
         REPO_ROOT="$git_root"
+      else
+        REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
       fi
+    else
+      REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
     fi
     cd "$REPO_ROOT"
 
