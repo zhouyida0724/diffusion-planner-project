@@ -623,12 +623,19 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
                 past_row["qy"],
                 past_row["qz"],
             )
+            # Ego history is stored in the *current ego frame*.
+            # dx/dy and v_local are already ego-frame, so make heading ego-relative too.
+            dheading = past_heading - ego_heading
+            while dheading > np.pi:
+                dheading -= 2 * np.pi
+            while dheading < -np.pi:
+                dheading += 2 * np.pi
             v_local = R @ np.array([past_row["vx"], past_row["vy"]])
             neighbor_past[0, i] = [
                 dx,
                 dy,
-                np.cos(past_heading),
-                np.sin(past_heading),
+                np.cos(dheading),
+                np.sin(dheading),
                 v_local[0],
                 v_local[1],
                 past_row["acceleration_x"],
