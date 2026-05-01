@@ -35,6 +35,12 @@ start_runner() {
   echo "[$(date -Is)] runner launched pid=$!" >> "$LOG_FILE"
 }
 
+# Extra safety: if any exporter processes are already running, don't start another.
+if pgrep -f "export_v0_1_single_npz.py" >/dev/null 2>&1 || pgrep -f "run_export_4cities_stride16_shard10.sh" >/dev/null 2>&1; then
+  echo "[$(date -Is)] exporter processes already running; skip start" >> "$LOG_FILE"
+  exit 0
+fi
+
 # If already done, don't restart.
 if [[ -f "$DONE_FILE" ]]; then
   echo "[$(date -Is)] DONE present, skip" >> "$LOG_FILE"
