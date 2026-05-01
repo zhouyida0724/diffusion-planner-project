@@ -210,7 +210,25 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         nb0 = neighbor_past[0, :, 0:2]
         valid_mask = (np.abs(nb0[:, 0]) > 1e-6) | (np.abs(nb0[:, 1]) > 1e-6)
         if np.any(valid_mask):
-            ax.plot(nb0[valid_mask, 0], nb0[valid_mask, 1], "g--", linewidth=3, alpha=0.8, label="Ego Past")
+            # Make ego-past visually unmistakable: use a unique color + higher zorder.
+            ax.plot(
+                nb0[valid_mask, 0],
+                nb0[valid_mask, 1],
+                color="#00FF00",
+                linestyle="--",
+                linewidth=4.0,
+                alpha=1.0,
+                zorder=50,
+                label="Ego Past (slot0)",
+            )
+            ax.scatter(
+                nb0[valid_mask, 0],
+                nb0[valid_mask, 1],
+                s=18,
+                color="#00FF00",
+                alpha=0.9,
+                zorder=51,
+            )
     except Exception:
         pass
 
