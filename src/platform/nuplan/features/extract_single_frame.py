@@ -26,6 +26,8 @@ import numpy as np
 
 # Optional debug: populated by extract_route_lanes() for manifest introspection.
 _LAST_ROUTE_LANE_TL_DEBUG: dict | None = None
+# Optional debug: populated by extract_route_lanes() when ROUTE_LANES_FALLBACK_ANY triggers.
+_LAST_ROUTE_LANES_DEBUG: dict | None = None
 from shapely import LineString
 
 from nuplan.common.actor_state.state_representation import Point2D
@@ -1091,6 +1093,9 @@ def extract_route_lanes(
     traffic_light_data=None,
     route_roadblock_ids: list[str] | None = None,
 ):
+    global _LAST_ROUTE_LANES_DEBUG
+    _LAST_ROUTE_LANES_DEBUG = None
+
     layers = map_api.get_proximal_map_objects(
         point,
         radius,
@@ -1103,6 +1108,14 @@ def extract_route_lanes(
     route_has_speed_limits = np.zeros(max_route_lanes, dtype=np.float32)
 
     route_roadblock_id_set = set(route_roadblock_ids) if route_roadblock_ids else None
+
+    # Optional robustness fallback: if the strict route_roadblock_ids filter yields *zero* route
+    # lane candidates (common when ego is off-route / route metadata is spatially far away), fall
+    # back to nearest lanes/connectors without route filtering.
+    #
+    # This is intentionally gated to avoid silently changing contracts.
+    fallback_any = os.environ.get("ROUTE_LANES_FALLBACK_ANY", "0").strip().lower() in {"1", "true", "yes", "y"}
+    used_fallback_any = False
 
     traffic_light_lookup = {}
     if traffic_light_data:
@@ -1169,6 +1182,47 @@ def extract_route_lanes(
             except Exception:
                 continue
 
+    if route_roadblock_id_set is not None and (not all_lanes) and fallback_any:
+        # Re-collect without route filtering.
+        used_fallback_any = True
+        all_lanes = []
+        for layer_type in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
+            if layer_type not in layers:
+                continue
+
+            for lane_obj in layers[layer_type]:
+                try:
+                    polygon = lane_obj.polygon
+                    if polygon is None:
+                        continue
+
+                    centroid = polygon.centroid
+                    dist = np.sqrt((centroid.x - point.x) ** 2 + (centroid.y - point.y) ** 2)
+
+                    baseline_path = lane_obj.baseline_path
+                    centerline_coords = [(node.x, node.y) for node in baseline_path.discrete_path]
+
+                    left_boundary_coords = []
+                    if hasattr(lane_obj, "left_boundary") and lane_obj.left_boundary:
+                        left_boundary_coords = [(node.x, node.y) for node in lane_obj.left_boundary.discrete_path]
+
+                    right_boundary_coords = []
+                    if hasattr(lane_obj, "right_boundary") and lane_obj.right_boundary:
+                        right_boundary_coords = [(node.x, node.y) for node in lane_obj.right_boundary.discrete_path]
+
+                    all_lanes.append(
+                        {
+                            "obj": lane_obj,
+                            "layer_type": layer_type,
+                            "centerline": centerline_coords,
+                            "left": left_boundary_coords,
+                            "right": right_boundary_coords,
+                            "dist": dist,
+                        }
+                    )
+                except Exception:
+                    continue
+
     all_lanes.sort(key=lambda x: x["dist"])
 
     route_idx = 0
@@ -1234,6 +1288,9 @@ def extract_route_lanes(
         "selected_connectors_in_tl": int(dbg_selected_connectors_in_tl),
         "traffic_light_dict_size": int(len(traffic_light_lookup)),
     }
+
+    if used_fallback_any:
+        _LAST_ROUTE_LANES_DEBUG = {"route_lanes_fallback_any": True}
 
     return route_lanes, route_lanes_avails, route_speed_limits, route_has_speed_limits
 
@@ -1643,12 +1700,21 @@ def extract_features(
             except Exception:
                 out["_profile_flags"]["route_lane_tl_debug"] = None
 
-    # If profiling is disabled, still allow TL debug export when explicitly requested.
-    if timing is None and os.environ.get("EXPORT_TL_DEBUG", "0") == "1":
+        # Optional route_lanes fallback debug.
+        try:
+            if _LAST_ROUTE_LANES_DEBUG is not None:
+                out["_profile_flags"].update(dict(_LAST_ROUTE_LANES_DEBUG))
+        except Exception:
+            pass
+
+    # If profiling is disabled, still allow debug export when explicitly requested.
+    if timing is None and (os.environ.get("EXPORT_TL_DEBUG", "0") == "1" or os.environ.get("ROUTE_LANES_FALLBACK_ANY", "0") == "1"):
         try:
             out["_profile_flags"] = {
                 "route_lane_tl_debug": (dict(_LAST_ROUTE_LANE_TL_DEBUG) if _LAST_ROUTE_LANE_TL_DEBUG is not None else None)
             }
+            if _LAST_ROUTE_LANES_DEBUG is not None:
+                out["_profile_flags"].update(dict(_LAST_ROUTE_LANES_DEBUG))
         except Exception:
             out["_profile_flags"] = {"route_lane_tl_debug": None}
 
