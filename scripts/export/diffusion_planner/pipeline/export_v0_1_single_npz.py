@@ -170,10 +170,10 @@ def main() -> int:
     # We keep plan_row_idx (= line index in index.jsonl) for traceability and sharding.
     t_plan0 = time.time()
     records = []
+    # IMPORTANT: --limit is interpreted as a *per-shard* cap (after sharding).
+    # Do NOT stop at i>=limit before modulo sharding, otherwise each shard only sees ~limit/num_shards.
     with open(index_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
-            if args.limit and i >= args.limit:
-                break
             if args.num_shards > 1 and (i % args.num_shards) != args.shard_id:
                 continue
             r = json.loads(line)
@@ -181,6 +181,8 @@ def main() -> int:
             r["shard_id"] = int(args.shard_id)
             r["num_shards"] = int(args.num_shards)
             records.append(r)
+            if args.limit and len(records) >= args.limit:
+                break
     t_plan_s = time.time() - t_plan0
 
     if not records:
