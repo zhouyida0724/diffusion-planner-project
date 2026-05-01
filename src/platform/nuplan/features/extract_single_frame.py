@@ -451,12 +451,62 @@ def bfs_bridge_route_if_needed(
 def get_target_frame(conn, scenario_token, frame_index):
     cursor = conn.cursor()
 
+    # NOTE ABOUT frame_index CONTRACT
+    # Historically, frame_index was interpreted as an index into ego_pose (100Hz) for the log.
+    # However, most downstream semantics (lidar_box, traffic_light_status, scene boundaries)
+    # are keyed to lidar_pc (20Hz) within the scene.
+    #
+    # When frame_index exceeds the number of lidar frames in the scene (common for random sampling),
+    # the old behavior can select a timestamp that does NOT belong to the requested scene_token.
+    # That produces visually-plausible but semantically-wrong samples (e.g., TL lookup becomes empty).
+    #
+    # To make this explicit and safe, we provide an opt-in mode that interprets frame_index as
+    # a scene-local lidar_pc index.
+    frame_mode = os.environ.get("EXPORT_FRAME_INDEX_MODE", "ego_pose").strip().lower()
+
     try:
         scenario_token_bytes = bytes.fromhex(scenario_token)
         cursor.execute("SELECT token FROM scene WHERE token = ?", (scenario_token_bytes,))
         scenario = cursor.fetchone()
 
         if scenario:
+            if frame_mode in {"lidar", "scene_lidar", "lidar_pc"}:
+                # Interpret frame_index as an index into lidar_pc timestamps within this scene.
+                cursor.execute(
+                    "SELECT timestamp FROM lidar_pc WHERE scene_token=? ORDER BY timestamp LIMIT 1 OFFSET ?",
+                    (scenario_token_bytes, int(frame_index)),
+                )
+                lr = cursor.fetchone()
+                if lr is not None:
+                    lidar_ts = int(lr[0])
+                else:
+                    # Out of range: clamp to last lidar_pc in scene.
+                    cursor.execute(
+                        "SELECT timestamp FROM lidar_pc WHERE scene_token=? ORDER BY timestamp DESC LIMIT 1",
+                        (scenario_token_bytes,),
+                    )
+                    lr2 = cursor.fetchone()
+                    if lr2 is None:
+                        raise RuntimeError("scene has no lidar_pc")
+                    lidar_ts = int(lr2[0])
+
+                # Map the lidar timestamp to the closest ego_pose at-or-before it (same log_token).
+                cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
+                log_token = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT ep.token, ep.timestamp
+                    FROM ego_pose ep
+                    WHERE ep.log_token = ? AND ep.timestamp <= ?
+                    ORDER BY ep.timestamp DESC
+                    LIMIT 1
+                    """,
+                    (log_token, lidar_ts),
+                )
+                er = cursor.fetchone()
+                if er is not None:
+                    return er[0], er[1], er[0]
+
             # First get log_token from scene (matching extract_ego_data approach)
             cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
             log_token = cursor.fetchone()[0]
