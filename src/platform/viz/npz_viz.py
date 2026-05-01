@@ -187,6 +187,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     # Route lanes visualization (light yellow solid lines with gold arrows)
     # ============================================================
     if route_lanes is not None:
+        tl_counts = {"g": 0, "y": 0, "r": 0, "unk": 0}
         route_lanes_avails = _squeeze1(data.get("route_lanes_avails")) if ("route_lanes_avails" in data.files) else None
         for rlane_idx in range(route_lanes.shape[0]):
             lane_x = route_lanes[rlane_idx, :, 0]
@@ -235,6 +236,16 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                     lane_lw = 4.0
                     lane_alpha = 1.0
 
+                # Track counts for a quick sanity check on the image.
+                if lane_color == "#00AA00":
+                    tl_counts["g"] += 1
+                elif lane_color == "#CCAA00":
+                    tl_counts["y"] += 1
+                elif lane_color == "#CC0000":
+                    tl_counts["r"] += 1
+                else:
+                    tl_counts["unk"] += 1
+
             ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=lane_alpha, linewidth=lane_lw)
 
             # Extra emphasis: draw colored dots along the route lane when TL is enabled.
@@ -278,6 +289,19 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                     _draw_dir_arrows(ax, x_coords, y_coords, dxs, dys, color="#AA00FF", every=max(1, len(x_coords) // 6))
                 except Exception:
                     pass
+
+        if show_tl:
+            ax.text(
+                0.02,
+                0.02,
+                f"route_lanes TL count: g={tl_counts['g']} y={tl_counts['y']} r={tl_counts['r']} unk={tl_counts['unk']}",
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=10,
+                color="#333333",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+            )
 
     # ========== 2. Ego (arrow at origin) ==========
     ego_state = _squeeze1(data["ego_current_state"])
