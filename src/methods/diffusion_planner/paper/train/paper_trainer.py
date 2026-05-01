@@ -26,6 +26,8 @@ except Exception:  # pragma: no cover
 from src.methods.diffusion_planner.train.trainer import TrainConfig, _assert_finite, _maybe_sync, _PerfTracker, seed_everything
 from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDiffusionPlanner
 from src.methods.diffusion_planner.paper.model.diffusion_utils import dpm_solver_pytorch as dpm
+
+from src.methods.diffusion_planner.utils.state_perturbation import StatePerturbation, StatePerturbationConfig
 from .tb_visualizer import render_npz_style_scene, render_xy_scatter, render_xy_scatter_with_context, stitch_montage
 
 
@@ -405,6 +407,23 @@ def train_loop_paper_dit_xstart(
 
     Pn = int(model.config.predicted_neighbor_num)
     Tf = int(model.config.future_len)
+
+    # -----------------
+    # training-time StatePerturbation augmentation (optional)
+    # -----------------
+    state_perturb: StatePerturbation | None = None
+    try:
+        enabled = bool(getattr(cfg, "state_perturb_enabled", False))
+        prob = float(getattr(cfg, "state_perturb_prob", 0.0) or 0.0)
+        min_vx = float(getattr(cfg, "state_perturb_min_vx_mps", 2.0) or 2.0)
+    except Exception:
+        enabled, prob, min_vx = False, 0.0, 2.0
+
+    if enabled and prob > 0.0:
+        state_perturb = StatePerturbation(
+            StatePerturbationConfig(enabled=True, prob=prob, min_vx_mps=min_vx),
+            device=device,
+        )
 
     # -----------------
     # fast validation
@@ -787,6 +806,12 @@ def train_loop_paper_dit_xstart(
         t_seg = time.perf_counter()
         batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
         breakdown["to_device_s"] = float(time.perf_counter() - t_seg)
+
+        # training-time augmentation (kept deterministic by cfg; does not run in fast-eval)
+        if state_perturb is not None:
+            t_seg = time.perf_counter()
+            batch = state_perturb(batch)
+            breakdown["state_perturb_s"] = float(time.perf_counter() - t_seg)
 
         # build + diffusion setup (count as misc, but keep a couple sub-keys for debugging)
         t_seg = time.perf_counter()

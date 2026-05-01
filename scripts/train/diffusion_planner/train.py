@@ -119,6 +119,31 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Weight on neighbor prediction loss for paper_dit_dpm (total = ego + alpha * neighbor).",
     )
+
+    # -----------------
+    # StatePerturbation (training-time augmentation; paper_dit_dpm only)
+    # -----------------
+    p.add_argument(
+        "--state-perturb-prob",
+        type=float,
+        default=None,
+        help=(
+            "Training-time StatePerturbation apply probability. "
+            "If omitted: defaults to 0.5 for paper_dit_dpm, else 0.0. "
+            "Set to 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--state-perturb-min-vx",
+        type=float,
+        default=2.0,
+        help="Only apply StatePerturbation when abs(vx) >= this threshold (m/s).",
+    )
+    p.add_argument(
+        "--no-state-perturb",
+        action="store_true",
+        help="Explicitly disable StatePerturbation (overrides --state-perturb-prob).",
+    )
     p.add_argument(
         "--amp",
         type=str,
@@ -585,6 +610,28 @@ def main() -> None:
 
         # resume
         resume_ckpt=str(getattr(args, "resume_ckpt", None)) if getattr(args, "resume_ckpt", None) else None,
+
+        # state perturbation (training-time; paper_dit_dpm only)
+        state_perturb_enabled=False,
+        state_perturb_prob=0.0,
+        state_perturb_min_vx_mps=float(getattr(args, "state_perturb_min_vx", 2.0) or 2.0),
+    )
+
+    # Decide default perturbation behavior.
+    # Goal: training should not "silently forget" perturbation.
+    if bool(getattr(args, "no_state_perturb", False)):
+        cfg.state_perturb_enabled = False
+        cfg.state_perturb_prob = 0.0
+    else:
+        if getattr(args, "state_perturb_prob", None) is None:
+            default_prob = 0.5 if args.mode == "paper_dit_dpm" else 0.0
+            cfg.state_perturb_prob = float(default_prob)
+        else:
+            cfg.state_perturb_prob = float(getattr(args, "state_perturb_prob"))
+        cfg.state_perturb_enabled = bool(cfg.state_perturb_prob > 0.0)
+
+    print(
+        f"[state-perturb] enabled={cfg.state_perturb_enabled} prob={cfg.state_perturb_prob} min_vx={cfg.state_perturb_min_vx_mps}"
     )
 
     # Pre-create exp dir so we can write data stats even if training crashes.
