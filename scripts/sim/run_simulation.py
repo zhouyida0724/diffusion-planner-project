@@ -39,9 +39,8 @@ def main() -> None:
     if not args.scenarios_file and not args.scenario and not args.num:
         parser.error("必须指定 --scenarios_file, --scenario 或 --num")
 
-    # Match previous env behavior, but avoid hard-coded /workspace path.
-    repo_root = Path(__file__).resolve().parents[2]
-    pythonpath = str(repo_root / "nuplan-visualization")
+    # Match previous env behavior
+    pythonpath = "/workspace/nuplan-visualization"
 
     planner_cfg = idm_planner_overrides().args
 
