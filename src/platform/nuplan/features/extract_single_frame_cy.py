@@ -1645,4 +1645,13 @@ def extract_features(
             except Exception:
                 out["_profile_flags"]["route_lane_tl_debug"] = None
 
+    # If profiling is disabled, still allow TL debug export when explicitly requested.
+    if timing is None and os.environ.get("EXPORT_TL_DEBUG", "0") == "1":
+        try:
+            out["_profile_flags"] = {
+                "route_lane_tl_debug": (dict(_LAST_ROUTE_LANE_TL_DEBUG) if _LAST_ROUTE_LANE_TL_DEBUG is not None else None)
+            }
+        except Exception:
+            out["_profile_flags"] = {"route_lane_tl_debug": None}
+
     return out
