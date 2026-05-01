@@ -219,16 +219,40 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
 
             # Optional: color route lanes by traffic light state stored in lane_feature[:,8:12]
             lane_color = "#FFFF99"
+            lane_lw = 2.0
+            lane_alpha = 0.9
             if show_tl:
                 try:
                     # Use the first valid point as representative.
                     j0 = int(np.argmax(valid_mask))
                     onehot = route_lanes[rlane_idx, j0, 8:12]
                     lane_color = _tl_color_from_onehot(onehot)
+                    # Make TL coloring visually obvious.
+                    lane_lw = 4.0
+                    lane_alpha = 1.0
                 except Exception:
                     lane_color = "#AAAAAA"
+                    lane_lw = 4.0
+                    lane_alpha = 1.0
 
-            ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=0.9, linewidth=2)
+            ax.plot(x_coords, y_coords, "-", color=lane_color, alpha=lane_alpha, linewidth=lane_lw)
+
+            # Extra emphasis: draw colored dots along the route lane when TL is enabled.
+            if show_tl:
+                try:
+                    step = max(1, len(x_coords) // 12)  # ~12 dots per lane
+                    ax.scatter(
+                        x_coords[::step],
+                        y_coords[::step],
+                        s=22,
+                        c=lane_color,
+                        edgecolors="#222222",
+                        linewidths=0.3,
+                        alpha=0.95,
+                        zorder=5,
+                    )
+                except Exception:
+                    pass
 
             # Plot gold direction arrows every few points
             arrow_interval = max(1, len(x_coords) // 5)  # ~5 arrows per lane
