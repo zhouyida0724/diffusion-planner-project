@@ -730,7 +730,9 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
             continue
 
         for i in range(NEIGHBOR_HISTORY_LEN):
-            idx = center_box_idx - (NEIGHBOR_HISTORY_LEN - 1 - i)
+            # lidar_box is 20Hz; neighbor past contract is 10Hz (21 points over 2s)
+            # => sample every 2 frames from lidar_box.
+            idx = center_box_idx - 2 * (NEIGHBOR_HISTORY_LEN - 1 - i)
             if idx >= 0:
                 box = boxes[idx]
                 dx, dy = transform_to_ego_frame(box["x"], box["y"], ego_x, ego_y, ego_heading)
