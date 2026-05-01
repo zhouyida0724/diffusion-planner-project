@@ -489,23 +489,27 @@ def get_traffic_lights_at_timestamp(conn, timestamp, map_name):
     cursor = conn.cursor()
 
     try:
+        # IMPORTANT: pull TL states for the single latest lidar_pc frame <= timestamp.
+        # The previous implementation limited to 50 rows ordered by timestamp, which can
+        # drop many lane_connector_ids (especially at intersections) and makes most lanes
+        # appear "unknown".
         cursor.execute(
-            """
-            SELECT tls.status, tls.lane_connector_id, lp.timestamp
-            FROM traffic_light_status tls
-            JOIN lidar_pc lp ON tls.lidar_pc_token = lp.token
-            WHERE lp.timestamp <= ?
-            ORDER BY lp.timestamp DESC
-            LIMIT 50
-        """,
+            "SELECT token, timestamp FROM lidar_pc WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
             (timestamp,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {}
+        lidar_pc_token = row[0]
+
+        cursor.execute(
+            "SELECT lane_connector_id, status FROM traffic_light_status WHERE lidar_pc_token = ?",
+            (lidar_pc_token,),
         )
         results = cursor.fetchall()
 
-        traffic_lights = {}
-        for row in results:
-            lane_id = row[1]
-            state = row[0]
+        traffic_lights: dict[int, str] = {}
+        for lane_id, state in results:
             traffic_lights[lane_id] = state
 
         return traffic_lights
