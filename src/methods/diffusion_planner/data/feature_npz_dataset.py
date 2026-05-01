@@ -280,6 +280,9 @@ class ShardedNpzFeatureDataset(Dataset):
                 "shard_dir": str(spec.shard_dir),
                 "row_idx": int(row_idx),
                 "t": meta.get("t"),
+                # Useful lightweight labels for analysis / fast-eval breakdowns.
+                "location": meta.get("location"),
+                "tags": meta.get("tags") or [],
             },
         }
         return sample

@@ -86,6 +86,10 @@ class TrainConfig:
     tb_denoise_mode: str = "t_sweep"  # t_sweep|forward_noise|sampler|all
     tb_sampler_steps: int = 10
 
+    # TB visualization sampling policy
+    # Prefer turning-tagged samples when available in batch['meta']['tags'].
+    tb_prefer_turn: bool = True
+
     # spike dump (paper_dit_dpm diagnostics)
     spike_dump: bool = False
     spike_start: int = 2000
@@ -98,9 +102,34 @@ class TrainConfig:
     fast_eval_mode: str = "proxy"  # proxy|sampler
     fast_eval_diffusion_steps: int = 10
 
+    # fast-eval turn/straight breakdown (paper_dit_dpm)
+    # - tags_or_gt: prefer manifest tags if present, else fall back to GT-trajectory heuristic
+    # - tags: use tags only
+    # - gt: use GT-trajectory heuristic only
+    fast_eval_turn_source: str = "tags_or_gt"  # tags_or_gt|tags|gt
+    # Turning is classified from GT future (ego_agent_future XY) by total heading change.
+    # Heuristics (10Hz assumed): require some travel before trusting heading.
+    fast_eval_turn_angle_deg: float = 15.0
+    fast_eval_turn_min_travel_m: float = 5.0
+
     # resume (optional)
     # Path to a checkpoint payload produced by this trainer, e.g. checkpoint_step_XXXXXX.pt
     resume_ckpt: str | None = None
+
+    # data augmentation: ego-history masking (paper_dit_dpm)
+    # With probability p (per-sample), mask ego history in conditioning features.
+    # This is intended to reduce over-reliance on ego past in closed-loop turns.
+    mask_ego_history_prob: float = 0.0
+    # Keep the last timestep (current) in the masked history; only mask the past.
+    mask_ego_history_keep_last: bool = True
+
+    # data augmentation: state perturbation (Diffusion-Planner style; paper_dit_dpm train only)
+    state_perturbation_enable: bool = False
+    state_perturbation_prob: float = 0.0
+    # Bounds are for [x, y, yaw, vx, vy, ax, ay, steer, yaw_rate] additive perturbations.
+    # Defaults mirror the open-source Diffusion-Planner reference.
+    state_perturbation_low: tuple[float, ...] = (0.0, -0.75, -0.35, -1.0, -0.5, -0.2, -0.1, 0.0, 0.0)
+    state_perturbation_high: tuple[float, ...] = (0.0, 0.75, 0.35, 1.0, 0.5, 0.2, 0.1, 0.0, 0.0)
 
 
 def seed_everything(seed: int) -> None:

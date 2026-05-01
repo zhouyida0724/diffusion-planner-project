@@ -31,6 +31,14 @@ def diffusion_planner_overrides(ckpt_path: Optional[str] = None, sampling_steps:
         "planner.diffusion_planner._target_=src.platform.nuplan.planners.diffusion_planner_ckpt_planner.DiffusionPlannerCkpt"
     )
 
+    # The vendor diffusion_planner config instantiates a `Config(args_file=...)` object by default
+    # (pointing at /workspace/checkpoints/args.json). Our repo-local planner does not need it.
+    # Override to null to avoid FileNotFoundError during Hydra instantiation.
+    args.append("planner.diffusion_planner.config=null")
+
+    # Prefer CUDA when available; DiffusionPlannerCkpt will fail-fast if requested but unavailable.
+    args.append("planner.diffusion_planner.device=cuda")
+
     if ckpt_path:
         args.append(f"planner.diffusion_planner.ckpt_path={ckpt_path}")
     if sampling_steps is not None:
