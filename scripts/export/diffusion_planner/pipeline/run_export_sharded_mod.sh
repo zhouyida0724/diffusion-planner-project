@@ -25,9 +25,17 @@ for ((SID=0; SID<NUM_SHARDS; SID++)); do
   mkdir -p "$OUT_DIR"
   echo "[launch] shard=$SID -> $OUT_DIR"
   (
-    cd /workspace
+    # Run from repo root (works on host; container can still bind-mount repo to /workspace).
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
+    if command -v git >/dev/null 2>&1; then
+      if git_root=$(cd "$REPO_ROOT" && git rev-parse --show-toplevel 2>/dev/null); then
+        REPO_ROOT="$git_root"
+      fi
+    fi
+    cd "$REPO_ROOT"
+
     EXTRACT_LOG_STYLE=quiet EXTRACT_WARN_PRINT_N=0 \
-      python3 scripts/export_v0_1_single_npz.py \
+      python3 scripts/export/diffusion_planner/pipeline/export_v0_1_single_npz.py \
         --plan "$PLAN_DIR" \
         --out "$OUT_DIR" \
         --limit "$LIMIT" \
