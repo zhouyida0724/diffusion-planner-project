@@ -98,6 +98,36 @@ def _draw_dir_arrows(ax, xs: np.ndarray, ys: np.ndarray, dxs: np.ndarray, dys: n
         )
 
 
+def _draw_legend_block(ax, *, show_neighbor_heading: bool, show_neighbor_vdir: bool, show_acc: bool, show_lane_dir: bool, show_tl: bool, show_static_yaw: bool) -> None:
+    lines = ["Legend:"]
+    if show_neighbor_heading:
+        lines.append("  blue: agent heading (cos/sin)")
+    if show_neighbor_vdir:
+        lines.append("  pink: v_local direction (vx/vy)")
+    if show_acc:
+        lines.append("  orange: a_local direction (ax/ay)")
+    if show_lane_dir:
+        lines.append("  purple: lane dir vectors (2:4)")
+    if show_tl:
+        lines.append("  route lane dots: TL state (g/y/r/unk)")
+    if show_static_yaw:
+        lines.append("  black: static yaw")
+    try:
+        ax.text(
+            0.98,
+            0.02,
+            "\n".join(lines),
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="#222222",
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+        )
+    except Exception:
+        pass
+
+
 def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None) -> Path:
     """Render a single-row NPZ export as a PNG.
 
@@ -146,6 +176,29 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     show_speed_text = _env_flag("NPZ_VIZ_SHOW_SPEED_LIMIT_TEXT", "0")
     show_static_yaw = _env_flag("NPZ_VIZ_SHOW_STATIC_YAW", "0")
 
+    # Presets: keep it to TWO images while still showing all fields.
+    # NPZ_VIZ_PRESET=1: kinematics/agents (heading/v/a + ego text + static yaw)
+    # NPZ_VIZ_PRESET=2: map semantics (lane dir + TL + speed limit text)
+    preset = os.environ.get("NPZ_VIZ_PRESET", "0").strip()
+    if preset == "1":
+        show_neighbor_heading = True
+        show_neighbor_vdir = True
+        show_acc = True
+        show_ego_state_text = True
+        show_static_yaw = True
+        show_tl = False
+        show_lane_dir = False
+        show_speed_text = False
+    elif preset == "2":
+        show_tl = True
+        show_lane_dir = True
+        show_speed_text = True
+        show_neighbor_heading = False
+        show_neighbor_vdir = False
+        show_acc = False
+        show_ego_state_text = False
+        show_static_yaw = False
+
     # Set range [-50, 50] for both axes
     ax.set_xlim(-50, 50)
     ax.set_ylim(-50, 50)
@@ -187,6 +240,17 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         right_y = lanes[lane_idx, :, 1] + lanes[lane_idx, :, 7]
         valid_right = (right_x != 0) | (right_y != 0)
         ax.plot(right_x[valid_right], right_y[valid_right], "r--", linewidth=1, alpha=0.5)
+
+        # Optional: visualize exported lane dir vectors (lanes[:,:,2:4]).
+        if show_lane_dir:
+            try:
+                x_coords = lanes[lane_idx, :, 0][valid_left]
+                y_coords = lanes[lane_idx, :, 1][valid_left]
+                dxs = lanes[lane_idx, :, 2][valid_left]
+                dys = lanes[lane_idx, :, 3][valid_left]
+                _draw_dir_arrows(ax, x_coords, y_coords, dxs, dys, color="#AA00FF", every=max(1, len(x_coords) // 6))
+            except Exception:
+                pass
 
     # ============================================================
     # Route lanes visualization (light yellow solid lines with gold arrows)
@@ -631,6 +695,16 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                         )
                 except Exception:
                     pass
+
+    _draw_legend_block(
+        ax,
+        show_neighbor_heading=show_neighbor_heading,
+        show_neighbor_vdir=show_neighbor_vdir,
+        show_acc=show_acc,
+        show_lane_dir=show_lane_dir,
+        show_tl=show_tl,
+        show_static_yaw=show_static_yaw,
+    )
 
     # Speed limit text dump (for manual review).
     if show_speed_text:
