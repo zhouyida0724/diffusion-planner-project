@@ -372,11 +372,20 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                 sin_h = float(neighbor_past[agent_idx, -1, 3])
                 h = float(np.arctan2(sin_h, cos_h))
                 L = 4.0
+                # Make ego slot0 heading arrow very obvious (it overlaps ego arrow at origin).
+                color = "#00AAFF"
+                lw = 2.0
+                alpha = 0.9
+                z = None
+                if agent_idx == 0:
+                    color = "#7A00FF"  # purple
+                    lw = 3.5
+                    alpha = 1.0
                 ax.annotate(
                     "",
                     xy=(float(curr_x + L * np.cos(h)), float(curr_y + L * np.sin(h))),
                     xytext=(float(curr_x), float(curr_y)),
-                    arrowprops=dict(arrowstyle="->", color="#00AAFF", lw=2.0, alpha=0.9),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=lw, alpha=alpha),
                 )
             except Exception:
                 pass
@@ -397,6 +406,29 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                         xytext=(float(curr_x), float(curr_y)),
                         arrowprops=dict(arrowstyle="->", color="#FF00AA", lw=2.0, alpha=0.85),
                     )
+            except Exception:
+                pass
+
+        # Optional: print ego slot0 heading/vdir angles for unambiguous debugging.
+        if agent_idx == 0 and (show_neighbor_heading or show_neighbor_vdir):
+            try:
+                cos_h = float(neighbor_past[0, -1, 2])
+                sin_h = float(neighbor_past[0, -1, 3])
+                h = float(np.arctan2(sin_h, cos_h))
+                vx = float(neighbor_past[0, -1, 4])
+                vy = float(neighbor_past[0, -1, 5])
+                vdir = float(np.arctan2(vy, vx))
+                ax.text(
+                    0.02,
+                    0.92,
+                    f"slot0 heading={h:.3f} rad, vdir={vdir:.3f} rad",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=10,
+                    color="#222222",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+                )
             except Exception:
                 pass
 
