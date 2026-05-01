@@ -180,6 +180,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     # NPZ_VIZ_PRESET=1: kinematics/agents (heading/v/a + ego text + static yaw)
     # NPZ_VIZ_PRESET=2: map semantics (lane dir + TL + speed limit text)
     preset = os.environ.get("NPZ_VIZ_PRESET", "0").strip()
+    map_only = False
     if preset == "1":
         show_neighbor_heading = True
         show_neighbor_vdir = True
@@ -190,6 +191,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         show_lane_dir = False
         show_speed_text = False
     elif preset == "2":
+        map_only = True
         show_tl = True
         show_lane_dir = True
         show_speed_text = True
@@ -393,7 +395,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     ax.add_patch(ego_circle)
 
     ego_future = _squeeze1(data["ego_agent_future"])
-    if ego_future is not None:
+    if (not map_only) and ego_future is not None:
         ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8)
 
     # Load neighbor agents data
@@ -402,31 +404,32 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
 
     # ========== 2.1 Ego past trajectory ==========
     # Use neighbor_agents_past[0] (ego slot0) as the single source of truth.
-    try:
-        nb0 = neighbor_past[0, :, 0:2]
-        valid_mask = (np.abs(nb0[:, 0]) > 1e-6) | (np.abs(nb0[:, 1]) > 1e-6)
-        if np.any(valid_mask):
-            # Make ego-past visually unmistakable: use a unique color + higher zorder.
-            ax.plot(
-                nb0[valid_mask, 0],
-                nb0[valid_mask, 1],
-                color="#00FF00",
-                linestyle="--",
-                linewidth=4.0,
-                alpha=1.0,
-                zorder=50,
-                label="Ego Past (slot0)",
-            )
-            ax.scatter(
-                nb0[valid_mask, 0],
-                nb0[valid_mask, 1],
-                s=18,
-                color="#00FF00",
-                alpha=0.9,
-                zorder=51,
-            )
-    except Exception:
-        pass
+    if not map_only:
+        try:
+            nb0 = neighbor_past[0, :, 0:2]
+            valid_mask = (np.abs(nb0[:, 0]) > 1e-6) | (np.abs(nb0[:, 1]) > 1e-6)
+            if np.any(valid_mask):
+                # Make ego-past visually unmistakable: use a unique color + higher zorder.
+                ax.plot(
+                    nb0[valid_mask, 0],
+                    nb0[valid_mask, 1],
+                    color="#00FF00",
+                    linestyle="--",
+                    linewidth=4.0,
+                    alpha=1.0,
+                    zorder=50,
+                    label="Ego Past (slot0)",
+                )
+                ax.scatter(
+                    nb0[valid_mask, 0],
+                    nb0[valid_mask, 1],
+                    s=18,
+                    color="#00FF00",
+                    alpha=0.9,
+                    zorder=51,
+                )
+        except Exception:
+            pass
 
     if show_ego_state_text:
         try:
@@ -453,6 +456,11 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     agent_ids: dict[int, int] = {}
 
     # ========== 3. Neighbor agents past trajectories ==========
+    if map_only:
+        # Map-semantic view: hide agent trajectories/arrows to make the right panel visually distinct.
+        neighbor_past = np.zeros_like(neighbor_past)
+        neighbor_future = None
+
     for agent_idx in range(neighbor_past.shape[0]):
         curr_x = neighbor_past[agent_idx, -1, 0]
         curr_y = neighbor_past[agent_idx, -1, 1]
