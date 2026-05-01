@@ -98,6 +98,36 @@ def _draw_dir_arrows(ax, xs: np.ndarray, ys: np.ndarray, dxs: np.ndarray, dys: n
         )
 
 
+def _draw_legend_block(ax, *, show_neighbor_heading: bool, show_neighbor_vdir: bool, show_acc: bool, show_lane_dir: bool, show_tl: bool, show_static_yaw: bool) -> None:
+    lines = ["Legend:"]
+    if show_neighbor_heading:
+        lines.append("  blue: agent heading (cos/sin)")
+    if show_neighbor_vdir:
+        lines.append("  pink: v_local direction (vx/vy)")
+    if show_acc:
+        lines.append("  orange: a_local direction (ax/ay)")
+    if show_lane_dir:
+        lines.append("  purple: lane dir vectors (2:4)")
+    if show_tl:
+        lines.append("  route lane dots: TL state (g/y/r/unk)")
+    if show_static_yaw:
+        lines.append("  black: static yaw")
+    try:
+        ax.text(
+            0.98,
+            0.02,
+            "\n".join(lines),
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="#222222",
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+        )
+    except Exception:
+        pass
+
+
 def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None) -> Path:
     """Render a single-row NPZ export as a PNG.
 
@@ -142,6 +172,34 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     show_neighbor_heading = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_HEADING", "0")
     show_neighbor_vdir = _env_flag("NPZ_VIZ_SHOW_NEIGHBOR_VDIR", "0")
     show_acc = _env_flag("NPZ_VIZ_SHOW_ACC", "0")
+    show_ego_state_text = _env_flag("NPZ_VIZ_SHOW_EGO_STATE_TEXT", "0")
+    show_speed_text = _env_flag("NPZ_VIZ_SHOW_SPEED_LIMIT_TEXT", "0")
+    show_static_yaw = _env_flag("NPZ_VIZ_SHOW_STATIC_YAW", "0")
+
+    # Presets: keep it to TWO images while still showing all fields.
+    # NPZ_VIZ_PRESET=1: kinematics/agents (heading/v/a + ego text + static yaw)
+    # NPZ_VIZ_PRESET=2: map semantics (lane dir + TL + speed limit text)
+    preset = os.environ.get("NPZ_VIZ_PRESET", "0").strip()
+    map_only = False
+    if preset == "1":
+        show_neighbor_heading = True
+        show_neighbor_vdir = True
+        show_acc = True
+        show_ego_state_text = True
+        show_static_yaw = True
+        show_tl = False
+        show_lane_dir = False
+        show_speed_text = False
+    elif preset == "2":
+        map_only = True
+        show_tl = True
+        show_lane_dir = True
+        show_speed_text = True
+        show_neighbor_heading = False
+        show_neighbor_vdir = False
+        show_acc = False
+        show_ego_state_text = False
+        show_static_yaw = False
 
     # Set range [-50, 50] for both axes
     ax.set_xlim(-50, 50)
@@ -184,6 +242,17 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
         right_y = lanes[lane_idx, :, 1] + lanes[lane_idx, :, 7]
         valid_right = (right_x != 0) | (right_y != 0)
         ax.plot(right_x[valid_right], right_y[valid_right], "r--", linewidth=1, alpha=0.5)
+
+        # Optional: visualize exported lane dir vectors (lanes[:,:,2:4]).
+        if show_lane_dir:
+            try:
+                x_coords = lanes[lane_idx, :, 0][valid_left]
+                y_coords = lanes[lane_idx, :, 1][valid_left]
+                dxs = lanes[lane_idx, :, 2][valid_left]
+                dys = lanes[lane_idx, :, 3][valid_left]
+                _draw_dir_arrows(ax, x_coords, y_coords, dxs, dys, color="#AA00FF", every=max(1, len(x_coords) // 6))
+            except Exception:
+                pass
 
     # ============================================================
     # Route lanes visualization (light yellow solid lines with gold arrows)
@@ -326,7 +395,7 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     ax.add_patch(ego_circle)
 
     ego_future = _squeeze1(data["ego_agent_future"])
-    if ego_future is not None:
+    if (not map_only) and ego_future is not None:
         ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8)
 
     # Load neighbor agents data
@@ -335,44 +404,50 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
 
     # ========== 2.1 Ego past trajectory ==========
     # Use neighbor_agents_past[0] (ego slot0) as the single source of truth.
-    try:
-        nb0 = neighbor_past[0, :, 0:2]
-        valid_mask = (np.abs(nb0[:, 0]) > 1e-6) | (np.abs(nb0[:, 1]) > 1e-6)
-        if np.any(valid_mask):
-            # Make ego-past visually unmistakable: use a unique color + higher zorder.
-            ax.plot(
-                nb0[valid_mask, 0],
-                nb0[valid_mask, 1],
-                color="#00FF00",
-                linestyle="--",
-                linewidth=4.0,
-                alpha=1.0,
-                zorder=50,
-                label="Ego Past (slot0)",
-            )
-            ax.scatter(
-                nb0[valid_mask, 0],
-                nb0[valid_mask, 1],
-                s=18,
-                color="#00FF00",
-                alpha=0.9,
-                zorder=51,
-            )
-    except Exception:
-        pass
-
-    if show_acc:
+    if not map_only:
         try:
+            nb0 = neighbor_past[0, :, 0:2]
+            valid_mask = (np.abs(nb0[:, 0]) > 1e-6) | (np.abs(nb0[:, 1]) > 1e-6)
+            if np.any(valid_mask):
+                # Make ego-past visually unmistakable: use a unique color + higher zorder.
+                ax.plot(
+                    nb0[valid_mask, 0],
+                    nb0[valid_mask, 1],
+                    color="#00FF00",
+                    linestyle="--",
+                    linewidth=4.0,
+                    alpha=1.0,
+                    zorder=50,
+                    label="Ego Past (slot0)",
+                )
+                ax.scatter(
+                    nb0[valid_mask, 0],
+                    nb0[valid_mask, 1],
+                    s=18,
+                    color="#00FF00",
+                    alpha=0.9,
+                    zorder=51,
+                )
+        except Exception:
+            pass
+
+    if show_ego_state_text:
+        try:
+            ego_h = float(np.arctan2(float(ego_state[3]), float(ego_state[2])))
             ax.text(
                 0.02,
                 0.98,
-                f"ego_ax={float(ego_state[6]):.3f}, ego_ay={float(ego_state[7]):.3f}",
+                "ego_current_state\n"
+                + f"heading(rad)={ego_h:+.3f}\n"
+                + f"v_local=[{float(ego_state[4]):+.3f},{float(ego_state[5]):+.3f}]\n"
+                + f"a_local=[{float(ego_state[6]):+.3f},{float(ego_state[7]):+.3f}]\n"
+                + f"valid={float(ego_state[8]):.1f},{float(ego_state[9]):.1f}",
                 transform=ax.transAxes,
                 ha="left",
                 va="top",
                 fontsize=10,
-                color="#333333",
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.8),
+                color="#222222",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
             )
         except Exception:
             pass
@@ -381,6 +456,11 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     agent_ids: dict[int, int] = {}
 
     # ========== 3. Neighbor agents past trajectories ==========
+    if map_only:
+        # Map-semantic view: hide agent trajectories/arrows to make the right panel visually distinct.
+        neighbor_past = np.zeros_like(neighbor_past)
+        neighbor_future = None
+
     for agent_idx in range(neighbor_past.shape[0]):
         curr_x = neighbor_past[agent_idx, -1, 0]
         curr_y = neighbor_past[agent_idx, -1, 1]
@@ -458,6 +538,25 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
                         xy=(float(curr_x + L * vx), float(curr_y + L * vy)),
                         xytext=(float(curr_x), float(curr_y)),
                         arrowprops=dict(arrowstyle="->", color="#FF00AA", lw=2.0, alpha=0.85),
+                    )
+            except Exception:
+                pass
+
+        # Optional: visualize acceleration direction (ego frame) using a_local (dims 6:8).
+        if show_acc and neighbor_past.shape[-1] >= 8:
+            try:
+                axv = float(neighbor_past[agent_idx, -1, 6])
+                ayv = float(neighbor_past[agent_idx, -1, 7])
+                n = float((axv * axv + ayv * ayv) ** 0.5)
+                if n > 1e-3 and np.isfinite(n):
+                    axv /= n
+                    ayv /= n
+                    L = 3.5
+                    ax.annotate(
+                        "",
+                        xy=(float(curr_x + L * axv), float(curr_y + L * ayv)),
+                        xytext=(float(curr_x), float(curr_y)),
+                        arrowprops=dict(arrowstyle="->", color="#FF8800", lw=2.0, alpha=0.85),
                     )
             except Exception:
                 pass
@@ -588,6 +687,69 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
             if abs(x) > 50 or abs(y) > 50:
                 continue
             ax.plot(x, y, color="red", marker="^", markersize=20, alpha=0.7)
+
+            if show_static_yaw and static_objs.shape[-1] >= 7:
+                try:
+                    yaw = float(static_objs[obj_idx, 6])
+                    if np.isfinite(yaw):
+                        dx = math.cos(yaw)
+                        dy = math.sin(yaw)
+                        L = 5.0
+                        ax.annotate(
+                            "",
+                            xy=(float(x + L * dx), float(y + L * dy)),
+                            xytext=(float(x), float(y)),
+                            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.8, alpha=0.85),
+                        )
+                except Exception:
+                    pass
+
+    _draw_legend_block(
+        ax,
+        show_neighbor_heading=show_neighbor_heading,
+        show_neighbor_vdir=show_neighbor_vdir,
+        show_acc=show_acc,
+        show_lane_dir=show_lane_dir,
+        show_tl=show_tl,
+        show_static_yaw=show_static_yaw,
+    )
+
+    # Speed limit text dump (for manual review).
+    if show_speed_text:
+        try:
+            lanes_sl = _squeeze1(data.get("lanes_speed_limit")) if ("lanes_speed_limit" in data.files) else None
+            lanes_has = _squeeze1(data.get("lanes_has_speed_limit")) if ("lanes_has_speed_limit" in data.files) else None
+            r_sl = _squeeze1(data.get("route_lanes_speed_limit")) if ("route_lanes_speed_limit" in data.files) else None
+            r_has = _squeeze1(data.get("route_lanes_has_speed_limit")) if ("route_lanes_has_speed_limit" in data.files) else None
+
+            def _fmt(sl, has, name: str) -> str:
+                if sl is None or has is None:
+                    return f"{name}: <missing>"
+                pairs = []
+                for i in range(int(sl.shape[0])):
+                    if float(has[i]) < 0.5:
+                        continue
+                    pairs.append(f"{i}:{float(sl[i]):.2f}")
+                    if len(pairs) >= 12:
+                        break
+                if not pairs:
+                    return f"{name}: <none>"
+                return f"{name} (first12): " + ", ".join(pairs)
+
+            txt = _fmt(lanes_sl, lanes_has, "lanes_speed_limit") + "\n" + _fmt(r_sl, r_has, "route_lanes_speed_limit")
+            ax.text(
+                0.02,
+                0.02,
+                txt,
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=9,
+                color="#222222",
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#CCCCCC", alpha=0.85),
+            )
+        except Exception:
+            pass
 
     ax.legend(loc="upper right")
     plt.tight_layout()
