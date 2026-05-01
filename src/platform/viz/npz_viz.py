@@ -57,7 +57,11 @@ def _tl_color_from_onehot(onehot: np.ndarray) -> str:
 
     if onehot is None or len(onehot) < 4:
         return "#AAAAAA"
-    i = int(np.argmax(onehot[:4]))
+    v = np.asarray(onehot[:4], dtype=np.float32)
+    # Guard against malformed vectors like [0,0,0,0] (argmax would incorrectly map to green).
+    if not np.all(np.isfinite(v)) or float(np.max(v)) < 0.5:
+        return "#AAAAAA"
+    i = int(np.argmax(v))
     if i == 0:
         return "#00AA00"  # green
     if i == 1:

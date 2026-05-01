@@ -1037,8 +1037,9 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
         left_boundary_coords = lane_data["left"]
         right_boundary_coords = lane_data["right"]
 
-        lane_id = lane_obj.id
-        traffic_light_state = traffic_light_lookup.get(lane_id, [0, 0, 0, 1])
+        # NOTE: `traffic_light_lookup` is keyed by string lane_connector_id from DB.
+        lane_id_str = str(lane_obj.id)
+        traffic_light_state = traffic_light_lookup.get(lane_id_str, [0, 0, 0, 1])
 
         lane_feature, avails = _lane_polyline_process_with_avails(
             lane_obj,
@@ -1172,8 +1173,9 @@ def extract_route_lanes(
         left_boundary_coords = lane_data["left"]
         right_boundary_coords = lane_data["right"]
 
-        lane_id = lane_obj.id
-        traffic_light_state = traffic_light_lookup.get(lane_id, [0, 0, 0, 1])
+        # NOTE: `traffic_light_lookup` is keyed by string lane_connector_id from DB.
+        lane_id_str = str(lane_obj.id)
+        traffic_light_state = traffic_light_lookup.get(lane_id_str, [0, 0, 0, 1])
 
         lane_feature, avails = _lane_polyline_process_with_avails(
             lane_obj,
