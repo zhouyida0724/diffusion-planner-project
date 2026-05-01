@@ -1,0 +1,13 @@
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+scenario_types: null
+scenario_tokens:
+  - '69aba8f9bc5059d0'
+log_names: null
+map_names: null
+num_scenarios_per_type: 1
+limit_total_scenarios: 1
+timestamp_threshold_s: null
+ego_displacement_minimum_m: null
+expand_scenarios: false
+remove_invalid_goals: true
+shuffle: false
