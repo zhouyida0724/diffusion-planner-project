@@ -96,7 +96,6 @@ esf = _esf
 
 REQUIRED_KEYS = [
     "ego_current_state",
-    "ego_past",
     "ego_agent_future",
     "neighbor_agents_past",
     "neighbor_agents_future",
