@@ -43,6 +43,12 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 STATUS_DIR="$OUT_ROOT/_status"
 mkdir -p "$STATUS_DIR"
 STATUS_JSON="$STATUS_DIR/run_${STAMP}.jsonl"
+PID_FILE="$STATUS_DIR/active.pid"
+DONE_FILE="$STATUS_DIR/DONE"
+
+# Mark this run as active (used by watchdog/cron).
+echo $$ > "$PID_FILE"
+rm -f "$DONE_FILE"
 
 declare -a CITIES=(boston vegas_1 pittsburgh singapore)
 
@@ -102,3 +108,7 @@ for c in "${CITIES[@]}"; do
 done
 
 echo "[all done] status=$STATUS_JSON" | tee -a "$STATUS_DIR/run_${STAMP}.log"
+
+# Mark completion for watchdog.
+date -Is > "$DONE_FILE"
+rm -f "$PID_FILE"
