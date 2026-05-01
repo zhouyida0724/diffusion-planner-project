@@ -274,23 +274,37 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
     if ego_future is not None:
         ax.plot(ego_future[:, 0], ego_future[:, 1], "b-", linewidth=3, alpha=0.8)
 
-    # ========== 2.1 Ego past trajectory ==========
-    if "ego_past" in data.files:
-        ego_past = _squeeze1(data["ego_past"])
-        valid_mask = (ego_past[:, 0] != 0) | (ego_past[:, 1] != 0)
-        if np.any(valid_mask):
-            ax.plot(
-                ego_past[valid_mask, 0],
-                ego_past[valid_mask, 1],
-                "g--",
-                linewidth=3,
-                alpha=0.8,
-                label="Ego Past",
-            )
-
     # Load neighbor agents data
     neighbor_past = _squeeze1(data["neighbor_agents_past"])
     neighbor_future = _squeeze1(data["neighbor_agents_future"]) if ("neighbor_agents_future" in data.files) else None
+
+    # ========== 2.1 Ego past trajectory ==========
+    # Use neighbor_agents_past[0] (ego slot0) as the single source of truth.
+    try:
+        nb0 = neighbor_past[0, :, 0:2]
+        valid_mask = (np.abs(nb0[:, 0]) > 1e-6) | (np.abs(nb0[:, 1]) > 1e-6)
+        if np.any(valid_mask):
+            # Make ego-past visually unmistakable: use a unique color + higher zorder.
+            ax.plot(
+                nb0[valid_mask, 0],
+                nb0[valid_mask, 1],
+                color="#00FF00",
+                linestyle="--",
+                linewidth=4.0,
+                alpha=1.0,
+                zorder=50,
+                label="Ego Past (slot0)",
+            )
+            ax.scatter(
+                nb0[valid_mask, 0],
+                nb0[valid_mask, 1],
+                s=18,
+                color="#00FF00",
+                alpha=0.9,
+                zorder=51,
+            )
+    except Exception:
+        pass
 
     if show_acc:
         try:

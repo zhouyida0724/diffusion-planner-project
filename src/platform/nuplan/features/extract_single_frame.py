@@ -608,24 +608,12 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
                 dheading += 2 * np.pi
             ego_future[i] = [dx, dy, dheading]
 
-    ego_past = np.zeros((EGO_HISTORY_LEN, 3), dtype=np.float32)
-    for i in range(EGO_HISTORY_LEN):
-        idx = center_idx - (EGO_HISTORY_LEN - 1 - i) * 10
-        if idx >= 0:
-            past_row = all_poses[idx]
-            dx, dy = transform_to_ego_frame(past_row["x"], past_row["y"], ego_x, ego_y, ego_heading)
-            heading = quaternion_to_heading(past_row["qw"], past_row["qx"], past_row["qy"], past_row["qz"])
-            dheading = heading - ego_heading
-            while dheading > np.pi:
-                dheading -= 2 * np.pi
-            while dheading < -np.pi:
-                dheading += 2 * np.pi
-            ego_past[i] = [dx, dy, dheading]
-
     neighbor_past = np.zeros((MAX_NEIGHBORS, NEIGHBOR_HISTORY_LEN, 11), dtype=np.float32)
 
     for i in range(NEIGHBOR_HISTORY_LEN):
-        idx = center_idx - (NEIGHBOR_HISTORY_LEN - 1 - i)
+        # ego_pose is 100Hz; neighbor_agents_past is defined at 10Hz (2s @ 10Hz),
+        # so we downsample by 10 frames per step (see mds/FEATURE_EXTRACTION_GUIDE.md).
+        idx = center_idx - (NEIGHBOR_HISTORY_LEN - 1 - i) * 10
         if idx >= 0:
             past_row = all_poses[idx]
             dx, dy = transform_to_ego_frame(past_row["x"], past_row["y"], ego_x, ego_y, ego_heading)
@@ -652,7 +640,9 @@ def extract_ego_data(conn, center_token, center_timestamp, scenario_token):
         else:
             neighbor_past[0, i, -1] = 0.0
 
-    return ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses
+    # NOTE: ego_past is intentionally not exported anymore. The model consumes ego history via
+    # neighbor_agents_past[0] (ego slot0), which is the single source of truth.
+    return ego_current_state, ego_future, neighbor_past, ego_x, ego_y, ego_heading, center_idx, all_poses
 
 
 def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
@@ -711,7 +701,9 @@ def extract_neighbor_agents(conn, center_timestamp, ego_x, ego_y, ego_heading):
             continue
 
         for i in range(NEIGHBOR_HISTORY_LEN):
-            idx = center_box_idx - (NEIGHBOR_HISTORY_LEN - 1 - i)
+            # lidar_box is 20Hz; neighbor past contract is 10Hz (21 points over 2s)
+            # => sample every 2 frames from lidar_box.
+            idx = center_box_idx - 2 * (NEIGHBOR_HISTORY_LEN - 1 - i)
             if idx >= 0:
                 box = boxes[idx]
                 dx, dy = transform_to_ego_frame(box["x"], box["y"], ego_x, ego_y, ego_heading)
@@ -1228,7 +1220,7 @@ def extract_features(
         center_token, center_timestamp, _ = get_target_frame(conn, scenario_token_hex, int(frame_index))
 
     with _timing_ctx(timing, "extract_ego_data"):
-        ego_current_state, ego_past, ego_future, neighbor_past, ego_x, ego_y, ego_heading, _, _ = extract_ego_data(
+        ego_current_state, ego_future, neighbor_past, ego_x, ego_y, ego_heading, _, _ = extract_ego_data(
             conn, center_token, center_timestamp, scenario_token_hex
         )
 
@@ -1537,7 +1529,6 @@ def extract_features(
 
     out = {
         "ego_current_state": ego_current_state,
-        "ego_past": ego_past,
         "ego_agent_future": ego_future,
         "neighbor_agents_past": neighbor_past,
         "neighbor_agents_future": neighbor_future,
