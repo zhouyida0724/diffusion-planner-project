@@ -534,11 +534,18 @@ def _build_neighbor_agents_past_from_history(
                 continue
 
             dx_dy = R @ np.array([x - cur_ego.x, y - cur_ego.y], dtype=np.float64)
-            # NOTE: match offline exporter: use ABSOLUTE heading for cos/sin (not delta-to-ego).
+            # Match offline exporter: headings are stored in the *current ego frame*.
+            # dx/dy and v_local are already in ego frame, so use delta heading here too.
+            dheading = float(heading) - float(cur_ego.heading)
+            while dheading > np.pi:
+                dheading -= 2 * np.pi
+            while dheading < -np.pi:
+                dheading += 2 * np.pi
+
             out[pp, t, 0] = float(dx_dy[0])
             out[pp, t, 1] = float(dx_dy[1])
-            out[pp, t, 2] = float(np.cos(float(heading)))
-            out[pp, t, 3] = float(np.sin(float(heading)))
+            out[pp, t, 2] = float(np.cos(dheading))
+            out[pp, t, 3] = float(np.sin(dheading))
 
             if vx is not None and vy is not None:
                 vv = R @ np.array([vx, vy], dtype=np.float64)
@@ -546,7 +553,7 @@ def _build_neighbor_agents_past_from_history(
                 out[pp, t, 5] = float(vv[1])
 
             # NOTE: match offline exporter 11-dim layout:
-            # [dx,dy,cos(heading_abs),sin(heading_abs),v_local_x,v_local_y,acc_x,acc_y,width,length,type_scalar]
+            # [dx,dy,cos(dheading),sin(dheading),v_local_x,v_local_y,acc_x,acc_y,width,length,type_scalar]
             # Runtime tracked objects do not provide reliable accelerations -> set to 0.
             out[pp, t, 6] = 0.0
             out[pp, t, 7] = 0.0
