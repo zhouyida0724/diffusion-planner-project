@@ -112,12 +112,30 @@ class PaperDiffusionPlanner(nn.Module):
     def sde(self):
         return self.decoder.decoder.sde
 
-    def forward(self, inputs: dict) -> tuple[dict, dict]:
-        # Normalize conditioning features (matches inference path).
-        # IMPORTANT: state normalization is handled explicitly in training and inside decoder sampling.
+    def _split_encoder_decoder_inputs(self, inputs: dict) -> tuple[dict, dict]:
+        """Return (encoder_inputs, decoder_inputs) with TB/runtime sampler parity.
+
+        Observation normalization belongs to conditioning features consumed by the
+        encoder/DiT (lanes, route_lanes, objects, etc.).  The decoder also needs
+        the raw current ego/neighbor states to clamp x_T[0] and then applies the
+        StateNormalizer itself. Passing observation-normalized current states into
+        the decoder would double-normalize the initial state and diverge from the
+        TensorBoard sampler path.
+        """
+
         inputs_n = self.config.observation_normalizer(inputs) if hasattr(self.config, "observation_normalizer") else inputs
-        enc = self.encoder(inputs_n)
-        dec = self.decoder(enc, inputs_n)
+        dec_inputs = dict(inputs_n)
+        # Keep raw current-state carriers for decoder initial-state constraint/masks.
+        if "ego_current_state" in inputs:
+            dec_inputs["ego_current_state"] = inputs["ego_current_state"]
+        if "neighbor_agents_past" in inputs:
+            dec_inputs["neighbor_agents_past"] = inputs["neighbor_agents_past"]
+        return inputs_n, dec_inputs
+
+    def forward(self, inputs: dict) -> tuple[dict, dict]:
+        enc_inputs, dec_inputs = self._split_encoder_decoder_inputs(inputs)
+        enc = self.encoder(enc_inputs)
+        dec = self.decoder(enc, dec_inputs)
         return enc, dec
 
     @torch.no_grad()
@@ -128,13 +146,13 @@ class PaperDiffusionPlanner(nn.Module):
         inputs = dict(inputs)
         inputs["diffusion_steps"] = int(diffusion_steps)
 
-        inputs = self.config.observation_normalizer(inputs) if hasattr(self.config, "observation_normalizer") else inputs
+        enc_inputs, dec_inputs = self._split_encoder_decoder_inputs(inputs)
 
-        enc = self.encoder(inputs)
+        enc = self.encoder(enc_inputs)
         # run decoder in eval mode
         was_training = self.decoder.training
         self.decoder.eval()
-        out = self.decoder(enc, inputs)
+        out = self.decoder(enc, dec_inputs)
         if was_training:
             self.decoder.train(True)
 
@@ -149,6 +167,53 @@ class PaperDiffusionPlanner(nn.Module):
         traj = torch.stack([x, y, heading], dim=-1)
         # return first batch
         return traj[0]
+
+    @torch.no_grad()
+    def sample_trajectories(self, inputs: dict, *, num_samples: int, diffusion_steps: int = 10) -> torch.Tensor:
+        """Run one batched DPM sampling call and return ego trajectories [N,T,3].
+
+        This is equivalent to calling sample_trajectory N times but is much faster when
+        the decoder supports batched sampling (it does).
+        """
+
+        n = int(num_samples)
+        if n <= 0:
+            raise ValueError(f"num_samples must be > 0, got {num_samples}")
+
+        self.eval()
+
+        def _tile(v: Any) -> Any:
+            try:
+                import torch
+
+                if torch.is_tensor(v):
+                    if v.ndim >= 1 and int(v.shape[0]) == 1:
+                        return v.repeat((n,) + (1,) * (v.ndim - 1))
+                    return v
+            except Exception:
+                pass
+            return v
+
+        inputs_b = {k: _tile(v) for k, v in dict(inputs).items()}
+        inputs_b["diffusion_steps"] = int(diffusion_steps)
+
+        enc_inputs, dec_inputs = self._split_encoder_decoder_inputs(inputs_b)
+
+        enc = self.encoder(enc_inputs)
+        was_training = self.decoder.training
+        self.decoder.eval()
+        out = self.decoder(enc, dec_inputs)
+        if was_training:
+            self.decoder.train(True)
+
+        pred = out["prediction"]  # [N,P,T,4]
+        ego = pred[:, 0]  # [N,T,4]
+        x = ego[..., 0]
+        y = ego[..., 1]
+        cos = ego[..., 2]
+        sin = ego[..., 3]
+        heading = torch.atan2(sin, cos)
+        return torch.stack([x, y, heading], dim=-1)
 
     def ckpt_payload(self) -> dict[str, Any]:
         """Metadata to store in checkpoints."""

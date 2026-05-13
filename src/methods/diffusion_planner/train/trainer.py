@@ -42,8 +42,8 @@ class TrainConfig:
     batch_size: int = 32
     lr: float = 1e-4
     # lr schedule
-    lr_schedule: str = "constant"  # constant|cosine
-    lr_min_ratio: float = 1.0  # cosine: lr_min = lr * lr_min_ratio
+    lr_schedule: str = "constant"  # constant|cosine|linear
+    lr_min_ratio: float = 1.0  # cosine/linear: lr_min = lr * lr_min_ratio
     lr_warmup_steps: int = 0
     weight_decay: float = 0.0
     num_workers: int = 2
@@ -109,6 +109,14 @@ class TrainConfig:
     state_perturb_enabled: bool = False
     state_perturb_prob: float = 0.0
     state_perturb_min_vx_mps: float = 2.0
+
+    # -----------------
+    # training-time ego history masking (a.k.a. histdrop)
+    # -----------------
+    # NOTE: This applies to `neighbor_agents_past` when it includes the ego row.
+    # p=1.0 and keep_last=False means fully mask ego history.
+    mask_ego_history_prob: float = 0.0
+    mask_ego_history_keep_last: bool = True
 
 
 def seed_everything(seed: int) -> None:
@@ -198,7 +206,7 @@ class _PerfTracker:
         self._profiler_total_flops: Optional[float] = None
         self._profiler_total_time_s: Optional[float] = None
 
-    def on_step_end(self, *, step: int, step_s: float, loss: float) -> None:
+    def on_step_end(self, *, step: int, step_s: float, loss: float, extra: Optional[Dict[str, Any]] = None) -> None:
         # window
         self._window.append(float(step_s))
         if len(self._window) > int(self.cfg.perf_window):
@@ -225,7 +233,7 @@ class _PerfTracker:
         samples_s = bs / max(step_s, 1e-12)
         frames_s = bs / max(step_s, 1e-12)
 
-        rec = {
+        rec: Dict[str, Any] = {
             "step": int(step),
             "loss": float(loss),
             "step_s": float(step_s),
@@ -238,6 +246,19 @@ class _PerfTracker:
             "nvidia_smi": dict(self._last_smi) if self._last_smi else {},
             "wall_s_since_start": float(time.time() - self._t_train_start),
         }
+        if extra:
+            # Only attach JSON-serializable scalars/short strings.
+            for k, v in dict(extra).items():
+                try:
+                    if isinstance(v, (int, float, str, bool)) or v is None:
+                        rec[k] = v
+                    elif hasattr(v, "item"):
+                        rec[k] = float(v.item())  # type: ignore[arg-type]
+                    else:
+                        # skip non-serializable payloads
+                        pass
+                except Exception:
+                    pass
         self.records.append(rec)
 
     def set_profiler(self, *, total_flops: float | None, total_time_s: float | None) -> None:

@@ -101,8 +101,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cosine"])
-    p.add_argument("--lr-min-ratio", type=float, default=1.0, help="For cosine: lr_min = lr * lr_min_ratio")
+    p.add_argument("--lr-schedule", type=str, default="constant", choices=["constant", "cosine", "linear"])
+    p.add_argument("--lr-min-ratio", type=float, default=1.0, help="For cosine/linear: lr_min = lr * lr_min_ratio")
     p.add_argument("--lr-warmup-steps", type=int, default=0)
     p.add_argument(
         "--resume-ckpt",
@@ -143,6 +143,22 @@ def parse_args() -> argparse.Namespace:
         "--no-state-perturb",
         action="store_true",
         help="Explicitly disable StatePerturbation (overrides --state-perturb-prob).",
+    )
+
+    # -----------------
+    # Ego history masking (histdrop)
+    # -----------------
+    p.add_argument(
+        "--mask-ego-history-prob",
+        type=float,
+        default=0.0,
+        help="Probability to mask ego history in neighbor_agents_past when ego row is present.",
+    )
+    p.add_argument(
+        "--mask-ego-history-keep-last",
+        type=int,
+        default=1,
+        help="If 1: keep last ego history step when masking. If 0: mask all steps.",
     )
     p.add_argument(
         "--amp",
@@ -241,18 +257,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fast-eval-n", type=int, default=1024, help="Number of fast-eval samples per city.")
     p.add_argument("--fast-eval-seed", type=int, default=0, help="Seed for deterministic fast-eval subset selection.")
 
-    p.add_argument(
-        "--fast-eval-mode",
-        type=str,
-        default="proxy",
-        choices=["proxy", "sampler"],
-        help="Fast-eval mode. proxy=t=0 one-step (cheap). sampler=run DPM sampler (matches inference; expensive).",
-    )
+    # Fast-eval is always sampler-mode (matches inference / closed-loop).
+    # Proxy/teacher-forcing eval is intentionally removed to prevent accidental misuse.
     p.add_argument(
         "--fast-eval-diffusion-steps",
         type=int,
         default=10,
-        help="When --fast-eval-mode=sampler, number of DPM sampler steps.",
+        help="Number of DPM sampler steps used by fast-eval.",
     )
     p.add_argument(
         "--fast-eval-batch-size",
@@ -611,8 +622,8 @@ def main() -> None:
         spike_thresh=float(getattr(args, "spike_thresh", 0.9) or 0.9),
         spike_topk=int(getattr(args, "spike_topk", 8) or 8),
 
-        # fast-eval behavior
-        fast_eval_mode=str(getattr(args, "fast_eval_mode", "proxy") or "proxy"),
+        # fast-eval behavior (sampler-mode only)
+        fast_eval_mode="sampler",
         fast_eval_diffusion_steps=int(getattr(args, "fast_eval_diffusion_steps", 10) or 10),
 
         # resume
@@ -622,6 +633,10 @@ def main() -> None:
         state_perturb_enabled=False,
         state_perturb_prob=0.0,
         state_perturb_min_vx_mps=float(getattr(args, "state_perturb_min_vx", 2.0) or 2.0),
+
+        # ego history masking (histdrop)
+        mask_ego_history_prob=float(getattr(args, "mask_ego_history_prob", 0.0) or 0.0),
+        mask_ego_history_keep_last=bool(int(getattr(args, "mask_ego_history_keep_last", 1) or 1)),
     )
 
     # Decide default perturbation behavior.

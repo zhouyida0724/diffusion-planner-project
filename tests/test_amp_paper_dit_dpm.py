@@ -79,6 +79,50 @@ class _SyntheticPaperBatchDataset(Dataset):
         }
 
 
+def test_paper_forward_keeps_raw_current_states_for_decoder():
+    paper_cfg = PaperModelConfig(
+        hidden_dim=32,
+        num_heads=4,
+        encoder_depth=1,
+        decoder_depth=1,
+        encoder_drop_path_rate=0.0,
+        decoder_drop_path_rate=0.0,
+        agent_num=3,
+        static_objects_num=1,
+        lane_num=2,
+        route_num=1,
+        time_len=2,
+        future_len=3,
+        lane_len=2,
+        predicted_neighbor_num=2,
+        static_objects_state_dim=10,
+        diffusion_model_type="x_start",
+        device="cpu",
+        observation_norm={
+            "ego_current_state": {"mean": [10.0] * 10, "std": [2.0] * 10},
+            "neighbor_agents_past": {"mean": [10.0] * 11, "std": [2.0] * 11},
+            "route_lanes": {"mean": [10.0] * 4, "std": [2.0] * 4},
+        },
+    )
+    model = PaperDiffusionPlanner(paper_cfg)
+    inputs = {
+        "ego_current_state": torch.ones(1, 10),
+        "neighbor_agents_past": torch.ones(1, 2, 2, 11),
+        "route_lanes": torch.ones(1, 1, 2, 4),
+    }
+
+    enc_inputs, dec_inputs = model._split_encoder_decoder_inputs(inputs)
+
+    assert torch.allclose(enc_inputs["ego_current_state"], torch.full((1, 10), -4.5))
+    assert torch.allclose(enc_inputs["neighbor_agents_past"], torch.full((1, 2, 2, 11), -4.5))
+    assert torch.allclose(enc_inputs["route_lanes"], torch.full((1, 1, 2, 4), -4.5))
+    # Decoder must receive raw current-state carriers so its StateNormalizer is applied exactly once.
+    assert torch.allclose(dec_inputs["ego_current_state"], inputs["ego_current_state"])
+    assert torch.allclose(dec_inputs["neighbor_agents_past"], inputs["neighbor_agents_past"])
+    # Conditioning tensors that DiT consumes through the decoder stay observation-normalized.
+    assert torch.allclose(dec_inputs["route_lanes"], enc_inputs["route_lanes"])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for AMP")
 @pytest.mark.parametrize("amp", ["bf16", "fp16"])
 def test_paper_dit_dpm_amp_smoke(tmp_path, amp):
