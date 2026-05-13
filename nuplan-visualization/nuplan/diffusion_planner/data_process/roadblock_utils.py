@@ -304,6 +304,19 @@ def route_roadblock_correction(
     route_roadblocks = list(route_roadblock_dict.values())
     route_roadblock_ids = list(route_roadblock_dict.keys())
 
+    # Fix 0 (STRICT ROUTE ANCHOR): if ego is already on the provided route,
+    # slice the route to start from the ego's current roadblock.
+    # Otherwise downstream "route lane" selection may pick already-traversed roadblocks
+    # behind the ego (still within radius), producing route_lanes with negative x in ego frame.
+    if starting_block.id in route_roadblock_ids:
+        try:
+            start_idx = int(route_roadblock_ids.index(starting_block.id))
+            if start_idx > 0:
+                route_roadblocks = route_roadblocks[start_idx:]
+                route_roadblock_ids = route_roadblock_ids[start_idx:]
+        except Exception:
+            pass
+
     # Fix 1: when agent starts off-route
     if starting_block.id not in route_roadblock_ids:
         # Backward search if current roadblock not in route
