@@ -1,0 +1,1816 @@
+diff --git a/nuplan-visualization/nuplan/planning/script/config/common/scenario_filter/one_hand_picked_scenario.yaml b/nuplan-visualization/nuplan/planning/script/config/common/scenario_filter/one_hand_picked_scenario.yaml
+index 286ebdc..0998dcd 100644
+--- a/nuplan-visualization/nuplan/planning/script/config/common/scenario_filter/one_hand_picked_scenario.yaml
++++ b/nuplan-visualization/nuplan/planning/script/config/common/scenario_filter/one_hand_picked_scenario.yaml
+@@ -1,32 +1,28 @@
+ _target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+ scenario_types: null
+ scenario_tokens:
+-  - [2021.05.25.14.16.10_veh-35_01690_02183, 1e6a7a42a68d5665]
+-  - [2021.06.28.16.29.11_veh-38_01415_01821, 452f6be632835ca2]
+-  - [2021.06.03.12.02.06_veh-35_00233_00609, db8daae938f35a97]
+-  - [2021.05.25.14.16.10_veh-35_01690_02183, cec532496b095210]
+-  - [2021.06.03.12.02.06_veh-35_00233_00609, 64b8b57aae165d7b]
+-  - [2021.06.28.15.02.02_veh-38_02398_02848, 4eb0a3c23acf596c]
+-  - [2021.06.28.16.29.11_veh-38_03263_03766, a5e4cb057dd9598a]
+-  - [2021.09.16.15.12.03_veh-42_01037_01434, d9bd0b65ab825873]
+-  - [2021.08.30.14.54.34_veh-40_00439_00835, 64d42308012b5625]
+-  - [2021.06.03.13.55.17_veh-35_00073_00426, ff5122734f4056ae]
+-  - [2021.06.28.16.29.11_veh-38_01415_01821, 276954878d2a59ce]
+-  - [2021.06.28.15.02.02_veh-38_02398_02848, bab967eee46f50fe]
+-  - [2021.05.25.14.16.10_veh-35_01690_02183, 1e616c7224925046]
+-  - [2021.10.06.07.26.10_veh-52_00006_00398, b27306754bfc5000]
+-  - [2021.09.16.15.12.03_veh-42_01037_01434, 74c1dd1205045255]
+-  - [2021.10.06.07.26.10_veh-52_00006_00398, f7bc37d0f6a151fd]
+-  - [2021.06.28.16.29.11_veh-38_01415_01821, 2fe2b69e103153f2]
+-  - [2021.05.25.14.16.10_veh-35_01690_02183, 86821c0f6c635d32]
+-  - [2021.10.06.07.26.10_veh-52_00006_00398, 3dabe793ed4b5052]
+-  - [2021.08.30.14.54.34_veh-40_00439_00835, 74b4d3b2d9e45203]
++  - '72aa451cd85458ef'
++  - '2d8b8e77af38568f'
++  - '9e4abb9834845016'
++  - '89f4094ea0635c0e'
++  - '2525256c428a5dc6'
++  - '1f289241983f5ec8'
++  - 'e9ec20fe8cf255d6'
++  - '4d1987eb8dd95f65'
++  - '122eacb8f6ca5957'
++  - 'a0300c18b2fd5c26'
++  - '1709d7d5b7a5593f'
++  - 'd850d89f6c9853f7'
++  - '4639ab670bca5237'
++  - 'd685cf7d491f561e'
++  - '8a5dda40e90f5e15'
++  - '1883a5aa8eb35035'
+ log_names: null
+ map_names: null
+-num_scenarios_per_type: 1
+-limit_total_scenarios: null
++num_scenarios_per_type: 16
++limit_total_scenarios: 16
+ timestamp_threshold_s: null
+ ego_displacement_minimum_m: null
+ expand_scenarios: false
+-remove_invalid_goals: true
++remove_invalid_goals: false
+ shuffle: false
+diff --git a/scripts/eval/open_loop_eval_test_maneuver20.py b/scripts/eval/open_loop_eval_test_maneuver20.py
+index 7ce1d20..a5808b5 100644
+--- a/scripts/eval/open_loop_eval_test_maneuver20.py
++++ b/scripts/eval/open_loop_eval_test_maneuver20.py
+@@ -179,12 +179,10 @@ def main() -> int:
+         feats = extract_features(
+             conn,
+             map_api,
+-            s.scene_token,
++            s.lidar_pc_token,
+             int(s.frame_index),
+             debug_log=False,
+             routing_mode="auto",
+-            map_root=map_root,
+-            map_version=map_version,
+         )
+         conn.close()
+ 
+diff --git a/scripts/sim/run_diffusion_simulation.py b/scripts/sim/run_diffusion_simulation.py
+index 90c7c2a..1adc6de 100755
+--- a/scripts/sim/run_diffusion_simulation.py
++++ b/scripts/sim/run_diffusion_simulation.py
+@@ -97,7 +97,9 @@ def main() -> None:
+                     tokens.append(parts[0])
+ 
+         print(f"Loaded {len(tokens)} scenarios from {args.scenarios_file}")
+-        write_scenario_filter_yaml_for_tokens(scenario_tokens=tokens, config_file=CONFIG_FILE)
++        # For regression/eval we want to run exactly the requested tokens.
++        # nuPlan's default ScenarioFilter can drop many tokens when `remove_invalid_goals=true`.
++        write_scenario_filter_yaml_for_tokens(scenario_tokens=tokens, config_file=CONFIG_FILE, remove_invalid_goals=False)
+ 
+         cmd = build_run_simulation_cmd(
+             planner_overrides=planner_overrides,
+@@ -106,7 +108,7 @@ def main() -> None:
+         )
+ 
+     elif args.scenario:
+-        write_scenario_filter_yaml_for_tokens(scenario_tokens=[args.scenario], config_file=CONFIG_FILE)
++        write_scenario_filter_yaml_for_tokens(scenario_tokens=[args.scenario], config_file=CONFIG_FILE, remove_invalid_goals=False)
+         cmd = build_run_simulation_cmd(
+             planner_overrides=planner_overrides,
+             scenario_filter="one_hand_picked_scenario",
+@@ -139,7 +141,7 @@ def main() -> None:
+         cmd=cmd,
+         base_env=base_env,
+         pythonpath=pythonpath,
+-        nuplan_exp_root=repo_root / "data" / "nuplan" / "exp",
++        nuplan_exp_root=base_env.get("NUPLAN_EXP_ROOT", str(repo_root / "data" / "nuplan" / "exp")),
+     )
+     raise SystemExit(run(invocation))
+ 
+diff --git a/src/methods/diffusion_planner/paper/model/diffusion_utils/sampling.py b/src/methods/diffusion_planner/paper/model/diffusion_utils/sampling.py
+index b60aaac..49653ad 100644
+--- a/src/methods/diffusion_planner/paper/model/diffusion_utils/sampling.py
++++ b/src/methods/diffusion_planner/paper/model/diffusion_utils/sampling.py
+@@ -25,6 +25,15 @@ def dpm_sampler(
+     dpm_solver_params = dpm_solver_params or {}
+     sample_params = sample_params or {}
+ 
++    import os
++
++    # Debug knobs (env): helps diagnose sampler collapse without changing call sites.
++    algo_type = os.getenv("DP_DPM_ALGO", "dpmsolver++").strip() or "dpmsolver++"
++    skip_type = os.getenv("DP_DPM_SKIP", "logSNR").strip() or "logSNR"
++    method = os.getenv("DP_DPM_METHOD", "multistep").strip() or "multistep"
++    order = int(os.getenv("DP_DPM_ORDER", "2"))
++    denoise_to_zero = os.getenv("DP_DPM_DENOISE_TO_ZERO", "1").strip().lower() not in {"0", "false", "no"}
++
+     with torch.no_grad():
+         noise_schedule = dpm.NoiseScheduleVP(schedule="linear", **noise_schedule_params)
+ 
+@@ -36,15 +45,15 @@ def dpm_sampler(
+             **model_wrapper_params,
+         )
+ 
+-        dpm_solver = dpm.DPM_Solver(model_fn, noise_schedule, algorithm_type="dpmsolver++", **dpm_solver_params)
++        dpm_solver = dpm.DPM_Solver(model_fn, noise_schedule, algorithm_type=algo_type, **dpm_solver_params)
+ 
+         sample_dpm = dpm_solver.sample(
+             x_T,
+             steps=diffusion_steps,
+-            order=2,
+-            skip_type="logSNR",
+-            method="multistep",
+-            denoise_to_zero=True,
++            order=order,
++            skip_type=skip_type,
++            method=method,
++            denoise_to_zero=denoise_to_zero,
+             **sample_params,
+         )
+ 
+diff --git a/src/methods/diffusion_planner/paper/model/module/decoder.py b/src/methods/diffusion_planner/paper/model/module/decoder.py
+index 33d32ab..67714d6 100644
+--- a/src/methods/diffusion_planner/paper/model/module/decoder.py
++++ b/src/methods/diffusion_planner/paper/model/module/decoder.py
+@@ -85,8 +85,17 @@ class Decoder(nn.Module):
+         # Normalize current states (expects shape [B,P,1,4] for correct broadcasting).
+         current_states_norm = self._state_normalizer(current_states[:, :, None, :])[:, :, 0, :]
+ 
+-        # Random noise for future states in normalized space.
+-        noise = torch.randn(B, P, self._future_len, 4, device=current_states.device) * 0.5
++        # Inference sampler temperature. This intentionally follows the official
++        # Diffusion-Planner implementation: initialize future states with N(0, 0.5^2)
++        # in normalized trajectory space, while clamping the current state. Although the
++        # VP-SDE marginal std at t=1 is ~1, the planner's DPM-Solver inference path uses
++        # this lower-temperature prior for stable conditional trajectory generation.
++        noise_scale = 0.5
++        try:
++            noise_scale = float(os.getenv("DP_SAMPLER_NOISE_SCALE", "0.5"))
++        except Exception:
++            noise_scale = 0.5
++        noise = torch.randn(B, P, self._future_len, 4, device=current_states.device, dtype=current_states.dtype) * float(noise_scale)
+         xT = torch.cat([current_states_norm[:, :, None], noise], dim=2).reshape(B, P, -1)
+ 
+         def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step: int):
+diff --git a/src/platform/nuplan/planners/diffusion_planner_ckpt_planner.py b/src/platform/nuplan/planners/diffusion_planner_ckpt_planner.py
+index 465e37a..d24259c 100644
+--- a/src/platform/nuplan/planners/diffusion_planner_ckpt_planner.py
++++ b/src/platform/nuplan/planners/diffusion_planner_ckpt_planner.py
+@@ -26,6 +26,10 @@ from typing import Deque, Optional
+ 
+ import os
+ import sqlite3
++import json
++import hashlib
++import math
++from pathlib import Path
+ import numpy as np
+ import torch
+ 
+@@ -45,15 +49,23 @@ from src.methods.diffusion_planner.paper.model.diffusion_planner import PaperDif
+ 
+ # Runtime feature extraction utilities (reuse export logic)
+ from src.platform.nuplan.features.extract_single_frame import (
++    FeatureLocalFrame,
+     extract_lanes,
+     extract_neighbor_agents,
+     extract_route_lanes,
+     extract_static_objects,
++    extract_features_at_timestamp,
+     get_traffic_lights_at_timestamp,
+ )
+ 
+ from src.platform.nuplan.features.feature_contract import maybe_check_feature_contract
+ from src.platform.nuplan.trajectory_selector import CandidateTrajectory, EgoPose2D, PrefixSelectorConfig, PrefixTrajectorySelector, SelectionContext
++from src.platform.nuplan.trajectory_selector.scorers import (
++    candidate_obstacle_proxies,
++    candidate_pairwise_diversity,
++    candidate_route_projection_summaries,
++    route_feature_sanity,
++)
+ 
+ 
+ @dataclass
+@@ -234,8 +246,8 @@ def _build_ego_runtime_features(
+         [
+             0.0,
+             0.0,
+-            float(np.cos(cur_k.heading)),
+-            float(np.sin(cur_k.heading)),
++            1.0,
++            0.0,
+             float(v_local[0]),
+             float(v_local[1]),
+             float(cur_k.ax),
+@@ -274,6 +286,190 @@ def _get_ego_box_dims(ego: EgoState) -> tuple[float, float]:
+     return width, length
+ 
+ 
++def _ego_vehicle_dimensions(ego: EgoState) -> dict[str, float | None]:
++    width, length = _get_ego_box_dims(ego)
++    out: dict[str, float | None] = {
++        "width": float(width),
++        "length": float(length),
++        "half_width": float(width) / 2.0,
++        "half_length": float(length) / 2.0,
++        "rear_axle_to_center": 1.46,
++        "front_length": None,
++        "rear_length": None,
++    }
++    try:
++        vp = ego.car_footprint.vehicle_parameters
++        out["half_width"] = float(getattr(vp, "half_width"))
++        out["half_length"] = float(getattr(vp, "half_length"))
++        out["rear_axle_to_center"] = float(getattr(vp, "rear_axle_to_center"))
++        out["front_length"] = float(getattr(vp, "front_length"))
++        out["rear_length"] = float(getattr(vp, "rear_length"))
++    except Exception:
++        try:
++            out["rear_axle_to_center"] = float(ego.car_footprint.rear_axle_to_center_dist)
++        except Exception:
++            if os.getenv("DP_CLOSEDLOOP_DEBUG_RAISE", "0") not in ("", "0", "false", "False"):
++                raise
++            pass
++    return out
++
++
++def _vehicle_footprint_arrays(world_rear_xyh: np.ndarray, vehicle_dimensions: dict[str, float | None]) -> tuple[np.ndarray, np.ndarray]:
++    rear = np.asarray(world_rear_xyh, dtype=np.float64)
++    if rear.ndim != 2 or rear.shape[1] < 3:
++        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 4, 2), dtype=np.float32)
++
++    rear_axle_to_center = float(vehicle_dimensions.get("rear_axle_to_center") or 0.0)
++    half_length = float(vehicle_dimensions.get("half_length") or float(vehicle_dimensions.get("length") or 0.0) / 2.0)
++    half_width = float(vehicle_dimensions.get("half_width") or float(vehicle_dimensions.get("width") or 0.0) / 2.0)
++    headings = rear[:, 2]
++    cos_h = np.cos(headings)
++    sin_h = np.sin(headings)
++    centers_xy = rear[:, :2] + rear_axle_to_center * np.stack([cos_h, sin_h], axis=1)
++    centers = np.column_stack([centers_xy, headings]).astype(np.float32)
++
++    local_corners = np.array(
++        [
++            [half_length, half_width],
++            [-half_length, half_width],
++            [-half_length, -half_width],
++            [half_length, -half_width],
++        ],
++        dtype=np.float64,
++    )
++    corners = np.zeros((rear.shape[0], 4, 2), dtype=np.float64)
++    for i, heading in enumerate(headings):
++        rot = _rot2d(float(heading))
++        corners[i] = (rot @ local_corners.T).T + centers_xy[i]
++    return centers, corners.astype(np.float32)
++
++
++def _map_drivable_flags(map_api: object | None, points_xy: np.ndarray) -> np.ndarray:
++    points = np.asarray(points_xy, dtype=np.float64).reshape(-1, 2)
++    flags = np.zeros((points.shape[0],), dtype=bool)
++    if map_api is None:
++        return flags
++    for i, point in enumerate(points):
++        try:
++            flags[i] = bool(map_api.is_in_layer(Point2D(float(point[0]), float(point[1])), SemanticMapLayer.DRIVABLE_AREA))
++        except Exception:
++            flags[i] = False
++    return flags
++
++
++def _safe_filename_part(value: object, *, fallback: str = "unknown") -> str:
++    try:
++        text = str(value)
++    except Exception:
++        text = fallback
++    text = text.strip() or fallback
++    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in text)
++    safe = safe.strip("._")
++    return safe[:160] if safe else fallback
++
++
++def _feature_sha1(features: dict[str, np.ndarray]) -> str:
++    h = hashlib.sha1()
++    for key in sorted(features.keys()):
++        arr = np.asarray(features[key])
++        h.update(str(key).encode("utf-8"))
++        h.update(str(arr.shape).encode("utf-8"))
++        h.update(str(arr.dtype).encode("utf-8"))
++        h.update(np.ascontiguousarray(arr).tobytes())
++    return h.hexdigest()
++
++
++def _trajectory_stats(local_xyh: np.ndarray) -> dict[str, object]:
++    arr = np.asarray(local_xyh, dtype=np.float32)
++    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 3:
++        return {"num_poses": int(arr.shape[0]) if arr.ndim >= 1 else 0}
++
++    xy = arr[:, :2]
++    if len(xy) > 1:
++        dxy = xy[1:] - xy[:-1]
++        segment_lengths = np.sqrt(np.sum(dxy * dxy, axis=1))
++        path_length_m = float(np.sum(segment_lengths))
++    else:
++        path_length_m = 0.0
++    displacement_m = float(np.sqrt(np.sum((xy[-1] - xy[0]) ** 2)))
++    return {
++        "num_poses": int(arr.shape[0]),
++        "path_length_m": path_length_m,
++        "start_end_displacement_m": displacement_m,
++        "start_xyh": arr[0, :3].astype(float).tolist(),
++        "end_xyh": arr[-1, :3].astype(float).tolist(),
++        "xy_min": np.min(xy, axis=0).astype(float).tolist(),
++        "xy_max": np.max(xy, axis=0).astype(float).tolist(),
++    }
++
++
++def _json_safe(value: object) -> object:
++    if isinstance(value, np.ndarray):
++        return _json_safe(value.tolist())
++    if isinstance(value, dict):
++        return {str(key): _json_safe(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_json_safe(item) for item in value]
++    if isinstance(value, (np.bool_, bool)):
++        return bool(value)
++    if isinstance(value, (np.integer,)):
++        return int(value)
++    if isinstance(value, (np.floating, float)):
++        scalar = float(value)
++        return scalar if math.isfinite(scalar) else None
++    return value
++
++
++def _db_ego_pose_at_timestamp(conn: sqlite3.Connection, scenario_token_hex: str, timestamp_us: int) -> dict[str, object] | None:
++    try:
++        from src.platform.nuplan.features.extract_single_frame import get_lidar_token_at_or_before_timestamp, quaternion_to_heading
++
++        lidar_token, lidar_ts = get_lidar_token_at_or_before_timestamp(
++            conn,
++            timestamp_us=int(timestamp_us),
++            scenario_token_hex=str(scenario_token_hex),
++        )
++        cur = conn.cursor()
++        cur.execute("SELECT scene_token FROM lidar_pc WHERE token = ? LIMIT 1", (lidar_token,))
++        scene_row = cur.fetchone()
++        if scene_row is None:
++            return None
++        scene_token = scene_row[0]
++        cur.execute("SELECT log_token FROM scene WHERE token = ? LIMIT 1", (scene_token,))
++        log_row = cur.fetchone()
++        if log_row is None or log_row[0] is None:
++            return None
++        log_token = log_row[0]
++        cur.execute(
++            """
++            SELECT timestamp, x, y, qw, qx, qy, qz
++            FROM ego_pose
++            WHERE log_token = ? AND timestamp <= ?
++            ORDER BY timestamp DESC
++            LIMIT 1
++            """,
++            (log_token, int(lidar_ts)),
++        )
++        pose_row = cur.fetchone()
++        if pose_row is None:
++            return None
++        qw, qx, qy, qz = float(pose_row[3]), float(pose_row[4]), float(pose_row[5]), float(pose_row[6])
++        try:
++            lidar_token_hex = bytes(lidar_token).hex()
++        except Exception:
++            lidar_token_hex = str(lidar_token)
++        return {
++            "x": float(pose_row[1]),
++            "y": float(pose_row[2]),
++            "heading": float(quaternion_to_heading(qw, qx, qy, qz)),
++            "timestamp_us": int(pose_row[0]),
++            "lidar_timestamp_us": int(lidar_ts),
++            "lidar_token": lidar_token_hex,
++        }
++    except Exception:
++        return None
++
++
+ def _build_ego_neighbor_slot(ego_states: Deque[EgoState], *, time_len: int) -> np.ndarray:
+     """Match offline extractor semantics for neighbor slot 0: ego history in center frame."""
+     states = list(ego_states)
+@@ -361,6 +557,8 @@ def _safe_xy_heading_v_wl_type(
+             y = float(getattr(c, "y"))
+             heading = float(getattr(c, "heading"))
+         except Exception:
++            if os.getenv("DP_CLOSEDLOOP_DEBUG_RAISE", "0") not in ("", "0", "false", "False"):
++                raise
+             pass
+ 
+     # velocity
+@@ -383,6 +581,8 @@ def _safe_xy_heading_v_wl_type(
+             width = float(getattr(obj, "width"))
+             length = float(getattr(obj, "length"))
+         except Exception:
++            if os.getenv("DP_CLOSEDLOOP_DEBUG_RAISE", "0") not in ("", "0", "false", "False"):
++                raise
+             pass
+ 
+     # type onehot(3): vehicle, pedestrian, bicycle
+@@ -633,6 +833,17 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+         )
+         self._feature_sanity_k = int(os.getenv("DP_RUNTIME_FEATURE_SANITY_K", str(self._runtime_debug_k or 5)))
+         self._feature_sanity_ticks = 0
++
++        # Feature dump for strict train↔infer alignment debugging.
++        # Dumps the *exact numpy* features consumed by the paper model at runtime.
++        # Enable with:
++        #   DP_RUNTIME_FEATURE_DUMP_DIR=/abs/path
++        #   DP_RUNTIME_FEATURE_DUMP_K=5
++        self._feature_dump_dir = os.getenv("DP_RUNTIME_FEATURE_DUMP_DIR", "").strip()
++        self._feature_dump_k = int(os.getenv("DP_RUNTIME_FEATURE_DUMP_K", "5"))
++        self._feature_dump_ticks = 0
++        self._last_feature_local_frame_meta: dict[str, object] | None = None
++        self._configure_closedloop_debug_dump_from_env()
+         self._debug_cond = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_COND", "0") not in ("", "0", "false", "False"))
+         self._debug_sampler = self._runtime_debug or (os.getenv("DIFFPLANNER_DEBUG_SAMPLER", "0") not in ("", "0", "false", "False"))
+ 
+@@ -665,6 +876,17 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+         self._selector_debug = bool(_coalesce(trajectory_selector_debug, env_selector_debug))
+         self._selector_tick = 0
+         self._prev_selected_world_xyh: Optional[np.ndarray] = None
++        # Selector diagnostics trace (jsonl). Enable with:
++        #   DP_TRAJ_SELECTOR_TRACE_JSONL=/abs/path/selector_trace.jsonl
++        # By default we only dump tick0 to keep files small; override with:
++        #   DP_TRAJ_SELECTOR_TRACE_TICK0_ONLY=0
++        self._selector_trace_jsonl = os.getenv("DP_TRAJ_SELECTOR_TRACE_JSONL", "").strip()
++        self._selector_trace_tick0_only = os.getenv("DP_TRAJ_SELECTOR_TRACE_TICK0_ONLY", "1") not in (
++            "",
++            "0",
++            "false",
++            "False",
++        )
+         self._trajectory_selector = PrefixTrajectorySelector(
+             PrefixSelectorConfig(
+                 prefix_seconds=float(_coalesce(trajectory_selector_prefix_seconds, float(os.getenv("DP_TRAJ_SELECTOR_PREFIX_SECONDS", "3.0") or 3.0))),
+@@ -677,6 +899,302 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+ 
+         self._load_checkpoint_or_raise()
+ 
++    def _configure_closedloop_debug_dump_from_env(self) -> None:
++        self._closedloop_debug_dump_dir = os.getenv("DP_CLOSEDLOOP_DEBUG_DUMP_DIR", "").strip()
++        self._closedloop_debug_start_tick = int(os.getenv("DP_CLOSEDLOOP_DEBUG_START_TICK", "0") or 0)
++        self._closedloop_debug_end_tick = int(os.getenv("DP_CLOSEDLOOP_DEBUG_END_TICK", "-1") or -1)
++        self._closedloop_debug_candidates = max(0, int(os.getenv("DP_CLOSEDLOOP_DEBUG_CANDIDATES", "0") or 0))
++        self._closedloop_debug_tick = 0
++
++    def _closedloop_debug_tick_in_range(self, tick: int) -> bool:
++        if not self._closedloop_debug_dump_dir:
++            return False
++        if int(tick) < int(self._closedloop_debug_start_tick):
++            return False
++        end_tick = int(self._closedloop_debug_end_tick)
++        return end_tick < 0 or int(tick) <= end_tick
++
++    def _scenario_token_and_log(self) -> tuple[str | None, str | None]:
++        token = None
++        for attr in ("token", "scenario_token", "scenario_token_hex"):
++            try:
++                value = getattr(self._scenario, attr, None)
++                if value is None:
++                    continue
++                token = value.hex() if isinstance(value, (bytes, bytearray)) else str(value)
++                break
++            except Exception:
++                continue
++
++        log_name = None
++        for attr in ("log_name", "_log_name", "log_file", "_log_file"):
++            try:
++                value = getattr(self._scenario, attr, None)
++                if value is None:
++                    continue
++                log_name = str(value)
++                break
++            except Exception:
++                continue
++        return token, log_name
++
++    def _maybe_dump_closedloop_debug(
++        self,
++        *,
++        current_input: PlannerInput,
++        tick: int,
++        selected_local_xyh: np.ndarray,
++        selected_world_xyh: np.ndarray,
++        feats_np: dict[str, np.ndarray] | None,
++        candidates_local_xyh: list[np.ndarray] | None = None,
++    ) -> None:
++        if not self._closedloop_debug_tick_in_range(int(tick)):
++            return
++
++        try:
++            dump_dir = Path(self._closedloop_debug_dump_dir)
++            dump_dir.mkdir(parents=True, exist_ok=True)
++
++            scenario_token, scenario_log = self._scenario_token_and_log()
++            iteration_index = int(getattr(current_input.iteration, "index", -1))
++            timestamp_us = int(getattr(current_input.iteration, "time_us", -1))
++            try:
++                ego_states = current_input.history.ego_states
++                if ego_states:
++                    timestamp_us = int(getattr(ego_states[-1], "time_us", timestamp_us))
++            except Exception:
++                pass
++
++            selected_local = np.asarray(selected_local_xyh, dtype=np.float32).copy()
++            selected_world = np.asarray(selected_world_xyh, dtype=np.float32).copy()
++            features = feats_np or {}
++
++            def _feature_array(name: str, shape: tuple[int, ...]) -> np.ndarray:
++                arr = features.get(name)
++                if arr is None:
++                    return np.zeros(shape, dtype=np.float32)
++                return np.asarray(arr).copy()
++
++            route_lanes = _feature_array("route_lanes", (0, 0, 12))
++            route_lanes_avails = _feature_array("route_lanes_avails", (0, 0))
++            lanes = _feature_array("lanes", (0, 0, 12))
++            lanes_avails = _feature_array("lanes_avails", (0, 0))
++
++            hash_features = {
++                "selected_local_xyh": selected_local,
++                "selected_world_xyh": selected_world,
++                "route_lanes": route_lanes,
++                "route_lanes_avails": route_lanes_avails,
++                "lanes": lanes,
++                "lanes_avails": lanes_avails,
++            }
++            if features:
++                hash_features.update({str(k): np.asarray(v) for k, v in features.items()})
++
++            route_lane_count = 0
++            try:
++                route_avails = np.asarray(route_lanes_avails)
++                route_lane_count = int(np.count_nonzero(np.any(route_avails > 0, axis=1)))
++            except Exception:
++                route_lane_count = 0
++
++            ego_pose: dict[str, float | None] = {"x": None, "y": None, "heading": None}
++            runtime_rear_axle: dict[str, float | int] | None = None
++            vehicle_dimensions: dict[str, float | None] = {
++                "width": None,
++                "length": None,
++                "half_width": None,
++                "half_length": None,
++                "rear_axle_to_center": None,
++                "front_length": None,
++                "rear_length": None,
++            }
++            try:
++                ego = current_input.history.ego_states[-1]
++                ego_k = _ego_kinematics(ego)
++                ego_pose = {"x": float(ego_k.x), "y": float(ego_k.y), "heading": float(ego_k.heading)}
++                runtime_time_us = getattr(ego, "time_us", timestamp_us)
++                if runtime_time_us is None:
++                    runtime_time_us = timestamp_us
++                runtime_rear_axle = {
++                    "x": float(ego_k.x),
++                    "y": float(ego_k.y),
++                    "heading": float(ego_k.heading),
++                    "time_us": int(runtime_time_us),
++                }
++                vehicle_dimensions = _ego_vehicle_dimensions(ego)
++            except Exception:
++                pass
++
++            db_rear_axle = None
++            db_minus_runtime_world = None
++            runtime_in_db_local = None
++            try:
++                if scenario_token and timestamp_us >= 0:
++                    bytes.fromhex(str(scenario_token))
++                    db_rear_axle = _db_ego_pose_at_timestamp(self._get_feature_conn(), str(scenario_token), int(timestamp_us))
++            except Exception:
++                db_rear_axle = None
++            try:
++                if db_rear_axle is not None and runtime_rear_axle is not None:
++                    db_x = float(db_rear_axle["x"])
++                    db_y = float(db_rear_axle["y"])
++                    db_heading = float(db_rear_axle["heading"])
++                    runtime_x = float(runtime_rear_axle["x"])
++                    runtime_y = float(runtime_rear_axle["y"])
++                    runtime_heading = float(runtime_rear_axle["heading"])
++                    db_minus_runtime_world = {
++                        "dx": float(db_x - runtime_x),
++                        "dy": float(db_y - runtime_y),
++                        "dheading": _wrap_pi(db_heading - runtime_heading),
++                    }
++                    runtime_local_xy = _rot2d(-db_heading) @ np.array([runtime_x - db_x, runtime_y - db_y], dtype=np.float64)
++                    runtime_in_db_local = {
++                        "x": float(runtime_local_xy[0]),
++                        "y": float(runtime_local_xy[1]),
++                        "heading": _wrap_pi(runtime_heading - db_heading),
++                    }
++            except Exception:
++                db_minus_runtime_world = None
++                runtime_in_db_local = None
++
++            selected_center, selected_corners = _vehicle_footprint_arrays(selected_world, vehicle_dimensions)
++            map_api = getattr(self, "_map_api", None)
++            selected_rear_drivable = _map_drivable_flags(map_api, selected_world[:, :2]).reshape(-1)
++            selected_center_drivable = _map_drivable_flags(map_api, selected_center[:, :2]).reshape(-1)
++            selected_corner_drivable = _map_drivable_flags(map_api, selected_corners.reshape(-1, 2)).reshape(selected_corners.shape[:2])
++            selected_corner_step_ok = np.all(selected_corner_drivable, axis=1) if selected_corner_drivable.size else np.zeros((0,), dtype=bool)
++            selected_corner_offroad_count = int(np.size(selected_corner_drivable) - np.count_nonzero(selected_corner_drivable))
++            if selected_corner_step_ok.size and not bool(np.all(selected_corner_step_ok)):
++                selected_first_corner_offroad_step: int | None = int(np.argmax(~selected_corner_step_ok))
++            else:
++                selected_first_corner_offroad_step = None
++
++            payload_arrays: dict[str, np.ndarray] = {
++                "selected_local_xyh": selected_local,
++                "selected_world_xyh": selected_world,
++                "closed_loop_y": selected_local,
++                "selected_xyh": selected_local,
++                "selected_world_rear_xyh": selected_world,
++                "selected_center_world_xyh": selected_center,
++                "selected_corners_world_xy": selected_corners,
++                "selected_corner_drivable": selected_corner_drivable,
++                "selected_center_drivable": selected_center_drivable,
++                "selected_rear_drivable": selected_rear_drivable,
++                "route_lanes": route_lanes,
++                "route_lanes_avails": route_lanes_avails,
++                "lanes": lanes,
++                "lanes_avails": lanes_avails,
++            }
++            candidate_limit = int(self._closedloop_debug_candidates)
++            candidate_debug_summary: dict[str, object] = {}
++            if candidate_limit > 0 and candidates_local_xyh:
++                candidate_arrays = [np.asarray(c, dtype=np.float32).copy() for c in candidates_local_xyh[:candidate_limit]]
++                try:
++                    candidates = np.stack(candidate_arrays, axis=0)
++                    payload_arrays["candidates_local_xyh"] = candidates
++                    payload_arrays["candidate_xyh"] = candidates
++                    route_centerlines_local = _route_centerlines_from_local_features(route_lanes, route_lanes_avails)
++                    debug_context = SelectionContext(
++                        ego_pose=EgoPose2D(
++                            x=float(ego_pose["x"] or 0.0),
++                            y=float(ego_pose["y"] or 0.0),
++                            heading=float(ego_pose["heading"] or 0.0),
++                        ),
++                        route_centerlines_local=route_centerlines_local,
++                        drivable_checker=lambda points_xy: np.zeros((np.asarray(points_xy).reshape(-1, 2).shape[0],), dtype=bool),
++                        vehicle_half_length=float(vehicle_dimensions.get("half_length") or 2.5),
++                        vehicle_half_width=float(vehicle_dimensions.get("half_width") or 1.15),
++                        rear_axle_to_center_dist=float(vehicle_dimensions.get("rear_axle_to_center") or 1.46),
++                        dt=float(getattr(self, "_step_interval", 0.1)),
++                        neighbor_agents_past=features.get("neighbor_agents_past"),
++                        static_objects=features.get("static_objects"),
++                        route_lanes=route_lanes,
++                        route_lanes_avails=route_lanes_avails,
++                    )
++                    route_projection = candidate_route_projection_summaries(candidate_arrays, route_centerlines_local)
++                    obstacle_proxies = candidate_obstacle_proxies(candidate_arrays, debug_context)
++                    diversity = candidate_pairwise_diversity(candidate_arrays)
++                    candidate_debug_summary = {
++                        "candidate_route_projection": route_projection,
++                        "candidate_obstacle_proxies": obstacle_proxies,
++                        "candidate_diversity": diversity,
++                    }
++                    payload_arrays["candidate_route_projection_final_lateral_error_m"] = np.asarray(
++                        route_projection["final_lateral_error_m"], dtype=np.float32
++                    )
++                    payload_arrays["candidate_route_projection_remaining_to_route_end_m"] = np.asarray(
++                        route_projection["remaining_to_route_end_m"], dtype=np.float32
++                    )
++                    payload_arrays["candidate_dynamic_min_clearance_m"] = np.asarray(
++                        obstacle_proxies["min_dynamic_clearance_m"], dtype=np.float32
++                    )
++                    payload_arrays["candidate_static_min_clearance_m"] = np.asarray(
++                        obstacle_proxies["min_static_clearance_m"], dtype=np.float32
++                    )
++                    if ego_pose["x"] is not None and ego_pose["y"] is not None and ego_pose["heading"] is not None:
++                        ego_for_candidates = _EgoKinematics(
++                            x=float(ego_pose["x"]),
++                            y=float(ego_pose["y"]),
++                            heading=float(ego_pose["heading"]),
++                            vx=0.0,
++                            vy=0.0,
++                            ax=0.0,
++                            ay=0.0,
++                        )
++                        candidate_counts: list[int] = []
++                        for candidate_local in candidate_arrays:
++                            candidate_world = _local_xyh_to_world_xyh(candidate_local, ego_for_candidates)
++                            _, candidate_corners = _vehicle_footprint_arrays(candidate_world, vehicle_dimensions)
++                            candidate_flags = _map_drivable_flags(map_api, candidate_corners.reshape(-1, 2)).reshape(candidate_corners.shape[:2])
++                            candidate_counts.append(int(np.size(candidate_flags) - np.count_nonzero(candidate_flags)))
++                        payload_arrays["candidate_corner_offroad_counts"] = np.asarray(candidate_counts, dtype=np.int64)
++                except Exception:
++                    pass
++
++            route_sanity = route_feature_sanity(route_lanes, route_lanes_avails)
++            meta = {
++                "scenario_token": scenario_token,
++                "scenario_log": scenario_log,
++                "tick": int(tick),
++                "iteration_index": iteration_index,
++                "timestamp_us": timestamp_us,
++                "feature_sha1": _feature_sha1(hash_features),
++                "selected_local_trajectory_stats": _trajectory_stats(selected_local),
++                "selected_corner_offroad_count": selected_corner_offroad_count,
++                "selected_first_corner_offroad_step": selected_first_corner_offroad_step,
++                "route_lane_count": route_lane_count,
++                "route_feature_sanity": _json_safe(route_sanity),
++                "ego_pose": ego_pose,
++                "runtime_rear_axle": runtime_rear_axle,
++                "db_rear_axle": db_rear_axle,
++                "db_minus_runtime_world": db_minus_runtime_world,
++                "runtime_in_db_local": runtime_in_db_local,
++                "vehicle_dimensions": vehicle_dimensions,
++                "env_config": {
++                    "DP_CLOSEDLOOP_DEBUG_DUMP_DIR": self._closedloop_debug_dump_dir,
++                    "DP_CLOSEDLOOP_DEBUG_START_TICK": int(self._closedloop_debug_start_tick),
++                    "DP_CLOSEDLOOP_DEBUG_END_TICK": int(self._closedloop_debug_end_tick),
++                    "DP_CLOSEDLOOP_DEBUG_CANDIDATES": int(self._closedloop_debug_candidates),
++                },
++            }
++            if candidate_debug_summary:
++                meta.update(_json_safe(candidate_debug_summary))
++            feature_frame_meta = getattr(self, "_last_feature_local_frame_meta", None)
++            if isinstance(feature_frame_meta, dict):
++                meta.update(feature_frame_meta)
++
++            stem = (
++                f"{_safe_filename_part(scenario_token, fallback='unknown_scenario')}"
++                f"_tick{int(tick):06d}_iter{iteration_index}_ts{timestamp_us}"
++            )
++            np.savez_compressed(dump_dir / f"{stem}.npz", **payload_arrays)
++            (dump_dir / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++        except Exception:
++            if os.getenv("DP_CLOSEDLOOP_DEBUG_RAISE", "0") not in ("", "0", "false", "False"):
++                raise
++            pass
++
+     def _load_checkpoint_or_raise(self) -> None:
+         # PyTorch 2.6 changed default `weights_only` to True, which can break loading
+         # older checkpoints that store non-tensor metadata (e.g., normalizer objects).
+@@ -724,6 +1242,21 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+ 
+         self._ckpt_kind = kind
+ 
++        # Train↔infer alignment options (stored in training-skeleton checkpoints).
++        # Some of our exports include ego history as row0 in neighbor_agents_past.
++        # During training we may mask that ego history to prevent leakage.
++        cfg_dict = ckpt.get("cfg") if isinstance(ckpt, dict) else None
++        if not isinstance(cfg_dict, dict):
++            cfg_dict = {}
++        try:
++            self._mask_ego_history_prob = float(cfg_dict.get("mask_ego_history_prob", 0.0) or 0.0)
++        except Exception:
++            self._mask_ego_history_prob = 0.0
++        try:
++            self._mask_ego_history_keep_last = bool(cfg_dict.get("mask_ego_history_keep_last", True))
++        except Exception:
++            self._mask_ego_history_keep_last = True
++
+         if kind == PaperDiffusionPlanner.CKPT_KIND:
+             paper_cfg_dict = ckpt.get("paper_config") or ckpt.get("paper_cfg") or ckpt.get("paper_model_cfg")
+             if not isinstance(paper_cfg_dict, dict):
+@@ -746,6 +1279,47 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+ 
+         self._model = model
+ 
++    def _maybe_mask_ego_history_runtime(self, neighbor_agents_past: np.ndarray) -> np.ndarray:
++        """Mask ego history in neighbor_agents_past (row0) to match training semantics."""
++
++        nb = np.asarray(neighbor_agents_past)
++        if nb.ndim != 3 or nb.shape[0] < 1 or nb.shape[1] < 1:
++            return nb
++
++        # Allow runtime override.
++        env = os.getenv("DP_MASK_EGO_HISTORY", "").strip()
++        if env:
++            enabled = env not in ("0", "false", "False", "no", "No")
++            prob = 1.0 if enabled else 0.0
++        else:
++            prob = float(getattr(self, "_mask_ego_history_prob", 0.0) or 0.0)
++
++        if prob <= 0.0:
++            return nb
++
++        # For inference we apply deterministically when prob>=1.0; otherwise sample per-tick.
++        if prob < 1.0:
++            try:
++                if float(np.random.rand()) >= prob:
++                    return nb
++            except Exception:
++                return nb
++
++        keep_last_env = os.getenv("DP_MASK_EGO_HISTORY_KEEP_LAST", "").strip()
++        if keep_last_env:
++            keep_last = keep_last_env not in ("0", "false", "False", "no", "No")
++        else:
++            keep_last = bool(getattr(self, "_mask_ego_history_keep_last", True))
++
++        out = nb.copy()
++        if keep_last and out.shape[1] >= 1:
++            last = out[0, -1:, :].copy()
++            out[0, :, :] = 0.0
++            out[0, -1:, :] = last
++        else:
++            out[0, :, :] = 0.0
++        return out
++
+     def _get_feature_conn(self) -> sqlite3.Connection:
+         if self._feature_conn is None:
+             db_path = getattr(self._scenario, "_log_file", None)
+@@ -764,99 +1338,187 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+         if not ego_states:
+             raise RuntimeError("PlannerInput.history.ego_states is empty")
+ 
+-        ego_current_state, ego_past, cur_ego = _build_ego_runtime_features(ego_states, history_len=int(cfg.time_len))
+         timestamp_us = int(getattr(ego_states[-1], "time_us", getattr(current_input.iteration, "time_us", -1)))
+         if timestamp_us < 0:
+             raise RuntimeError("Unable to determine runtime timestamp from ego history or iteration")
+ 
+-        traffic_light_data = _traffic_lights_from_planner_input(current_input)
+-        if not traffic_light_data:
+-            map_name = getattr(self._map_api, "map_name", None) or getattr(self._map_api, "_map_name", None)
+-            traffic_light_data = get_traffic_lights_at_timestamp(self._get_feature_conn(), timestamp_us, map_name)
++        # Keep an ego_past tensor for legacy shape checks (paper model doesn't consume it directly).
++        ego_current_state, ego_past, cur_ego = _build_ego_runtime_features(ego_states, history_len=int(cfg.time_len))
++        feature_local_frame = FeatureLocalFrame(
++            x=float(cur_ego.x),
++            y=float(cur_ego.y),
++            heading=float(cur_ego.heading),
++            source="runtime_sim",
++            convention="rear_axle",
++        )
++        self._last_feature_local_frame_meta = {
++            "feature_local_frame_source": feature_local_frame.source,
++            "feature_local_frame": {
++                "x": float(feature_local_frame.x),
++                "y": float(feature_local_frame.y),
++                "heading": float(feature_local_frame.heading),
++            },
++            "feature_local_frame_convention": feature_local_frame.convention,
++        }
++        ego_neighbor_slot = _build_ego_neighbor_slot(ego_states, time_len=int(cfg.time_len))
+ 
+-        point = Point2D(cur_ego.x, cur_ego.y)
+-        route_ids = list(self._route_roadblock_ids) if self._route_roadblock_ids else []
++        # Strict alignment path: use the same DB-driven extractor semantics as offline exports.
++        # This avoids silent train↔infer drift when feature logic evolves.
+         conn = self._get_feature_conn()
+ 
+-        lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
+-            point,
++        scen_token = None
++        # nuPlan scenarios expose `token` as bytes; keep best-effort.
++        try:
++            v = getattr(self._scenario, "token", None)
++            if v is not None:
++                scen_token = (v.hex() if isinstance(v, (bytes, bytearray)) else str(v))
++        except Exception:
++            scen_token = None
++
++        feats = extract_features_at_timestamp(
++            conn,
+             self._map_api,
+-            radius=100,
+-            max_lanes=int(cfg.lane_num),
+-            ego_heading=cur_ego.heading,
+-            traffic_light_data=traffic_light_data,
++            scenario_token_hex=scen_token,
++            timestamp_us=timestamp_us,
++            routing_mode="auto",
++            debug_log=self._runtime_debug,
++            local_frame=feature_local_frame,
++            ego_current_state_override=ego_current_state,
++            ego_past_override=ego_past,
++            ego_neighbor_past_override=ego_neighbor_slot,
+         )
+-        route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
+-            point,
+-            self._map_api,
+-            radius=150,
+-            max_route_lanes=int(cfg.route_num),
+-            ego_heading=cur_ego.heading,
+-            traffic_light_data=traffic_light_data,
+-            route_roadblock_ids=route_ids,
++
++        # Resize to match model config (exporter uses MAX_* constants; runtime model may differ).
++        def _fit(name: str, arr: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
++            a = np.asarray(arr)
++            if tuple(a.shape) == tuple(shape):
++                return a.astype(np.float32, copy=False) if a.dtype != np.float32 and a.dtype != np.bool_ else a
++            out = np.zeros(shape, dtype=(np.bool_ if a.dtype == np.bool_ else np.float32))
++            slices = tuple(slice(0, min(int(a.shape[i]), int(shape[i]))) for i in range(len(shape)))
++            out[slices] = a[slices]
++            return out
++
++        feats = dict(feats)
++        feats["ego_current_state"] = np.asarray(ego_current_state, dtype=np.float32)
++        feats["ego_past"] = np.asarray(ego_past, dtype=np.float32)
++        feats["ego_agent_future"] = _fit("ego_agent_future", feats["ego_agent_future"], (int(cfg.future_len), 3))
++        feats["neighbor_agents_past"] = _fit("neighbor_agents_past", feats["neighbor_agents_past"], (int(cfg.agent_num), int(cfg.time_len), 11))
++        if feats["neighbor_agents_past"].shape[0] > 0:
++            slot_len = min(int(feats["neighbor_agents_past"].shape[1]), int(ego_neighbor_slot.shape[0]))
++            feat_dim = min(int(feats["neighbor_agents_past"].shape[2]), int(ego_neighbor_slot.shape[1]))
++            feats["neighbor_agents_past"][0, :slot_len, :feat_dim] = ego_neighbor_slot[:slot_len, :feat_dim]
++        feats["neighbor_agents_past"] = self._maybe_mask_ego_history_runtime(feats["neighbor_agents_past"])
++        feats["neighbor_agents_future"] = _fit(
++            "neighbor_agents_future", feats["neighbor_agents_future"], (int(cfg.agent_num), int(cfg.future_len), 3)
+         )
+-        static_objects = extract_static_objects(conn, timestamp_us, cur_ego.x, cur_ego.y, cur_ego.heading)
++        feats["static_objects"] = _fit("static_objects", feats["static_objects"], (int(cfg.static_objects_num), int(cfg.static_objects_state_dim)))
++        feats["lanes"] = _fit("lanes", feats["lanes"], (int(cfg.lane_num), int(cfg.lane_len), 12))
++        feats["lanes_avails"] = _fit("lanes_avails", feats["lanes_avails"], (int(cfg.lane_num), int(cfg.lane_len)))
++        feats["route_lanes"] = _fit("route_lanes", feats["route_lanes"], (int(cfg.route_num), int(cfg.lane_len), 12))
++        feats["route_lanes_avails"] = _fit("route_lanes_avails", feats["route_lanes_avails"], (int(cfg.route_num), int(cfg.lane_len)))
++        feats["lanes_speed_limit"] = _fit("lanes_speed_limit", feats["lanes_speed_limit"], (int(cfg.lane_num),))
++        feats["lanes_has_speed_limit"] = _fit("lanes_has_speed_limit", feats["lanes_has_speed_limit"], (int(cfg.lane_num),))
++        feats["route_lanes_speed_limit"] = _fit("route_lanes_speed_limit", feats["route_lanes_speed_limit"], (int(cfg.route_num),))
++        feats["route_lanes_has_speed_limit"] = _fit("route_lanes_has_speed_limit", feats["route_lanes_has_speed_limit"], (int(cfg.route_num),))
++
++        # Optional: dump features for offline diffing against exporter outputs.
++        # This is the most reliable way to prove train↔infer semantic equivalence.
++        if self._feature_dump_dir and self._feature_dump_ticks < self._feature_dump_k:
++            try:
++                dump_dir = Path(self._feature_dump_dir)
++                dump_dir.mkdir(parents=True, exist_ok=True)
++
++                scen_token_meta, _ = self._scenario_token_and_log()
++
++                meta = {
++                    "scenario_token": scen_token_meta,
++                    "iteration_index": int(getattr(current_input.iteration, "index", -1)),
++                    "timestamp_us": int(timestamp_us),
++                    "db_path": str(getattr(self._scenario, "_log_file", "")),
++                    "map_name": getattr(self._map_api, "map_name", None) or getattr(self._map_api, "_map_name", None),
++                }
++                meta.update(self._last_feature_local_frame_meta or {})
++
++                # Extra debug metadata to diagnose "backwards" outputs:
++                # compare heading used by DB-driven extractor vs heading from runtime EgoState.
++                try:
++                    import math
+ 
+-        # Neighbor history is a major train-vs-infer sensitivity.
+-        # Prefer the offline DB extractor for neighbor tracks (selection + ordering + density), but
+-        # always overwrite slot 0 with *sim-anchored* ego history to avoid PR37-style expert anchoring.
+-        ego_slot0 = _build_ego_neighbor_slot(ego_states, time_len=int(cfg.time_len))
++                    def _wrap_pi(a: float) -> float:
++                        a = (a + math.pi) % (2 * math.pi) - math.pi
++                        return float(a)
+ 
+-        neighbor_agents_past = None
+-        try:
+-            db_neighbor_past, _ = extract_neighbor_agents(
+-                conn,
+-                timestamp_us,
+-                cur_ego.x,
+-                cur_ego.y,
+-                cur_ego.heading,
+-            )
+-            neighbor_agents_past = db_neighbor_past.astype(np.float32, copy=False)
+-        except Exception as e:
+-            if self._runtime_debug:
+-                try:
+-                    print(f"[DP_RUNTIME_DEBUG] extract_neighbor_agents(DB) failed, falling back to observation history: {e}")
++                    # runtime heading from nuPlan EgoState
++                    try:
++                        ego_hist = current_input.history.ego_states
++                        meta["heading_runtime"] = float(ego_hist[-1].rear_axle.heading)
++                    except Exception:
++                        meta["heading_runtime"] = None
++
++                    # db heading from ego_pose quaternion at/before the resolved lidar timestamp
++                    meta["heading_db"] = None
++                    try:
++                        from src.platform.nuplan.features.extract_single_frame import (
++                            get_lidar_token_at_or_before_timestamp,
++                            quaternion_to_heading,
++                        )
++
++                        cur = conn.cursor()
++                        # resolve lidar_ts within the scene from scenario token + timestamp
++                        lidar_tok_bytes, lidar_ts = get_lidar_token_at_or_before_timestamp(
++                            conn,
++                            timestamp_us=int(timestamp_us),
++                            scenario_token_hex=str(scen_token_meta),
++                        )
++                        # get scene->log_token
++                        cur.execute("SELECT scene_token FROM lidar_pc WHERE token=? LIMIT 1", (lidar_tok_bytes,))
++                        rr = cur.fetchone()
++                        if rr is not None:
++                            scene_tok = rr[0]
++                            cur.execute("SELECT log_token FROM scene WHERE token=? LIMIT 1", (scene_tok,))
++                            lr = cur.fetchone()
++                            if lr is not None and lr[0] is not None:
++                                log_tok = lr[0]
++                                cur.execute(
++                                    """
++                                    SELECT qw,qx,qy,qz
++                                    FROM ego_pose
++                                    WHERE log_token=? AND timestamp<=?
++                                    ORDER BY timestamp DESC
++                                    LIMIT 1
++                                    """,
++                                    (log_tok, int(lidar_ts)),
++                                )
++                                er = cur.fetchone()
++                                if er is not None:
++                                    qw, qx, qy, qz = float(er[0]), float(er[1]), float(er[2]), float(er[3])
++                                    meta["heading_db"] = float(quaternion_to_heading(qw, qx, qy, qz))
++                    except Exception:
++                        meta["heading_db"] = meta.get("heading_db")
++
++                    if meta.get("heading_db") is not None and meta.get("heading_runtime") is not None:
++                        meta["heading_db_minus_runtime"] = _wrap_pi(float(meta["heading_db"]) - float(meta["heading_runtime"]))
+                 except Exception:
+                     pass
+ 
+-        if neighbor_agents_past is None:
+-            neighbor_agents_past, _ = _build_neighbor_agents_past_from_history(
+-                history=history,
+-                cur_ego=cur_ego,
+-                predicted_neighbor_num=int(cfg.agent_num),
+-                time_len=int(cfg.time_len),
+-                runtime_debug=self._runtime_debug,
+-            )
+-
+-        # Ensure shape + slot0 semantics
+-        Pn = int(cfg.agent_num)
+-        V = int(cfg.time_len)
+-        if tuple(neighbor_agents_past.shape) != (Pn, V, 11):
+-            fixed = np.zeros((Pn, V, 11), dtype=np.float32)
+-            p = min(Pn, int(neighbor_agents_past.shape[0]))
+-            v = min(V, int(neighbor_agents_past.shape[1]))
+-            fixed[:p, :v] = neighbor_agents_past[:p, :v]
+-            neighbor_agents_past = fixed
+-
+-        if Pn > 0:
+-            neighbor_agents_past[0] = ego_slot0
+-
+-        feats = {
+-            "ego_current_state": ego_current_state.astype(np.float32, copy=False),
+-            "ego_past": ego_past.astype(np.float32, copy=False),
+-            "ego_agent_future": np.zeros((int(cfg.future_len), 3), dtype=np.float32),
+-            "neighbor_agents_past": neighbor_agents_past.astype(np.float32, copy=False),
+-            "neighbor_agents_future": np.zeros((int(cfg.agent_num), int(cfg.future_len), 3), dtype=np.float32),
+-            "static_objects": static_objects.astype(np.float32, copy=False),
+-            "lanes": lanes.astype(np.float32, copy=False),
+-            "lanes_avails": lanes_avails,
+-            "route_lanes": route_lanes.astype(np.float32, copy=False),
+-            "route_lanes_avails": route_lanes_avails,
+-            "lanes_speed_limit": lanes_speed_limit.astype(np.float32, copy=False),
+-            "lanes_has_speed_limit": lanes_has_speed_limit.astype(np.float32, copy=False),
+-            "route_lanes_speed_limit": route_lanes_speed_limit.astype(np.float32, copy=False),
+-            "route_lanes_has_speed_limit": route_lanes_has_speed_limit.astype(np.float32, copy=False),
+-        }
++                # Stable content hash to enable quick equality checks.
++                h = hashlib.sha1()
++                for k in sorted(feats.keys()):
++                    arr = np.asarray(feats[k])
++                    h.update(k.encode("utf-8"))
++                    h.update(str(arr.shape).encode("utf-8"))
++                    h.update(str(arr.dtype).encode("utf-8"))
++                    h.update(arr.tobytes())
++                meta["feature_sha1"] = h.hexdigest()
++
++                stem = f"tick{self._feature_dump_ticks:04d}_iter{meta['iteration_index']}_ts{meta['timestamp_us']}"
++                npz_path = dump_dir / f"{stem}.npz"
++                meta_path = dump_dir / f"{stem}.json"
++                np.savez_compressed(npz_path, **feats)
++                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
++            except Exception:
++                pass
++            self._feature_dump_ticks += 1
+ 
+         if self._feature_sanity_debug and self._feature_sanity_ticks < self._feature_sanity_k:
+             try:
+@@ -908,13 +1570,20 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+         cuda_states = torch.cuda.get_rng_state_all() if self._device == "cuda" and torch.cuda.is_available() else None
+         out: list[np.ndarray] = []
+         try:
+-            for i in range(int(num_samples)):
+-                seed = int(self._selector_seed_base) + int(self._selector_tick) * 1009 + int(i)
+-                torch.manual_seed(seed)
+-                if cuda_states is not None:
+-                    torch.cuda.manual_seed_all(seed)
+-                y = self._model.sample_trajectory(inputs, diffusion_steps=self._sampling_steps)
+-                out.append(y.detach().cpu().numpy().astype(np.float32))
++            n = int(num_samples)
++            if n <= 0:
++                return []
++
++            # Parallel/batched sampling: replicate conditioning to batch=N and sample once.
++            # This is significantly faster than N serial decoder runs.
++            seed = int(self._selector_seed_base) + int(self._selector_tick) * 1009
++            torch.manual_seed(seed)
++            if cuda_states is not None:
++                torch.cuda.manual_seed_all(seed)
++
++            trajs = self._model.sample_trajectories(inputs, num_samples=n, diffusion_steps=self._sampling_steps)  # [N,T,3]
++            arr = trajs.detach().cpu().numpy().astype(np.float32)
++            out = [arr[i] for i in range(arr.shape[0])]
+         finally:
+             torch.random.set_rng_state(cpu_state)
+             if cuda_states is not None:
+@@ -957,6 +1626,11 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+             rear_axle_to_center_dist=rear_axle_to_center,
+             dt=float(self._step_interval),
+             previous_selected_local=prev_local,
++            neighbor_agents_past=feats_np.get("neighbor_agents_past"),
++            static_objects=feats_np.get("static_objects"),
++            route_lanes=feats_np.get("route_lanes"),
++            route_lanes_avails=feats_np.get("route_lanes_avails"),
++            trace_meta=getattr(self, "_last_feature_local_frame_meta", None) or {},
+         )
+ 
+     def _select_candidate_trajectory(self, feats_np: dict[str, np.ndarray], ego_history: Deque[EgoState], candidates_local_xyh: list[np.ndarray]) -> np.ndarray:
+@@ -968,6 +1642,38 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+                 [CandidateTrajectory(local_xyh=np.asarray(c, dtype=np.float32)) for c in candidates_local_xyh],
+                 context,
+             )
++
++            # Optional: dump per-candidate diagnostics for analysis.
++            if self._selector_trace_jsonl:
++                try:
++                    if (not self._selector_trace_tick0_only) or int(self._selector_tick) == 0:
++                        import json
++
++                        route_sanity = route_feature_sanity(context.route_lanes, context.route_lanes_avails)
++                        route_projection = candidate_route_projection_summaries(candidates_local_xyh, context.route_centerlines_local)
++                        obstacle_proxies = candidate_obstacle_proxies(candidates_local_xyh, context)
++                        diversity = candidate_pairwise_diversity(candidates_local_xyh)
++                        payload = {
++                            "token": str(getattr(self._scenario, "token", "")),
++                            "log_name": str(getattr(self._scenario, "log_name", "")),
++                            "tick": int(self._selector_tick),
++                            "best_index": int(result.best_index),
++                            "survivor_indices": list(result.survivor_indices),
++                            "used_fallback": bool(result.used_fallback),
++                            "diagnostics": [d.__dict__ for d in result.diagnostics],
++                            "route_feature_sanity": _json_safe(route_sanity),
++                            "candidate_route_projection": _json_safe(route_projection),
++                            "candidate_obstacle_proxies": _json_safe(obstacle_proxies),
++                            "candidate_diversity": _json_safe(diversity),
++                            "candidate_mode_labels": _json_safe(diversity.get("candidate_mode_labels", [])),
++                            "local_frame_sanity": _json_safe(context.trace_meta),
++                        }
++                        Path(self._selector_trace_jsonl).parent.mkdir(parents=True, exist_ok=True)
++                        with open(self._selector_trace_jsonl, "a", encoding="utf-8") as f:
++                            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
++                except Exception:
++                    pass
++
+             chosen = np.asarray(candidates_local_xyh[result.best_index], dtype=np.float32)
+             if self._selector_debug:
+                 try:
+@@ -1001,6 +1707,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+         self._route_roadblock_ids = initialization.route_roadblock_ids
+         self._prev_selected_world_xyh = None
+         self._selector_tick = 0
++        self._closedloop_debug_tick = 0
+         self._init_done = True
+         return
+ 
+@@ -1022,6 +1729,8 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+             x_t = x_t.cuda(non_blocking=True)
+ 
+         neighbor_agents_past_nonzero_count: int = 0
++        feats_np_for_closedloop_debug: dict[str, np.ndarray] | None = None
++        candidates_local_for_closedloop_debug: list[np.ndarray] | None = None
+ 
+         if self._ckpt_kind == PaperDiffusionPlanner.CKPT_KIND:
+             # IMPORTANT: For paper checkpoints, the runtime conditioning MUST be semantically aligned
+@@ -1033,6 +1742,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+             cfg = self._model.config
+ 
+             feats_np = self._build_paper_runtime_features(current_input, cfg)
++            feats_np_for_closedloop_debug = feats_np
+             # Contract check in numpy space (high-signal schema drift detection).
+             maybe_check_feature_contract(feats_np, batched=False)
+ 
+@@ -1084,6 +1794,7 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+             selector_active = self._selector_enabled and self._selector_num_samples > 1 and not norm_dbg_should_print and not self._debug_sampler
+             if selector_active:
+                 candidates_local = self._sample_paper_candidates(inputs, self._selector_num_samples)
++                candidates_local_for_closedloop_debug = candidates_local
+                 y_np = self._select_candidate_trajectory(feats_np, ego_history, candidates_local)
+                 y = torch.from_numpy(y_np)
+             else:
+@@ -1202,6 +1913,22 @@ class DiffusionPlannerCkpt(AbstractPlanner):
+                 y = self._model(x_t)
+             y_np = y.squeeze(0).detach().cpu().numpy().astype(np.float32)
+ 
++        closedloop_debug_tick = int(getattr(self, "_closedloop_debug_tick", 0))
++        if self._closedloop_debug_tick_in_range(closedloop_debug_tick):
++            try:
++                selected_world_xyh = _local_xyh_to_world_xyh(y_np, _ego_kinematics(ego_history[-1]))
++                self._maybe_dump_closedloop_debug(
++                    current_input=current_input,
++                    tick=closedloop_debug_tick,
++                    selected_local_xyh=y_np,
++                    selected_world_xyh=selected_world_xyh,
++                    feats_np=feats_np_for_closedloop_debug,
++                    candidates_local_xyh=candidates_local_for_closedloop_debug,
++                )
++            except Exception:
++                pass
++        self._closedloop_debug_tick = closedloop_debug_tick + 1
++
+         # --- Trajectory debug (ego frame, before transform_predictions_to_states) ---
+         if self._traj_debug and (self._traj_debug_ticks < self._traj_debug_k):
+             try:
+diff --git a/src/platform/nuplan/planners/overrides.py b/src/platform/nuplan/planners/overrides.py
+index fc6f506..51c0397 100644
+--- a/src/platform/nuplan/planners/overrides.py
++++ b/src/platform/nuplan/planners/overrides.py
+@@ -31,6 +31,10 @@ def diffusion_planner_overrides(ckpt_path: Optional[str] = None, sampling_steps:
+         "planner.diffusion_planner._target_=src.platform.nuplan.planners.diffusion_planner_ckpt_planner.DiffusionPlannerCkpt"
+     )
+ 
++    # The vendor diffusion_planner config tries to load args_file from /workspace/checkpoints/args.json.
++    # Our ckpt-backed planner does not need it; set to null to avoid FileNotFoundError during Hydra instantiation.
++    args.append("planner.diffusion_planner.config=null")
++
+     if ckpt_path:
+         args.append(f"planner.diffusion_planner.ckpt_path={ckpt_path}")
+     if sampling_steps is not None:
+diff --git a/src/platform/nuplan/runners/simulation.py b/src/platform/nuplan/runners/simulation.py
+index a7e75f4..26e31e5 100644
+--- a/src/platform/nuplan/runners/simulation.py
++++ b/src/platform/nuplan/runners/simulation.py
+@@ -66,6 +66,7 @@ def write_scenario_filter_yaml_for_tokens(
+     *,
+     scenario_tokens: Sequence[str],
+     config_file: str = DEFAULT_SCENARIO_FILTER_CONFIG_FILE,
++    remove_invalid_goals: bool = False,
+ ) -> None:
+     ensure_parent_dir(config_file)
+     tokens_yaml = "\n".join([f"  - '{t}'" for t in scenario_tokens])
+@@ -73,6 +74,7 @@ def write_scenario_filter_yaml_for_tokens(
+     # If all selected tokens share the same scenario_type, leaving this at 1 will truncate
+     # to a single scenario. Use a high enough limit to keep all provided tokens.
+     n = int(len(scenario_tokens))
++    remove_invalid_goals_yaml = "true" if bool(remove_invalid_goals) else "false"
+     Path(config_file).write_text(
+         """_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+ scenario_types: null
+@@ -90,7 +92,9 @@ limit_total_scenarios: """
+ timestamp_threshold_s: null
+ ego_displacement_minimum_m: null
+ expand_scenarios: false
+-remove_invalid_goals: true
++remove_invalid_goals: """
++        + remove_invalid_goals_yaml
++        + """
+ shuffle: false
+ """,
+         encoding="utf-8",
+diff --git a/src/platform/nuplan/trajectory_selector/scorers.py b/src/platform/nuplan/trajectory_selector/scorers.py
+index d3985df..d76d0e7 100644
+--- a/src/platform/nuplan/trajectory_selector/scorers.py
++++ b/src/platform/nuplan/trajectory_selector/scorers.py
+@@ -134,3 +134,317 @@ def smoothness_cost(local_xyh: np.ndarray, *, upto: int | None = None) -> float:
+     xy = local_xyh[:n, :2]
+     dd = xy[2:] - 2.0 * xy[1:-1] + xy[:-2]
+     return float(np.mean(np.linalg.norm(dd, axis=1)))
++
++
++def candidate_pairwise_diversity(candidates_local_xyh: list[np.ndarray]) -> dict[str, object]:
++    candidates = [np.asarray(candidate, dtype=np.float64) for candidate in candidates_local_xyh]
++    num_candidates = len(candidates)
++    mode_rms_threshold_m = 1.0
++    mode_final_l2_threshold_m = 2.0
++    per_candidate_nn_rms = np.zeros((num_candidates,), dtype=np.float64)
++    per_candidate_mean_rms = np.zeros((num_candidates,), dtype=np.float64)
++    per_candidate_nn_final = np.zeros((num_candidates,), dtype=np.float64)
++    per_candidate_mean_final = np.zeros((num_candidates,), dtype=np.float64)
++    if num_candidates <= 1:
++        return {
++            "num_candidates": int(num_candidates),
++            "pairwise_rms_min_m": 0.0,
++            "pairwise_rms_mean_m": 0.0,
++            "pairwise_rms_max_m": 0.0,
++            "trajectory_spread": 0.0,
++            "pairwise_final_l2_min_m": 0.0,
++            "pairwise_final_l2_mean_m": 0.0,
++            "pairwise_final_l2_max_m": 0.0,
++            "endpoint_spread": 0.0,
++            "per_candidate_nn_rms_xy_m": per_candidate_nn_rms,
++            "per_candidate_mean_rms_xy_m": per_candidate_mean_rms,
++            "per_candidate_nn_final_l2_m": per_candidate_nn_final,
++            "per_candidate_mean_final_l2_m": per_candidate_mean_final,
++            "effective_modes": int(num_candidates),
++            "mode_entropy": 0.0,
++            "candidate_mode_labels": list(range(num_candidates)),
++            "mode_rms_threshold_m": mode_rms_threshold_m,
++            "mode_final_l2_threshold_m": mode_final_l2_threshold_m,
++        }
++
++    pairwise_rms = np.full((num_candidates, num_candidates), np.inf, dtype=np.float64)
++    pairwise_final = np.full((num_candidates, num_candidates), np.inf, dtype=np.float64)
++    for first_index in range(num_candidates):
++        first_candidate = candidates[first_index]
++        for second_index in range(first_index + 1, num_candidates):
++            second_candidate = candidates[second_index]
++            shared_steps = min(len(first_candidate), len(second_candidate))
++            if shared_steps <= 0:
++                continue
++            deltas = first_candidate[:shared_steps, :2] - second_candidate[:shared_steps, :2]
++            rms = float(np.sqrt(np.mean(np.sum(deltas * deltas, axis=1))))
++            final_l2 = float(np.linalg.norm(first_candidate[shared_steps - 1, :2] - second_candidate[shared_steps - 1, :2]))
++            pairwise_rms[first_index, second_index] = rms
++            pairwise_rms[second_index, first_index] = rms
++            pairwise_final[first_index, second_index] = final_l2
++            pairwise_final[second_index, first_index] = final_l2
++
++    finite_rms = pairwise_rms[np.isfinite(pairwise_rms)]
++    finite_final = pairwise_final[np.isfinite(pairwise_final)]
++    for candidate_index in range(num_candidates):
++        rms_values = pairwise_rms[candidate_index, np.isfinite(pairwise_rms[candidate_index])]
++        final_values = pairwise_final[candidate_index, np.isfinite(pairwise_final[candidate_index])]
++        per_candidate_nn_rms[candidate_index] = float(np.min(rms_values)) if len(rms_values) else 0.0
++        per_candidate_mean_rms[candidate_index] = float(np.mean(rms_values)) if len(rms_values) else 0.0
++        per_candidate_nn_final[candidate_index] = float(np.min(final_values)) if len(final_values) else 0.0
++        per_candidate_mean_final[candidate_index] = float(np.mean(final_values)) if len(final_values) else 0.0
++
++    parents = list(range(num_candidates))
++
++    def find(index: int) -> int:
++        while parents[index] != index:
++            parents[index] = parents[parents[index]]
++            index = parents[index]
++        return index
++
++    def union(first_index: int, second_index: int) -> None:
++        first_root = find(first_index)
++        second_root = find(second_index)
++        if first_root != second_root:
++            parents[second_root] = first_root
++
++    for first_index in range(num_candidates):
++        for second_index in range(first_index + 1, num_candidates):
++            if (
++                pairwise_rms[first_index, second_index] <= mode_rms_threshold_m
++                and pairwise_final[first_index, second_index] <= mode_final_l2_threshold_m
++            ):
++                union(first_index, second_index)
++
++    root_to_label: dict[int, int] = {}
++    mode_labels: list[int] = []
++    for candidate_index in range(num_candidates):
++        root = find(candidate_index)
++        if root not in root_to_label:
++            root_to_label[root] = len(root_to_label)
++        mode_labels.append(root_to_label[root])
++    mode_counts = np.bincount(np.asarray(mode_labels, dtype=np.int64), minlength=len(root_to_label)).astype(np.float64)
++    mode_probs = mode_counts / float(max(1, num_candidates))
++    mode_entropy = float(-np.sum(mode_probs * np.log(np.maximum(mode_probs, 1e-12))))
++
++    trajectory_spread = float(np.mean(finite_rms)) if len(finite_rms) else 0.0
++    endpoint_spread = float(np.mean(finite_final)) if len(finite_final) else 0.0
++
++    return {
++        "num_candidates": int(num_candidates),
++        "pairwise_rms_min_m": float(np.min(finite_rms)) if len(finite_rms) else 0.0,
++        "pairwise_rms_mean_m": trajectory_spread,
++        "pairwise_rms_max_m": float(np.max(finite_rms)) if len(finite_rms) else 0.0,
++        "trajectory_spread": trajectory_spread,
++        "pairwise_final_l2_min_m": float(np.min(finite_final)) if len(finite_final) else 0.0,
++        "pairwise_final_l2_mean_m": endpoint_spread,
++        "pairwise_final_l2_max_m": float(np.max(finite_final)) if len(finite_final) else 0.0,
++        "endpoint_spread": endpoint_spread,
++        "per_candidate_nn_rms_xy_m": per_candidate_nn_rms,
++        "per_candidate_mean_rms_xy_m": per_candidate_mean_rms,
++        "per_candidate_nn_final_l2_m": per_candidate_nn_final,
++        "per_candidate_mean_final_l2_m": per_candidate_mean_final,
++        "effective_modes": int(len(root_to_label)),
++        "mode_entropy": mode_entropy,
++        "candidate_mode_labels": mode_labels,
++        "mode_rms_threshold_m": mode_rms_threshold_m,
++        "mode_final_l2_threshold_m": mode_final_l2_threshold_m,
++    }
++
++
++def route_feature_sanity(route_lanes: np.ndarray | None, route_lanes_avails: np.ndarray | None) -> dict[str, object]:
++    if route_lanes is None or route_lanes_avails is None:
++        return {
++            "route_lane_count": 0,
++            "route_avail_points": 0,
++            "route_points_finite": True,
++            "route_first_point_norm_m": math.inf,
++            "route_last_point_norm_m": math.inf,
++            "route_local_min_xy": np.zeros((2,), dtype=np.float64),
++            "route_local_max_xy": np.zeros((2,), dtype=np.float64),
++        }
++    lanes = np.asarray(route_lanes, dtype=np.float64)
++    avails = np.asarray(route_lanes_avails)
++    if lanes.ndim < 3 or lanes.shape[-1] < 2 or avails.ndim < 2:
++        return {
++            "route_lane_count": 0,
++            "route_avail_points": 0,
++            "route_points_finite": False,
++            "route_first_point_norm_m": math.inf,
++            "route_last_point_norm_m": math.inf,
++            "route_local_min_xy": np.zeros((2,), dtype=np.float64),
++            "route_local_max_xy": np.zeros((2,), dtype=np.float64),
++        }
++
++    valid_mask = avails > 0
++    lane_valid_mask = np.any(valid_mask, axis=1)
++    points = lanes[:, :, :2][valid_mask]
++    if len(points) == 0:
++        return {
++            "route_lane_count": int(np.count_nonzero(lane_valid_mask)),
++            "route_avail_points": 0,
++            "route_points_finite": True,
++            "route_first_point_norm_m": math.inf,
++            "route_last_point_norm_m": math.inf,
++            "route_local_min_xy": np.zeros((2,), dtype=np.float64),
++            "route_local_max_xy": np.zeros((2,), dtype=np.float64),
++        }
++
++    return {
++        "route_lane_count": int(np.count_nonzero(lane_valid_mask)),
++        "route_avail_points": int(np.count_nonzero(valid_mask)),
++        "route_points_finite": bool(np.all(np.isfinite(points))),
++        "route_first_point_norm_m": float(np.linalg.norm(points[0])),
++        "route_last_point_norm_m": float(np.linalg.norm(points[-1])),
++        "route_local_min_xy": np.min(points, axis=0),
++        "route_local_max_xy": np.max(points, axis=0),
++    }
++
++
++def candidate_route_projection_summaries(candidates_local_xyh: list[np.ndarray], route_centerlines_local: list[np.ndarray]) -> dict[str, object]:
++    candidates = [np.asarray(candidate, dtype=np.float64) for candidate in candidates_local_xyh]
++    num_candidates = len(candidates)
++    min_lateral = np.full((num_candidates,), np.inf, dtype=np.float64)
++    final_lateral = np.full((num_candidates,), np.inf, dtype=np.float64)
++    max_lateral = np.full((num_candidates,), np.inf, dtype=np.float64)
++    final_progress = np.zeros((num_candidates,), dtype=np.float64)
++    remaining_to_end = np.full((num_candidates,), np.inf, dtype=np.float64)
++    beyond_end = np.zeros((num_candidates,), dtype=bool)
++    projection_finite = np.zeros((num_candidates,), dtype=bool)
++
++    route_points, route_progress = _flatten_route(route_centerlines_local)
++    route_end_progress = float(route_progress[-1]) if len(route_progress) else 0.0
++    route_end_point = route_points[-1] if len(route_points) else None
++    route_end_tangent = np.zeros((2,), dtype=np.float64)
++    if len(route_points) >= 2:
++        route_end_tangent = route_points[-1] - route_points[-2]
++        norm = float(np.linalg.norm(route_end_tangent))
++        if norm > 1e-6:
++            route_end_tangent = route_end_tangent / norm
++
++    for candidate_index, candidate in enumerate(candidates):
++        if len(candidate) == 0:
++            continue
++        nearest_dist, candidate_progress, _ = project_to_route(candidate[:, :2], route_centerlines_local)
++        finite_mask = np.isfinite(nearest_dist)
++        projection_finite[candidate_index] = bool(np.all(finite_mask) and len(nearest_dist) > 0)
++        if len(nearest_dist) == 0 or not np.any(finite_mask):
++            continue
++        finite_dist = nearest_dist[finite_mask]
++        min_lateral[candidate_index] = float(np.min(finite_dist))
++        max_lateral[candidate_index] = float(np.max(finite_dist))
++        final_lateral[candidate_index] = float(nearest_dist[-1])
++        final_progress[candidate_index] = float(candidate_progress[-1]) if len(candidate_progress) else 0.0
++        remaining_to_end[candidate_index] = max(0.0, route_end_progress - final_progress[candidate_index])
++        if route_end_point is not None and np.any(route_end_tangent):
++            beyond_amount = float(np.dot(candidate[-1, :2] - route_end_point, route_end_tangent))
++            beyond_end[candidate_index] = bool(beyond_amount > 0.5 and final_progress[candidate_index] >= route_end_progress - 1e-6)
++
++    return {
++        "num_candidates": int(num_candidates),
++        "min_lateral_error_m": min_lateral,
++        "final_lateral_error_m": final_lateral,
++        "max_lateral_error_m": max_lateral,
++        "final_progress_m": final_progress,
++        "remaining_to_route_end_m": remaining_to_end,
++        "beyond_route_end": beyond_end,
++        "projection_finite": projection_finite,
++    }
++
++
++def candidate_obstacle_proxies(candidates_local_xyh: list[np.ndarray], context: SelectionContext) -> dict[str, object]:
++    candidates = [np.asarray(candidate, dtype=np.float64) for candidate in candidates_local_xyh]
++    num_candidates = len(candidates)
++    min_dynamic_clearance = np.full((num_candidates,), math.inf, dtype=np.float64)
++    min_static_clearance = np.full((num_candidates,), math.inf, dtype=np.float64)
++    min_clearance_step = np.full((num_candidates,), -1, dtype=np.int64)
++    has_negative_clearance = np.zeros((num_candidates,), dtype=bool)
++    proxy_collision = np.zeros((num_candidates,), dtype=bool)
++    proxy_first_collision_step = np.full((num_candidates,), -1, dtype=np.int64)
++    proxy_ttc_s = np.full((num_candidates,), math.inf, dtype=np.float64)
++    min_ttc_clearance = np.full((num_candidates,), math.inf, dtype=np.float64)
++
++    ego_radius = float(math.hypot(float(context.vehicle_half_length), float(context.vehicle_half_width)))
++    dynamic_xy, dynamic_velocity, dynamic_radius = _dynamic_obstacle_state(getattr(context, "neighbor_agents_past", None))
++    static_xy, static_radius = _static_obstacle_state(getattr(context, "static_objects", None))
++
++    for candidate_index, candidate in enumerate(candidates):
++        if len(candidate) == 0:
++            continue
++        candidate_xy = candidate[:, :2]
++        clearance_series: list[np.ndarray] = []
++        if len(dynamic_xy):
++            times = np.arange(len(candidate_xy), dtype=np.float64) * float(context.dt)
++            obstacle_xy = dynamic_xy[None, :, :] + times[:, None, None] * dynamic_velocity[None, :, :]
++            distances = np.linalg.norm(candidate_xy[:, None, :] - obstacle_xy, axis=-1)
++            dynamic_clearance = distances - ego_radius - dynamic_radius[None, :]
++            clearance_series.append(dynamic_clearance)
++            min_dynamic_clearance[candidate_index] = float(np.min(dynamic_clearance))
++        if len(static_xy):
++            distances = np.linalg.norm(candidate_xy[:, None, :] - static_xy[None, :, :], axis=-1)
++            static_clearance = distances - ego_radius - static_radius[None, :]
++            clearance_series.append(static_clearance)
++            min_static_clearance[candidate_index] = float(np.min(static_clearance))
++        if not clearance_series:
++            continue
++        all_clearance = np.concatenate(clearance_series, axis=1)
++        per_step_min = np.min(all_clearance, axis=1)
++        min_step = int(np.argmin(per_step_min))
++        min_clearance_step[candidate_index] = min_step
++        min_ttc_clearance[candidate_index] = float(per_step_min[min_step])
++        has_negative_clearance[candidate_index] = bool(np.any(per_step_min < 0.0))
++        proxy_collision[candidate_index] = bool(has_negative_clearance[candidate_index])
++        if proxy_collision[candidate_index]:
++            first_collision = int(np.argmax(per_step_min < 0.0))
++            proxy_first_collision_step[candidate_index] = first_collision
++            proxy_ttc_s[candidate_index] = float(first_collision) * float(context.dt)
++
++    return {
++        "num_candidates": int(num_candidates),
++        "dynamic_agent_count": int(len(dynamic_xy)),
++        "static_object_count": int(len(static_xy)),
++        "min_dynamic_clearance_m": min_dynamic_clearance,
++        "min_static_clearance_m": min_static_clearance,
++        "min_clearance_step": min_clearance_step,
++        "has_negative_clearance": has_negative_clearance,
++        "proxy_collision": proxy_collision,
++        "proxy_first_collision_step": proxy_first_collision_step,
++        "proxy_ttc_s": proxy_ttc_s,
++        "min_ttc_clearance_m": min_ttc_clearance,
++    }
++
++
++def _dynamic_obstacle_state(neighbor_agents_past: np.ndarray | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    if neighbor_agents_past is None:
++        return np.zeros((0, 2), dtype=np.float64), np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
++    agents = np.asarray(neighbor_agents_past, dtype=np.float64)
++    if agents.ndim != 3 or agents.shape[0] <= 1 or agents.shape[2] < 11:
++        return np.zeros((0, 2), dtype=np.float64), np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
++    current = agents[1:, -1, :]
++    valid = current[:, 10] > 0.5
++    current = current[valid]
++    if len(current) == 0:
++        return np.zeros((0, 2), dtype=np.float64), np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
++    obstacle_xy = current[:, :2]
++    obstacle_velocity = current[:, 4:6]
++    widths = np.maximum(current[:, 8], 0.1)
++    lengths = np.maximum(current[:, 9], 0.1)
++    obstacle_radius = 0.5 * np.sqrt(widths * widths + lengths * lengths)
++    return obstacle_xy, obstacle_velocity, obstacle_radius
++
++
++def _static_obstacle_state(static_objects: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
++    if static_objects is None:
++        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
++    objects = np.asarray(static_objects, dtype=np.float64)
++    if objects.ndim != 2 or objects.shape[1] < 10:
++        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
++    valid = objects[:, 9] > 0.5
++    objects = objects[valid]
++    if len(objects) == 0:
++        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
++    object_xy = objects[:, :2]
++    widths = np.maximum(objects[:, 3], 0.1)
++    lengths = np.maximum(objects[:, 4], 0.1)
++    object_radius = 0.5 * np.sqrt(widths * widths + lengths * lengths)
++    return object_xy, object_radius
+diff --git a/src/platform/nuplan/trajectory_selector/types.py b/src/platform/nuplan/trajectory_selector/types.py
+index 7d472bd..132af02 100644
+--- a/src/platform/nuplan/trajectory_selector/types.py
++++ b/src/platform/nuplan/trajectory_selector/types.py
+@@ -37,6 +37,11 @@ class SelectionContext:
+     rear_axle_to_center_dist: float = 0.0
+     dt: float = 0.1
+     previous_selected_local: np.ndarray | None = None
++    neighbor_agents_past: np.ndarray | None = None
++    static_objects: np.ndarray | None = None
++    route_lanes: np.ndarray | None = None
++    route_lanes_avails: np.ndarray | None = None
++    trace_meta: Mapping[str, Any] = field(default_factory=dict)
+ 
+ 
+ @dataclass
+diff --git a/src/platform/viz/npz_viz.py b/src/platform/viz/npz_viz.py
+index e8f65c2..5a35be6 100644
+--- a/src/platform/viz/npz_viz.py
++++ b/src/platform/viz/npz_viz.py
+@@ -609,22 +609,12 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
+             ax.plot(end_x, end_y, "*", markersize=12, color="green", markeredgecolor="darkgreen", markeredgewidth=1)
+ 
+     # ========== 5. Neighbor agents with box visualization ==========
++    # New export contract: neighbor_agents_past[..., 8:11] = [width, length, valid].
+     for agent_idx in range(neighbor_past.shape[0]):
+-        type_v = neighbor_past[agent_idx, -1, 8]
+-        type_p = neighbor_past[agent_idx, -1, 9]
+-        type_b = neighbor_past[agent_idx, -1, 10]
+-
+-        if type_v > 0.5:
+-            agent_type = "Vehicle"
+-            color = "blue"
+-        elif type_p > 0.5:
+-            agent_type = "Pedestrian"
+-            color = "orange"
+-        elif type_b > 0.5:
+-            agent_type = "Bicycle"
+-            color = "purple"
+-        else:
++        if neighbor_past.shape[-1] >= 11 and float(neighbor_past[agent_idx, -1, 10]) < 0.5:
+             continue
++        agent_type = "Vehicle"
++        color = "blue"
+ 
+         curr_x = neighbor_past[agent_idx, -1, 0]
+         curr_y = neighbor_past[agent_idx, -1, 1]
+@@ -634,8 +624,8 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
+         if abs(curr_x) > 50 or abs(curr_y) > 50:
+             continue
+ 
+-        width = neighbor_past[agent_idx, -1, 6]
+-        length = neighbor_past[agent_idx, -1, 7]
++        width = neighbor_past[agent_idx, -1, 8] if neighbor_past.shape[-1] >= 9 else 2.0
++        length = neighbor_past[agent_idx, -1, 9] if neighbor_past.shape[-1] >= 10 else 4.0
+ 
+         cos_h = neighbor_past[agent_idx, -1, 2]
+         sin_h = neighbor_past[agent_idx, -1, 3]
+@@ -677,32 +667,51 @@ def visualize_npz(npz_path: str | Path, output_path: Optional[str | Path] = None
+             )
+             ax.add_patch(diamond)
+ 
+-    # ========== 6. Static objects ==========
++    # ========== 6. Static objects / obstacles ==========
++    # New export contract: static_objects[..., :10] = [x,y,z,width,length,height,yaw,*,*,valid].
+     static_objs = _squeeze1(data.get("static_objects")) if ("static_objects" in data.files) else None
+     if static_objs is not None and len(static_objs) > 0:
+         for obj_idx in range(static_objs.shape[0]):
+             x, y = static_objs[obj_idx, 0], static_objs[obj_idx, 1]
++            if static_objs.shape[-1] >= 10 and float(static_objs[obj_idx, 9]) < 0.5:
++                continue
+             if float(x) == 0.0 and float(y) == 0.0:
+                 continue
+             if abs(x) > 50 or abs(y) > 50:
+                 continue
+-            ax.plot(x, y, color="red", marker="^", markersize=20, alpha=0.7)
++            width = float(static_objs[obj_idx, 3]) if static_objs.shape[-1] >= 4 else 2.0
++            length = float(static_objs[obj_idx, 4]) if static_objs.shape[-1] >= 5 else 4.0
++            yaw = float(static_objs[obj_idx, 6]) if static_objs.shape[-1] >= 7 else 0.0
++            if not np.isfinite(width) or abs(width) < 1e-3:
++                width = 2.0
++            if not np.isfinite(length) or abs(length) < 1e-3:
++                length = 4.0
++            if not np.isfinite(yaw):
++                yaw = 0.0
+ 
+-            if show_static_yaw and static_objs.shape[-1] >= 7:
+-                try:
+-                    yaw = float(static_objs[obj_idx, 6])
+-                    if np.isfinite(yaw):
+-                        dx = math.cos(yaw)
+-                        dy = math.sin(yaw)
+-                        L = 5.0
+-                        ax.annotate(
+-                            "",
+-                            xy=(float(x + L * dx), float(y + L * dy)),
+-                            xytext=(float(x), float(y)),
+-                            arrowprops=dict(arrowstyle="->", color="#222222", lw=1.8, alpha=0.85),
+-                        )
+-                except Exception:
+-                    pass
++            rect = patches.Rectangle(
++                (float(x) - length / 2, float(y) - width / 2),
++                length,
++                width,
++                facecolor="red",
++                edgecolor="black",
++                linewidth=1.0,
++                alpha=0.45,
++            )
++            rect.set_transform(transforms.Affine2D().rotate_around(float(x), float(y), yaw) + ax.transData)
++            ax.add_patch(rect)
++            ax.plot(x, y, color="red", marker="^", markersize=10, alpha=0.9)
++
++            if show_static_yaw:
++                dx = math.cos(yaw)
++                dy = math.sin(yaw)
++                L = max(3.0, min(6.0, length))
++                ax.annotate(
++                    "",
++                    xy=(float(x + L * dx), float(y + L * dy)),
++                    xytext=(float(x), float(y)),
++                    arrowprops=dict(arrowstyle="->", color="#222222", lw=1.8, alpha=0.85),
++                )
+ 
+     _draw_legend_block(
+         ax,
+diff --git a/tests/test_trajectory_selector.py b/tests/test_trajectory_selector.py
+index fc4a3a9..fd42039 100644
+--- a/tests/test_trajectory_selector.py
++++ b/tests/test_trajectory_selector.py
+@@ -3,6 +3,12 @@ from __future__ import annotations
+ import numpy as np
+ 
+ from src.platform.nuplan.trajectory_selector import CandidateTrajectory, EgoPose2D, PrefixSelectorConfig, PrefixTrajectorySelector, SelectionContext
++from src.platform.nuplan.trajectory_selector.scorers import (
++    candidate_obstacle_proxies,
++    candidate_pairwise_diversity,
++    candidate_route_projection_summaries,
++    route_feature_sanity,
++)
+ 
+ 
+ def _straight_route(length: int = 80) -> list[np.ndarray]:
+@@ -99,3 +105,62 @@ def test_selector_fallback_picks_least_bad_candidate_when_all_rejected() -> None
+     assert result.best_index == 0
+     assert result.diagnostics[0].rejected is False
+     assert result.diagnostics[1].rejected is True
++
++
++def test_candidate_pairwise_diversity_summarizes_nearest_neighbor_spread() -> None:
++    base = _traj(0.0, n=3, x_end=2.0)
++    shifted = base.copy()
++    shifted[:, 1] = 1.0
++
++    summary = candidate_pairwise_diversity([base, shifted])
++
++    assert summary["num_candidates"] == 2
++    assert summary["pairwise_rms_min_m"] == 1.0
++    assert summary["pairwise_rms_mean_m"] == 1.0
++    assert summary["pairwise_rms_max_m"] == 1.0
++    np.testing.assert_allclose(summary["per_candidate_nn_rms_xy_m"], np.array([1.0, 1.0]))
++    np.testing.assert_allclose(summary["per_candidate_nn_final_l2_m"], np.array([1.0, 1.0]))
++
++
++def test_candidate_obstacle_proxies_detect_constant_velocity_collision() -> None:
++    candidate = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]], dtype=np.float32)
++    neighbor_agents_past = np.zeros((2, 1, 11), dtype=np.float32)
++    neighbor_agents_past[0, 0, 10] = 1.0
++    neighbor_agents_past[1, 0, 0] = 3.0
++    neighbor_agents_past[1, 0, 1] = 0.0
++    neighbor_agents_past[1, 0, 8] = 2.0
++    neighbor_agents_past[1, 0, 9] = 2.0
++    neighbor_agents_past[1, 0, 10] = 1.0
++    context = _context()
++    context.neighbor_agents_past = neighbor_agents_past
++    context.vehicle_half_length = 1.0
++    context.vehicle_half_width = 1.0
++    context.dt = 1.0
++
++    summary = candidate_obstacle_proxies([candidate], context)
++
++    assert summary["dynamic_agent_count"] == 1
++    assert bool(summary["proxy_collision"][0]) is True
++    assert int(summary["proxy_first_collision_step"][0]) == 1
++    assert summary["proxy_ttc_s"][0] == 1.0
++    assert summary["min_dynamic_clearance_m"][0] < 0.0
++
++
++def test_route_feature_sanity_and_candidate_projection_expose_route_end_state() -> None:
++    route_lanes = np.zeros((2, 3, 12), dtype=np.float32)
++    route_lanes_avails = np.zeros((2, 3), dtype=np.float32)
++    route_lanes[0, :, 0] = np.array([0.0, 5.0, 10.0], dtype=np.float32)
++    route_lanes_avails[0, :] = 1.0
++    candidate = np.array([[0.0, 0.0, 0.0], [5.0, 0.5, 0.0], [12.0, 0.0, 0.0]], dtype=np.float32)
++
++    sanity = route_feature_sanity(route_lanes, route_lanes_avails)
++    route = [route_lanes[0, :, :2]]
++    projection = candidate_route_projection_summaries([candidate], route)
++
++    assert sanity["route_lane_count"] == 1
++    assert sanity["route_avail_points"] == 3
++    assert sanity["route_points_finite"] is True
++    assert sanity["route_first_point_norm_m"] == 0.0
++    assert projection["final_lateral_error_m"][0] == 2.0
++    assert bool(projection["beyond_route_end"][0]) is True
++    assert projection["remaining_to_route_end_m"][0] == 0.0
