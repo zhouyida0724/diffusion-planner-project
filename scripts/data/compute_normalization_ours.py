@@ -210,8 +210,25 @@ def main() -> None:
                 ego_count += int(c)
 
         if fp_np.exists() and fp_nf.exists():
-            nb_cur = np.load(fp_np, mmap_mode="r")[:, :, -1, :4]  # [N,P,T,4] -> current [N,P,4]
+            nb_p = np.load(fp_np, mmap_mode="r")
+            nb_cur = nb_p[:, :, -1, :4]  # [N,P,T,4] -> current [N,P,4]
             nb_f = np.load(fp_nf, mmap_mode="r")  # [N,P,81,3] (often includes current)
+
+            # Our exporter stores ego history in neighbor_agents_past[0]. Exclude that ego-slot from
+            # neighbor normalization, matching training's predicted_neighbor_num detection.
+            try:
+                ego_cur4 = np.load(fp_ecs, mmap_mode="r")[:, :4] if fp_ecs.exists() else None
+                if ego_cur4 is not None:
+                    n_check = min(1024, int(nb_cur.shape[0]))
+                    slot0_is_ego = bool(np.allclose(np.asarray(nb_cur[:n_check, 0, :4]), np.asarray(ego_cur4[:n_check]), atol=1e-4, rtol=0.0))
+                else:
+                    slot0_is_ego = False
+            except Exception:
+                slot0_is_ego = False
+            if slot0_is_ego and nb_cur.shape[1] >= 2:
+                nb_cur = nb_cur[:, 1:, :]
+                nb_f = nb_f[:, 1:, ...]
+
             if nb_f.shape[-2] == 81:
                 nb_f = nb_f[..., 1:, :]
             nb_xy = nb_f[..., :2]

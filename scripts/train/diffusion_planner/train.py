@@ -271,6 +271,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fast-eval-boston-slices", type=str, nargs="+", default=None)
     p.add_argument("--fast-eval-pittsburgh-roots", type=str, nargs="+", default=None)
     p.add_argument("--fast-eval-vegas-roots", type=str, nargs="+", default=None)
+    p.add_argument("--fast-eval-singapore-roots", type=str, nargs="+", default=None)
 
     p.add_argument(
         "--max-samples",
@@ -388,7 +389,7 @@ def _build_balanced_subset_dataset(
 
 
 def _discover_slice_dirs(dataset_root: Path) -> list[Path]:
-    """Heuristic: treat a root as a dataset root if it contains slice subdirs with shards/.
+    """Heuristic: treat a root as a dataset root if it contains slice subdirs with shards.
 
     We only include slices that appear to contain at least one valid shard.
     """
@@ -398,12 +399,17 @@ def _discover_slice_dirs(dataset_root: Path) -> list[Path]:
 
     slice_dirs: list[Path] = []
     for p in sorted(dataset_root.iterdir()):
-        if not (p.is_dir() and (p / "shards").is_dir()):
+        if not p.is_dir():
             continue
 
-        shards_root = p / "shards"
+        # New materialized cache layout uses <root>/<slice>/shard_XXX/arrays/*.npy
+        # while older export roots may use <root>/<slice>/shards/shard_XXX/data.npz.
+        shards_root = p / "shards" if (p / "shards").is_dir() else p
         has_any = False
         for sd in shards_root.glob("shard_*"):
+            if (sd / "arrays").is_dir() and (sd / "manifest_kept.jsonl").is_file():
+                has_any = True
+                break
             if (sd / "data.npz").is_file() and (sd / "manifest.jsonl").is_file():
                 has_any = True
                 break
@@ -501,6 +507,7 @@ def main() -> None:
             _maybe_add_city("boston", args.fast_eval_boston_roots, args.fast_eval_boston_slices)
             _maybe_add_city("pittsburgh", args.fast_eval_pittsburgh_roots, None)
             _maybe_add_city("vegas", args.fast_eval_vegas_roots, None)
+            _maybe_add_city("singapore", args.fast_eval_singapore_roots, None)
 
             if fast_eval_loaders:
                 cities = ",".join(sorted(fast_eval_loaders.keys()))
@@ -658,10 +665,19 @@ def main() -> None:
         if future_len == 81:
             future_len = 80
 
+        # Our exporter stores ego history in neighbor_agents_past[0] as an ego-slot.
+        # Do not train it again as a predicted neighbor. Detect this from the first sample instead of
+        # relying on array length conventions (older code only excluded slot0 when P == predicted+1).
+        try:
+            slot0_is_ego = bool(torch.allclose(nb[0, -1, :4], s0["ego_current_state"][:4], atol=1e-4, rtol=0.0))
+        except Exception:
+            slot0_is_ego = False
+        predicted_neighbor_num = int(nb.shape[0] - 1) if slot0_is_ego else int(nb.shape[0])
+
         paper_cfg = PaperModelConfig(
             device=args.device,
-            agent_num=int(nb.shape[0]),
-            predicted_neighbor_num=int(nb.shape[0] - 1) if int(nb.shape[0]) > 32 else int(nb.shape[0]),
+            agent_num=int(1 + predicted_neighbor_num),
+            predicted_neighbor_num=predicted_neighbor_num,
             time_len=int(nb.shape[1]),
             static_objects_num=int(st.shape[0]),
             lane_num=int(ln.shape[0]),
