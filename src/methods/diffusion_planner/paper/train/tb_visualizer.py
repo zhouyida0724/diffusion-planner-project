@@ -129,8 +129,30 @@ def render_npz_style_scene(
     dpi = max(80, int(image_size / 10))
     fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
     try:
-        ax.set_xlim(-50, 50)
-        ax.set_ylim(-50, 50)
+        # IMPORTANT: do not hard-crop the view.
+        # A fixed +/-50m window can make very-bad long-horizon predictions look "ok".
+        # We auto-scale based on GT/pred extents (with a minimum of 50m for context).
+        pts = []
+        try:
+            if ego_future is not None and ego_future.shape[1] >= 2:
+                pts.append(np.asarray(ego_future[:, :2], dtype=np.float32))
+        except Exception:
+            pass
+        try:
+            if ego_future_xy is not None:
+                pxy = _to_numpy(ego_future_xy)
+                if pxy is not None and pxy.ndim == 2 and pxy.shape[1] >= 2:
+                    pts.append(np.asarray(pxy[:, :2], dtype=np.float32))
+        except Exception:
+            pass
+        if pts:
+            all_xy = np.concatenate(pts, axis=0)
+            r = float(np.nanmax(np.abs(all_xy)))
+            lim = max(50.0, r + 10.0)
+        else:
+            lim = 50.0
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
         ax.set_facecolor("white")
         ax.set_aspect("equal")
         ax.set_xlabel("X (m)")
@@ -226,9 +248,10 @@ def render_npz_style_scene(
                 except Exception:
                     continue
 
-        # Neighbor past trajectories (more visible, with ids)
+        # Neighbor past trajectories (more visible, with ids).
+        # Slot0 is ego history in the new export contract; do not render it as a neighbor/context agent.
         agent_id = 0
-        for agent_idx in range(neighbor_past.shape[0]):
+        for agent_idx in range(1, neighbor_past.shape[0]):
             curr_x = float(neighbor_past[agent_idx, -1, 0])
             curr_y = float(neighbor_past[agent_idx, -1, 1])
             past = neighbor_past[agent_idx, :, :2]
@@ -247,26 +270,14 @@ def render_npz_style_scene(
             # Bounding box visualization (match npz_viz conventions)
             try:
                 if neighbor_past.shape[-1] >= 11:
-                    # types
-                    type_v = float(neighbor_past[agent_idx, -1, 8])
-                    type_p = float(neighbor_past[agent_idx, -1, 9])
-                    type_b = float(neighbor_past[agent_idx, -1, 10])
+                    # New export contract: [x,y,cos,sin,vx,vy,ax,ay,width,length,valid].
+                    if float(neighbor_past[agent_idx, -1, 10]) < 0.5:
+                        continue
+                    agent_type = "Vehicle"
+                    color = "blue"
 
-                    if type_v > 0.5:
-                        agent_type = "Vehicle"
-                        color = "blue"
-                    elif type_p > 0.5:
-                        agent_type = "Pedestrian"
-                        color = "orange"
-                    elif type_b > 0.5:
-                        agent_type = "Bicycle"
-                        color = "purple"
-                    else:
-                        agent_type = None
-                        color = "cyan"
-
-                    width = float(neighbor_past[agent_idx, -1, 6])
-                    length = float(neighbor_past[agent_idx, -1, 7])
+                    width = float(neighbor_past[agent_idx, -1, 8])
+                    length = float(neighbor_past[agent_idx, -1, 9])
                     if width == 0:
                         width = 2.0
                     if length == 0:
@@ -331,17 +342,39 @@ def render_npz_style_scene(
 
         # Neighbor future trajectories
         if neighbor_future is not None:
-            for agent_idx in range(neighbor_future.shape[0]):
+            for agent_idx in range(1, neighbor_future.shape[0]):
                 future = neighbor_future[agent_idx, :, :2]
                 valid_mask = (future[:, 0] != 0) | (future[:, 1] != 0)
                 if np.any(valid_mask):
                     ax.plot(future[valid_mask, 0], future[valid_mask, 1], "g-", linewidth=2.5, alpha=0.55)
 
-        # Static objects (points) — many nuPlan exports currently have these as all-zeros.
+        # Static objects / obstacles: [x,y,z,width,length,height,yaw,*,*,valid].
         if static_objects is not None and static_objects.ndim == 2 and static_objects.shape[-1] >= 2:
-            valid = np.any(np.abs(static_objects[:, :2]) > 1e-6, axis=1)
-            if np.any(valid):
-                ax.scatter(static_objects[valid, 0], static_objects[valid, 1], s=40, c="black", alpha=0.65, marker="x", label="static")
+            for obj in static_objects:
+                if static_objects.shape[-1] >= 10 and float(obj[9]) < 0.5:
+                    continue
+                x, y = float(obj[0]), float(obj[1])
+                if abs(x) < 1e-6 and abs(y) < 1e-6:
+                    continue
+                if abs(x) > 50 or abs(y) > 50:
+                    continue
+                width = float(obj[3]) if static_objects.shape[-1] >= 4 else 2.0
+                length = float(obj[4]) if static_objects.shape[-1] >= 5 else 4.0
+                yaw = float(obj[6]) if static_objects.shape[-1] >= 7 else 0.0
+                if not np.isfinite(width) or abs(width) < 1e-3:
+                    width = 2.0
+                if not np.isfinite(length) or abs(length) < 1e-3:
+                    length = 4.0
+                if not np.isfinite(yaw):
+                    yaw = 0.0
+                rect = patches.Rectangle((x - length / 2, y - width / 2), length, width, facecolor="black", edgecolor="black", linewidth=1, alpha=0.25)
+                try:
+                    import matplotlib.transforms as transforms
+
+                    rect.set_transform(transforms.Affine2D().rotate_around(x, y, yaw) + ax.transData)
+                except Exception:
+                    pass
+                ax.add_patch(rect)
 
         ax.legend(loc="upper right")
         fig.tight_layout()
@@ -448,8 +481,8 @@ def render_xy_scatter_with_context(
         ego_circle = patches.Circle((0, 0), radius=1.5, facecolor="red", edgecolor="darkred", linewidth=2)
         ax.add_patch(ego_circle)
 
-        # Neighbors
-        for agent_idx in range(neighbor_past.shape[0]):
+        # Neighbors. Slot0 is ego history; mask it out from context visualizations.
+        for agent_idx in range(1, neighbor_past.shape[0]):
             curr_x = float(neighbor_past[agent_idx, -1, 0])
             curr_y = float(neighbor_past[agent_idx, -1, 1])
             past = neighbor_past[agent_idx, :, :2]
@@ -466,25 +499,14 @@ def render_xy_scatter_with_context(
             # Optional agent shape overlay (vehicle box / pedestrian circle / bicycle diamond)
             try:
                 if neighbor_past.shape[-1] >= 11:
-                    type_v = float(neighbor_past[agent_idx, -1, 8])
-                    type_p = float(neighbor_past[agent_idx, -1, 9])
-                    type_b = float(neighbor_past[agent_idx, -1, 10])
+                    # New export contract: [x,y,cos,sin,vx,vy,ax,ay,width,length,valid].
+                    if float(neighbor_past[agent_idx, -1, 10]) < 0.5:
+                        continue
+                    agent_type = "Vehicle"
+                    color = "blue"
 
-                    if type_v > 0.5:
-                        agent_type = "Vehicle"
-                        color = "blue"
-                    elif type_p > 0.5:
-                        agent_type = "Pedestrian"
-                        color = "orange"
-                    elif type_b > 0.5:
-                        agent_type = "Bicycle"
-                        color = "purple"
-                    else:
-                        agent_type = None
-                        color = "cyan"
-
-                    width = float(neighbor_past[agent_idx, -1, 6])
-                    length = float(neighbor_past[agent_idx, -1, 7])
+                    width = float(neighbor_past[agent_idx, -1, 8])
+                    length = float(neighbor_past[agent_idx, -1, 9])
                     if width == 0:
                         width = 2.0
                     if length == 0:
@@ -546,16 +568,38 @@ def render_xy_scatter_with_context(
                 pass
 
         if neighbor_future is not None:
-            for agent_idx in range(neighbor_future.shape[0]):
+            for agent_idx in range(1, neighbor_future.shape[0]):
                 future = neighbor_future[agent_idx, :, :2]
                 valid_mask = (future[:, 0] != 0) | (future[:, 1] != 0)
                 if np.any(valid_mask):
                     ax.plot(future[valid_mask, 0], future[valid_mask, 1], "g-", linewidth=2.0, alpha=0.35)
 
         if static_objects is not None and static_objects.ndim == 2 and static_objects.shape[-1] >= 2:
-            valid = np.any(np.abs(static_objects[:, :2]) > 1e-6, axis=1)
-            if np.any(valid):
-                ax.scatter(static_objects[valid, 0], static_objects[valid, 1], s=30, c="black", alpha=0.5, marker="x")
+            for obj in static_objects:
+                if static_objects.shape[-1] >= 10 and float(obj[9]) < 0.5:
+                    continue
+                x, y = float(obj[0]), float(obj[1])
+                if abs(x) < 1e-6 and abs(y) < 1e-6:
+                    continue
+                if abs(x) > 50 or abs(y) > 50:
+                    continue
+                width = float(obj[3]) if static_objects.shape[-1] >= 4 else 2.0
+                length = float(obj[4]) if static_objects.shape[-1] >= 5 else 4.0
+                yaw = float(obj[6]) if static_objects.shape[-1] >= 7 else 0.0
+                if not np.isfinite(width) or abs(width) < 1e-3:
+                    width = 2.0
+                if not np.isfinite(length) or abs(length) < 1e-3:
+                    length = 4.0
+                if not np.isfinite(yaw):
+                    yaw = 0.0
+                rect = patches.Rectangle((x - length / 2, y - width / 2), length, width, facecolor="black", edgecolor="black", linewidth=1, alpha=0.18)
+                try:
+                    import matplotlib.transforms as transforms
+
+                    rect.set_transform(transforms.Affine2D().rotate_around(x, y, yaw) + ax.transData)
+                except Exception:
+                    pass
+                ax.add_patch(rect)
 
         if ego_past_xy is not None:
             past_xy = _to_numpy(ego_past_xy)

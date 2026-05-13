@@ -101,3 +101,46 @@ def test_state_perturbation_does_not_mutate_input_batch_inplace():
 
     for k, v in saved.items():
         assert torch.equal(batch[k], v), f"input batch mutated in-place for key={k}"
+
+
+def test_state_perturbation_spline_not_dependent_on_unused_ego_cs_tail_dims():
+    """ego_current_state[8:10] are placeholders in our cached feature contract.
+
+    The spline refinement must not depend on those tail dims; otherwise training would be sensitive to
+    arbitrary constants in the cache.
+    """
+
+    from src.methods.diffusion_planner.utils.state_perturbation import StatePerturbation, StatePerturbationConfig
+
+    cfg = StatePerturbationConfig(enabled=True, prob=1.0, min_vx_mps=0.0)
+    aug = StatePerturbation(cfg, device=torch.device("cpu"))
+
+    torch.manual_seed(42)
+    b1 = _make_batch(B=2)
+    b2 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in b1.items()}
+
+    # Change only ego_current_state tail dims.
+    b2["ego_current_state"][:, 8] = 123.0
+    b2["ego_current_state"][:, 9] = -456.0
+
+    torch.manual_seed(123)
+    o1 = aug({k: (v.clone() if torch.is_tensor(v) else v) for k, v in b1.items()})
+
+    torch.manual_seed(123)
+    o2 = aug({k: (v.clone() if torch.is_tensor(v) else v) for k, v in b2.items()})
+
+    assert torch.allclose(o1["ego_agent_future"], o2["ego_agent_future"], atol=1e-6, rtol=0.0)
+
+
+def test_state_perturbation_restores_ego_centric_convention():
+    from src.methods.diffusion_planner.utils.state_perturbation import StatePerturbation, StatePerturbationConfig
+
+    cfg = StatePerturbationConfig(enabled=True, prob=1.0, min_vx_mps=0.0)
+    aug = StatePerturbation(cfg, device=torch.device("cpu"))
+
+    torch.manual_seed(7)
+    out = aug(_make_batch(B=3))
+
+    assert torch.allclose(out["ego_current_state"][:, 0:2], torch.zeros((3, 2)), atol=1e-6, rtol=0.0)
+    assert torch.allclose(out["ego_current_state"][:, 2], torch.ones((3,)), atol=1e-6, rtol=0.0)
+    assert torch.allclose(out["ego_current_state"][:, 3], torch.zeros((3,)), atol=1e-6, rtol=0.0)

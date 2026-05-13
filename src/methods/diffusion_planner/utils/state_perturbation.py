@@ -154,22 +154,14 @@ class StatePerturbation:
         delta = delta * apply[:, None].to(delta.dtype)
 
         # -----------------
-        # 1) Coordinate transform FIRST (keep consistent with the cached feature frame).
+        # 1) Perturb current ego state in the current cached ego frame.
         # -----------------
+        # This mirrors the reference Diffusion-Planner order:
+        #   (a) create a perturbed ego pose/state,
+        #   (b) regenerate the short ego future prefix from that perturbed state,
+        #   (c) re-center / re-rotate the whole scene around the perturbed ego.
+        # After step (c), the cached convention is restored: ego xy=(0,0), heading=(1,0).
         batch = dict(batch)
-        batch["ego_current_state"] = ego_cs
-        batch["ego_agent_future"] = ego_fut
-        if torch.is_tensor(nb_fut):
-            batch["neighbor_agents_future"] = nb_fut
-        batch = self._apply_pose_perturb_inplace(batch, delta=delta)
-
-        # Refresh local refs after in-place ops.
-        ego_cs = batch["ego_current_state"]
-        ego_fut = batch["ego_agent_future"]
-
-        # -----------------
-        # 2) Perturb ego_current_state (in the already-transformed frame).
-        # -----------------
         yaw0 = torch.atan2(ego_cs[:, 3], ego_cs[:, 2])
         state0 = torch.stack(
             [
@@ -186,33 +178,34 @@ class StatePerturbation:
             dim=-1,
         )
         state1 = state0 + delta
-        # IMPORTANT: Do NOT apply DP-reference clamps here.
         state1[:, 2] = _normalize_angle(state1[:, 2])
 
-        # Preserve cached convention: ego x,y remain 0.
-        ego_cs[:, 0:2] = 0.0
+        ego_cs[:, 0:2] = state1[:, 0:2]
         ego_cs[:, 2] = torch.cos(state1[:, 2])
         ego_cs[:, 3] = torch.sin(state1[:, 2])
         ego_cs[:, 4:8] = state1[:, 3:7]
         ego_cs[:, 8] = state1[:, 7]
         ego_cs[:, 9] = state1[:, 8]
         batch["ego_current_state"] = ego_cs
+        batch["ego_agent_future"] = ego_fut
+        if torch.is_tensor(nb_fut):
+            batch["neighbor_agents_future"] = nb_fut
 
         # -----------------
-        # 3) Quintic spline: regenerate first ~2s of ego future.
+        # 2) Quintic spline: regenerate first ~2s of ego future for augmented samples only.
         # -----------------
-        # IMPORTANT: Only apply spline refinement to samples where augmentation was applied.
-        # Otherwise we would silently change supervision targets for non-augmented samples.
         ego_fut_interp = self._interpolate_ego_future(ego_cs, ego_fut)
-        if apply.dtype != torch.bool:
-            apply_mask = apply.to(torch.bool)
-        else:
-            apply_mask = apply
+        apply_mask = apply.to(torch.bool) if apply.dtype != torch.bool else apply
         if bool(apply_mask.all().item()):
             batch["ego_agent_future"] = ego_fut_interp
         else:
             m = apply_mask[:, None, None]
             batch["ego_agent_future"] = torch.where(m, ego_fut_interp, ego_fut)
+
+        # -----------------
+        # 3) Restore the cached ego-centric convention around the perturbed ego pose.
+        # -----------------
+        batch = self._centric_transform_inplace(batch)
 
         return batch
 
@@ -290,12 +283,14 @@ class StatePerturbation:
             lane[mask] = 0.0
             batch[k] = lane
 
-        # static objects: [B,S,D]
+        # static objects: [B,S,10] = [x,y,z,width,length,height,yaw,*,*,valid]
         so = batch.get("static_objects")
         if torch.is_tensor(so) and so.ndim == 3 and so.shape[-1] >= 2:
             so = so.clone()
-            mask = (torch.sum(torch.ne(so[..., :2], 0.0), dim=-1) == 0)
+            mask = (torch.sum(torch.ne(so, 0.0), dim=-1) == 0)
             so[..., :2] = _apply_xy(so[..., :2], dxy)
+            if so.shape[-1] >= 7:
+                so[..., 6] = _normalize_angle(so[..., 6] - dyaw[:, None])
             so[mask] = 0.0
             batch["static_objects"] = so
 
@@ -315,7 +310,10 @@ class StatePerturbation:
 
     def _centric_transform_inplace(self, batch: dict[str, Any]) -> dict[str, Any]:
         ego_cs = batch["ego_current_state"]
-        center_xy = ego_cs[:, 0:2]
+        # Clone: center_xy is used as the translation bias for every other feature. If this is a view
+        # into ego_cs, the ego self-transform below zeroes it before neighbors/lanes/static objects are
+        # transformed, silently dropping the translation component of the perturbation.
+        center_xy = ego_cs[:, 0:2].clone()
         rot = self._rot_from_cos_sin(ego_cs)
 
         # ego_current_state: xy / cos-sin / v / a are 2D vectors.
@@ -333,7 +331,7 @@ class StatePerturbation:
             ego_fut = torch.cat([ego_fut_xy, ego_fut_h[..., None]], dim=-1)
             batch["ego_agent_future"] = ego_fut
 
-        # neighbor past: [B,*,Tp,D] where xy/cos-sin/v are first dims.
+        # neighbor past: [B,*,Tp,D] where xy/cos-sin/v/a are first dims in our cache.
         nb_past = batch.get("neighbor_agents_past")
         if torch.is_tensor(nb_past) and nb_past.ndim == 4 and nb_past.shape[-1] >= 6:
             nb_past = nb_past.clone()
@@ -342,6 +340,8 @@ class StatePerturbation:
             nb_past[..., :2] = _vector_transform(nb_past[..., :2], rot, center_xy)
             nb_past[..., 2:4] = _vector_transform(nb_past[..., 2:4], rot)
             nb_past[..., 4:6] = _vector_transform(nb_past[..., 4:6], rot)
+            if nb_past.shape[-1] >= 8:
+                nb_past[..., 6:8] = _vector_transform(nb_past[..., 6:8], rot)
             nb_past[mask] = 0.0
             batch["neighbor_agents_past"] = nb_past
 
@@ -369,14 +369,16 @@ class StatePerturbation:
             lane[mask] = 0.0
             batch[k] = lane
 
-        # static objects: [B,S,10] (we only transform xy, and (cos,sin) if present)
+        # static objects: [B,S,10] = [x,y,z,width,length,height,yaw,*,*,valid].
+        # Only xy is a 2D vector; yaw is an angle scalar; z/size/valid must remain unchanged.
         so = batch.get("static_objects")
         if torch.is_tensor(so) and so.ndim == 3 and so.shape[-1] >= 2:
             so = so.clone()
             mask = (torch.sum(torch.ne(so[..., :10] if so.shape[-1] >= 10 else so, 0.0), dim=-1) == 0)
             so[..., :2] = _vector_transform(so[..., :2], rot, center_xy)
-            if so.shape[-1] >= 4:
-                so[..., 2:4] = _vector_transform(so[..., 2:4], rot)
+            if so.shape[-1] >= 7:
+                yaw = so[..., 6]
+                so[..., 6] = _heading_transform(yaw, rot)
             so[mask] = 0.0
             batch["static_objects"] = so
 
@@ -405,7 +407,12 @@ class StatePerturbation:
         theta0 = torch.atan2(ego_future[:, mid, 1] - y0, ego_future[:, mid, 0] - x0)
         v0 = torch.linalg.norm(ego_cs[:, 4:6], dim=-1)
         a0 = torch.linalg.norm(ego_cs[:, 6:8], dim=-1)
-        omega0 = ego_cs[:, 9]
+        # NOTE(feature_contract): ego_current_state[8:10] are not reliable kinematic signals in our cached
+        # feature contract (they are placeholders in extract_single_frame.py today).
+        # Using them here can silently corrupt the spline boundary conditions.
+        # Estimate yaw_rate at t0 from the first future relative heading delta instead.
+        # ego_future[0,2] is the relative heading at t=dt in the *current ego frame*.
+        omega0 = _normalize_angle(ego_future[:, 0, 2]) / dt
 
         xT = ego_future[:, P, 0]
         yT = ego_future[:, P, 1]

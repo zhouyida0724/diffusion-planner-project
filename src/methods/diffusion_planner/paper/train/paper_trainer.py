@@ -140,6 +140,58 @@ def _build_joint_trajectories_x0(batch: dict, *, predicted_neighbor_num: int, fu
     return x0, current_states
 
 
+def _maybe_mask_ego_history_in_neighbor_past(
+    batch: dict,
+    *,
+    cfg: TrainConfig,
+    predicted_neighbor_num: int,
+) -> None:
+    """Optionally mask ego history in neighbor_agents_past when the export includes the ego row.
+
+    Convention: some exports store ego history as row0 in neighbor_agents_past with shape [B, Pn+1, Th, D].
+    Masking means setting that ego row to 0 for (most/all) timesteps.
+    """
+
+    try:
+        p = float(getattr(cfg, "mask_ego_history_prob", 0.0) or 0.0)
+        keep_last = bool(getattr(cfg, "mask_ego_history_keep_last", True))
+    except Exception:
+        p, keep_last = 0.0, True
+
+    if p <= 0.0:
+        return
+
+    nb_past = batch.get("neighbor_agents_past")
+    if nb_past is None or (not torch.is_tensor(nb_past)):
+        return
+
+    # only when ego row is present
+    if int(nb_past.shape[1]) != int(predicted_neighbor_num) + 1:
+        return
+
+    # p is per-sample; for p==1.0 it's always.
+    B = int(nb_past.shape[0])
+    device = nb_past.device
+    mask_flags = torch.rand((B,), device=device) < float(p)
+    if not bool(mask_flags.any().item()):
+        return
+
+    # zero ego row where mask applies
+    # nb_past: [B, Pn+1, Th, D]
+    ego_row = nb_past[:, 0:1, :, :]
+    ego_row = ego_row.clone()
+    if keep_last and ego_row.shape[2] >= 1:
+        last = ego_row[:, :, -1:, :].clone()
+        ego_row[mask_flags, :, :, :] = 0.0
+        ego_row[mask_flags, :, -1:, :] = last[mask_flags]
+    else:
+        ego_row[mask_flags, :, :, :] = 0.0
+
+    nb_past = nb_past.clone()
+    nb_past[:, 0:1, :, :] = ego_row
+    batch["neighbor_agents_past"] = nb_past
+
+
 def _compute_neighbor_masks(
     batch: dict,
     *,
@@ -264,33 +316,71 @@ def train_loop_paper_dit_xstart(
     tb_image_size = int(getattr(cfg, "tb_image_size", 800) or 800)
     tb_warned_disabled = False
 
+    def _tb_maneuver_label(sample: dict[str, Any]) -> str:
+        """Classify a sample for TensorBoard visualization buckets.
+
+        Uses ego future relative heading at the last valid point. Positive yaw is left,
+        negative yaw is right; near-zero yaw is straight.
+        """
+
+        try:
+            fut = sample.get("ego_agent_future")
+            if fut is None:
+                return "straight"
+            if torch.is_tensor(fut):
+                arr = fut.detach().float().cpu()
+            else:
+                arr = torch.as_tensor(fut, dtype=torch.float32)
+            if arr.ndim == 3:
+                arr = arr[0]
+            valid = torch.sum(torch.ne(arr[:, :2], 0.0), dim=-1) != 0
+            if torch.any(valid):
+                idx = int(torch.nonzero(valid, as_tuple=False)[-1].item())
+            else:
+                idx = int(arr.shape[0] - 1)
+            yaw = float(arr[idx, 2].item()) if arr.shape[-1] >= 3 else 0.0
+            if yaw > 0.35:
+                return "left"
+            if yaw < -0.35:
+                return "right"
+            return "straight"
+        except Exception:
+            return "straight"
+
     # Pre-sample stable visualization examples from fast-eval loaders (if available).
+    # Required TB layout: city x maneuver(straight/left/right) x tb_num_samples.
     # This keeps TB tags stable across steps and aligned across cities.
-    tb_vis_by_city: dict[str, list[dict[str, Any]]] = {}
+    tb_vis_by_city_maneuver: dict[str, dict[str, list[dict[str, Any]]]] = {}
     if fast_eval_loaders is not None:
         for _city, _ldr in fast_eval_loaders.items():
+            buckets: dict[str, list[dict[str, Any]]] = {"straight": [], "left": [], "right": []}
             try:
-                _batch = next(iter(_ldr))
+                for _batch in _ldr:
+                    B0 = None
+                    for _v in _batch.values():
+                        if torch.is_tensor(_v):
+                            B0 = int(_v.shape[0])
+                            break
+                    if B0 is None or B0 <= 0:
+                        continue
+                    for i in range(B0):
+                        s: dict[str, Any] = {}
+                        for k, v in _batch.items():
+                            if torch.is_tensor(v):
+                                s[k] = v[i : i + 1].to(device=device, dtype=torch.float32)
+                            else:
+                                s[k] = v
+                        label = _tb_maneuver_label(s)
+                        if len(buckets.get(label, [])) < tb_num_samples:
+                            buckets[label].append(s)
+                    if all(len(buckets[m]) >= tb_num_samples for m in ["straight", "left", "right"]):
+                        break
             except Exception:
                 continue
-            B0 = None
-            for _v in _batch.values():
-                if torch.is_tensor(_v):
-                    B0 = int(_v.shape[0])
-                    break
-            if B0 is None or B0 <= 0:
-                continue
-            samples: list[dict[str, Any]] = []
-            for i in range(min(tb_num_samples, B0)):
-                s: dict[str, Any] = {}
-                for k, v in _batch.items():
-                    if torch.is_tensor(v):
-                        s[k] = v[i : i + 1].to(device=device, dtype=torch.float32)
-                    else:
-                        s[k] = v
-                samples.append(s)
-            if samples:
-                tb_vis_by_city[str(_city)] = samples
+            tb_vis_by_city_maneuver[str(_city)] = buckets
+            missing = {m: len(v) for m, v in buckets.items() if len(v) < tb_num_samples}
+            if missing:
+                print(f"[tb] warning: city={_city} missing maneuver viz samples: {missing}", flush=True)
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -339,14 +429,17 @@ def train_loop_paper_dit_xstart(
         if warmup > 0 and step_i < warmup:
             return base_lr * float(step_i + 1) / float(max(warmup, 1))
 
-        if sched == "cosine":
-            import math
-
+        if sched in {"cosine", "linear"}:
             min_ratio = float(getattr(cfg, "lr_min_ratio", 1.0) or 1.0)
             min_lr = base_lr * min_ratio
             denom = max(int(cfg.steps) - warmup, 1)
             prog = float(step_i - warmup) / float(denom)
             prog = max(0.0, min(1.0, prog))
+            if sched == "linear":
+                return float(base_lr + (min_lr - base_lr) * prog)
+
+            import math
+
             return float(min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * prog)))
 
         return base_lr
@@ -439,17 +532,10 @@ def train_loop_paper_dit_xstart(
         if not fast_eval_loaders or fast_eval_every <= 0:
             return
 
-        fast_eval_mode = str(getattr(cfg, "fast_eval_mode", "proxy") or "proxy")
-        if fast_eval_mode not in ("proxy", "sampler"):
-            fast_eval_mode = "proxy"
-
-        # NOTE: proxy mode historically used train-mode per request.
-        # Sampler mode must match inference, so we run in eval() temporarily.
+        # We only support sampler-mode fast-eval (matches inference / closed-loop).
+        # Proxy/teacher-forcing is intentionally removed to prevent accidental misuse.
         was_training = model.training
-        if fast_eval_mode == "sampler":
-            model.eval()
-        else:
-            model.train()  # keep train-mode for legacy proxy
+        model.eval()
         t_eval0 = time.time()
 
         horizon_idxs = [9, 29, 49, 79]
@@ -464,94 +550,55 @@ def train_loop_paper_dit_xstart(
                 for batch in loader:
                     batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
+                    # Match training-time histdrop contract (if enabled) so fast-eval aligns with closed-loop wrapper semantics.
+                    _maybe_mask_ego_history_in_neighbor_past(batch, cfg=cfg, predicted_neighbor_num=Pn)
+
                     B = int(batch["ego_current_state"].shape[0])
 
-                    if fast_eval_mode == "proxy":
-                        # --- teacher-forced proxy: one-step x0 prediction at t=0 ---
-                        x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
-                        x0n = model.config.state_normalizer(x0_4)
+                    # --- sampler mode: run inference sampler (matches closed-loop) ---
+                    steps_s = int(getattr(cfg, "fast_eval_diffusion_steps", 10) or 10)
+                    inputs = {
+                        "ego_current_state": batch["ego_current_state"],
+                        "neighbor_agents_past": batch["neighbor_agents_past"],
+                        "static_objects": batch["static_objects"],
+                        "lanes": batch["lanes"],
+                        "lanes_speed_limit": batch["lanes_speed_limit"],
+                        "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
+                        "route_lanes": batch["route_lanes"],
+                        "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
+                        "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
+                        "diffusion_steps": steps_s,
+                    }
+                    with autocast_ctx:
+                        _, dec_out = model(inputs)
+                    # dec_out["prediction"]: [B,P,T,4] in inverse space
+                    pred_raw = dec_out["prediction"]  # [B,P,T,4] raw
+                    pred_ego_xy = pred_raw[:, 0, :, :2]
 
-                        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
-                            batch,
-                            predicted_neighbor_num=Pn,
-                            future_len=Tf,
-                        )
+                    # Loss-like scalar in normalized space between sampled prediction and GT.
+                    x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
+                    x0n = model.config.state_normalizer(x0_4)
+                    neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
+                        batch,
+                        predicted_neighbor_num=Pn,
+                        future_len=Tf,
+                    )
+                    x0n_masked = x0n.clone()
+                    x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
+                    gt_fut_n = x0n_masked[:, :, 1:, :]  # [B,P,T,4]
+                    pred_fut_n = model.config.state_normalizer(pred_raw)  # [B,P,T,4]
+                    dpm_loss = torch.sum((pred_fut_n - gt_fut_n) ** 2, dim=-1)  # [B,P,T]
+                    ego_loss = dpm_loss[:, 0, :].mean()
+                    nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
+                    nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
+                    val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
 
-                        x0n_masked = x0n.clone()
-                        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
-
-                        t = torch.zeros((B,), device=device, dtype=torch.float32)
-                        inputs = {
-                            "ego_current_state": batch["ego_current_state"],
-                            "neighbor_agents_past": batch["neighbor_agents_past"],
-                            "static_objects": batch["static_objects"],
-                            "lanes": batch["lanes"],
-                            "lanes_speed_limit": batch["lanes_speed_limit"],
-                            "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
-                            "route_lanes": batch["route_lanes"],
-                            "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
-                            "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
-                            "sampled_trajectories": x0n_masked,
-                            "diffusion_time": t,
-                        }
-
-                        with autocast_ctx:
-                            _, dec_out = model(inputs)
-                        pred = dec_out["score"]  # [B,P,1+T,4] (normalized)
-
-                        # val loss proxy (future-only, official masking)
-                        pred_fut = pred[:, :, 1:, :]
-                        gt_fut = x0n_masked[:, :, 1:, :]
-                        dpm_loss = torch.sum((pred_fut - gt_fut) ** 2, dim=-1)  # [B,P,T]
-                        ego_loss = dpm_loss[:, 0, :].mean()
-                        nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
-                        nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
-                        val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
-
-                        # ADE/FDE on ego (x,y)
-                        pred_x0 = model.config.state_normalizer.inverse(pred)
-                        pred_ego_xy = pred_x0[:, 0, 1:, :2]
-                    else:
-                        # --- sampler mode: run inference sampler (matches closed-loop) ---
-                        steps_s = int(getattr(cfg, "fast_eval_diffusion_steps", 10) or 10)
-                        inputs = {
-                            "ego_current_state": batch["ego_current_state"],
-                            "neighbor_agents_past": batch["neighbor_agents_past"],
-                            "static_objects": batch["static_objects"],
-                            "lanes": batch["lanes"],
-                            "lanes_speed_limit": batch["lanes_speed_limit"],
-                            "lanes_has_speed_limit": batch["lanes_has_speed_limit"],
-                            "route_lanes": batch["route_lanes"],
-                            "route_lanes_speed_limit": batch.get("route_lanes_speed_limit"),
-                            "route_lanes_has_speed_limit": batch.get("route_lanes_has_speed_limit"),
-                            "diffusion_steps": steps_s,
-                        }
-                        with autocast_ctx:
-                            _, dec_out = model(inputs)
-                        # dec_out["prediction"]: [B,P,T,4] in inverse space
-                        pred_raw = dec_out["prediction"]  # [B,P,T,4] raw
-                        pred_ego_xy = pred_raw[:, 0, :, :2]
-
-                        # In sampler mode we still want a per-city "loss-like" scalar that is
-                        # consistent with inference. We compute an MSE in normalized space
-                        # between sampled prediction and GT (future only), using the same
-                        # neighbor validity masking as training.
-                        x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
-                        x0n = model.config.state_normalizer(x0_4)
-                        neighbor_mask_full, neighbors_future_valid = _compute_neighbor_masks(
-                            batch,
-                            predicted_neighbor_num=Pn,
-                            future_len=Tf,
-                        )
-                        x0n_masked = x0n.clone()
-                        x0n_masked[:, 1:, :, :][neighbor_mask_full] = 0.0
-                        gt_fut_n = x0n_masked[:, :, 1:, :]  # [B,P,T,4]
-                        pred_fut_n = model.config.state_normalizer(pred_raw)  # [B,P,T,4]
-                        dpm_loss = torch.sum((pred_fut_n - gt_fut_n) ** 2, dim=-1)  # [B,P,T]
-                        ego_loss = dpm_loss[:, 0, :].mean()
-                        nb_elems = dpm_loss[:, 1:, :][neighbors_future_valid]
-                        nb_loss = nb_elems.mean() if nb_elems.numel() > 0 else torch.tensor(0.0, device=dpm_loss.device)
-                        val_loss_proxy = ego_loss + alpha_planning_loss * nb_loss
+                    # Extra debug metrics: ego xy MSE in raw meters, and loss components.
+                    gt_ego_future = batch["ego_agent_future"]
+                    if gt_ego_future.shape[-2] == Tf + 1:
+                        gt_ego_future = gt_ego_future[:, 1:, :]
+                    gt_ego_xy = gt_ego_future[..., :2]
+                    ego_xy_mse = torch.mean((pred_ego_xy - gt_ego_xy) ** 2)
 
                     gt_ego_future = batch["ego_agent_future"]
                     if gt_ego_future.shape[-2] == Tf + 1:
@@ -561,7 +608,11 @@ def train_loop_paper_dit_xstart(
                     ade_fde = _ade_fde_at_horizons(pred_ego_xy, gt_ego_xy, horizon_idxs)
 
                     metrics_batch: dict[str, float] = {
+                        # Back-compat key name; value is sampler-mode MSE (NOT teacher-forced proxy).
                         "val_loss_proxy": float(val_loss_proxy.detach().float().cpu().item()) if torch.is_tensor(val_loss_proxy) else float("nan"),
+                        "val_loss_sampler_ego": float(ego_loss.detach().float().cpu().item()),
+                        "val_loss_sampler_nb": float(nb_loss.detach().float().cpu().item()) if torch.is_tensor(nb_loss) else float("nan"),
+                        "ego_xy_mse_m2": float(ego_xy_mse.detach().float().cpu().item()),
                     }
                     metrics_batch.update(ade_fde)
 
@@ -636,8 +687,7 @@ def train_loop_paper_dit_xstart(
                 f.write(json.dumps(macro_rec) + "\n")
 
         # restore model mode
-        if fast_eval_mode == "sampler":
-            model.train(was_training)
+        model.train(was_training)
 
     def _run_fast_val(step_i: int) -> None:
         if fast_val_loader is None or fast_val_every <= 0:
@@ -655,6 +705,8 @@ def train_loop_paper_dit_xstart(
         with torch.no_grad():
             for batch in fast_val_loader:
                 batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+                _maybe_mask_ego_history_in_neighbor_past(batch, cfg=cfg, predicted_neighbor_num=Pn)
 
                 x0_4, _ = _build_joint_trajectories_x0(batch, predicted_neighbor_num=Pn, future_len=Tf)
                 x0n = model.config.state_normalizer(x0_4)
@@ -806,6 +858,11 @@ def train_loop_paper_dit_xstart(
         t_seg = time.perf_counter()
         batch = {k: (v.to(device=device, dtype=torch.float32) if torch.is_tensor(v) else v) for k, v in batch.items()}
         breakdown["to_device_s"] = float(time.perf_counter() - t_seg)
+
+        # training-time ego history masking (histdrop)
+        t_seg = time.perf_counter()
+        _maybe_mask_ego_history_in_neighbor_past(batch, cfg=cfg, predicted_neighbor_num=Pn)
+        breakdown["mask_ego_history_s"] = float(time.perf_counter() - t_seg)
 
         # training-time augmentation (kept deterministic by cfg; does not run in fast-eval)
         if state_perturb is not None:
@@ -1084,7 +1141,18 @@ def train_loop_paper_dit_xstart(
         # overall step
         _maybe_sync(device)
         step_s = time.time() - step_t0
-        perf.on_step_end(step=step, step_s=step_s, loss=float(loss.item()))
+        # Always record key loss components so we can validate "loss down but ADE/FDE flat" claims.
+        perf.on_step_end(
+            step=step,
+            step_s=step_s,
+            loss=float(loss.item()),
+            extra={
+                "lr": float(lr_now),
+                "ego_planning_loss": float(ego_planning_loss.detach().float().item()),
+                "neighbor_prediction_loss": float(neighbor_prediction_loss.detach().float().item()),
+                "alpha_planning_loss": float(alpha_planning_loss),
+            },
+        )
 
         # attach breakdown + host stats to perf record (perf.json)
         if _do_profile(step) and perf.records:
@@ -1148,13 +1216,14 @@ def train_loop_paper_dit_xstart(
                 model.eval()
 
                 # TB layout (stable tags):
-                #   viz/<city>/sample_<k>
-                #   denoise/<city>/sample_<k>
-                #   forward/<city>/sample_<k>
+                #   viz/<city>/<maneuver>/sample_<k>
+                #   denoise/<city>/<maneuver>/sample_<k>
+                #   forward/<city>/<maneuver>/sample_<k>
                 # No per-solver-step spam.
 
-                cities = ["boston", "pittsburgh", "vegas"]
-                # tb_num_samples is per-city.
+                cities = sorted(tb_vis_by_city_maneuver.keys()) or ["boston", "pittsburgh", "vegas", "singapore"]
+                maneuvers = ["straight", "left", "right"]
+                # tb_num_samples is per-city-per-maneuver.
                 vis_per_city = max(1, int(tb_num_samples))
 
                 def _fallback_from_train_batch(n: int, *, salt: int) -> list[dict[str, Any]]:
@@ -1176,198 +1245,216 @@ def train_loop_paper_dit_xstart(
                     return outs
 
                 for ci, city in enumerate(cities):
-                    samples = tb_vis_by_city.get(city)
-                    if not samples:
-                        samples = _fallback_from_train_batch(vis_per_city, salt=ci)
-                    if not samples:
-                        continue
+                    for mi, maneuver in enumerate(maneuvers):
+                        samples = tb_vis_by_city_maneuver.get(city, {}).get(maneuver)
+                        if not samples:
+                            # Fallback keeps training robust, but stable maneuver buckets should come from fast-eval loaders.
+                            samples = _fallback_from_train_batch(vis_per_city, salt=ci * 10 + mi)
+                        if not samples:
+                            continue
 
-                    for slot, batch1 in enumerate(samples[:vis_per_city]):
-                        with torch.no_grad():
-                            x0_4_1, _ = _build_joint_trajectories_x0(batch1, predicted_neighbor_num=Pn, future_len=Tf)
-                            x0n_1 = model.config.state_normalizer(x0_4_1)
-                            neighbor_mask_full_1, _ = _compute_neighbor_masks(batch1, predicted_neighbor_num=Pn, future_len=Tf)
-                            x0n_masked_1 = x0n_1.clone()
-                            x0n_masked_1[:, 1:, :, :][neighbor_mask_full_1] = 0.0
-
-                            # IMPORTANT: match training/inference by applying observation normalization
-                            # to conditioning features before feeding the encoder/DiT sampler.
-                            enc_inputs_vis_raw = {
-                                "ego_current_state": batch1["ego_current_state"],
-                                "neighbor_agents_past": batch1["neighbor_agents_past"],
-                                "static_objects": batch1["static_objects"],
-                                "lanes": batch1["lanes"],
-                                "lanes_speed_limit": batch1["lanes_speed_limit"],
-                                "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
-                                "route_lanes": batch1["route_lanes"],
-                            }
-                            if batch1.get("route_lanes_speed_limit") is not None:
-                                enc_inputs_vis_raw["route_lanes_speed_limit"] = batch1["route_lanes_speed_limit"]
-                            if batch1.get("route_lanes_has_speed_limit") is not None:
-                                enc_inputs_vis_raw["route_lanes_has_speed_limit"] = batch1["route_lanes_has_speed_limit"]
-
-                            enc_inputs_vis = (
-                                model.config.observation_normalizer(enc_inputs_vis_raw)
-                                if hasattr(model.config, "observation_normalizer")
-                                else enc_inputs_vis_raw
-                            )
-                            enc_vis = model.encoder(enc_inputs_vis)
-
-                            neighbors_past_1 = batch1["neighbor_agents_past"]
-                            if neighbors_past_1.shape[1] == Pn + 1:
-                                neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
-                            else:
-                                neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
-                            neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
-
-                            # Forward-noise montage (q(x_t|x0)).
-                            base_noise = torch.randn_like(x0n_masked_1[:, :, 1:, :])
-                            t_forward = [0.01, 0.1, 0.5, 1.0]
-                            forward_panels: list[Any] = []
-                            for t_val in t_forward:
-                                t_vis = torch.full((1,), float(t_val), device=device, dtype=torch.float32)
-                                mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
-                                xt_fut = mean + std * base_noise
-                                xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
-                                xt_inv = model.config.state_normalizer.inverse(xt_vis)
-                                xt_xy = xt_inv[0, 0, 1:, :2]
-                                img = render_xy_scatter_with_context(
-                                    batch1,
-                                    sample_idx=0,
-                                    xy=xt_xy,
-                                    title=f"forward xt | t={t_val:.2f}",
-                                    image_size=tb_image_size,
-                                    marker="x",
-                                    alpha=0.85,
-                                    connect_line=False,
+                        for slot, batch1 in enumerate(samples[:vis_per_city]):
+                            with torch.no_grad():
+                                x0_4_1, _ = _build_joint_trajectories_x0(batch1, predicted_neighbor_num=Pn, future_len=Tf)
+                                x0n_1 = model.config.state_normalizer(x0_4_1)
+                                neighbor_mask_full_1, _ = _compute_neighbor_masks(batch1, predicted_neighbor_num=Pn, future_len=Tf)
+                                x0n_masked_1 = x0n_1.clone()
+                                x0n_masked_1[:, 1:, :, :][neighbor_mask_full_1] = 0.0
+    
+                                # IMPORTANT: match training/inference by applying observation normalization
+                                # to conditioning features before feeding the encoder/DiT sampler.
+                                enc_inputs_vis_raw = {
+                                    "ego_current_state": batch1["ego_current_state"],
+                                    "neighbor_agents_past": batch1["neighbor_agents_past"],
+                                    "static_objects": batch1["static_objects"],
+                                    "lanes": batch1["lanes"],
+                                    "lanes_speed_limit": batch1["lanes_speed_limit"],
+                                    "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
+                                    "route_lanes": batch1["route_lanes"],
+                                }
+                                if batch1.get("route_lanes_speed_limit") is not None:
+                                    enc_inputs_vis_raw["route_lanes_speed_limit"] = batch1["route_lanes_speed_limit"]
+                                if batch1.get("route_lanes_has_speed_limit") is not None:
+                                    enc_inputs_vis_raw["route_lanes_has_speed_limit"] = batch1["route_lanes_has_speed_limit"]
+    
+                                enc_inputs_vis = (
+                                    model.config.observation_normalizer(enc_inputs_vis_raw)
+                                    if hasattr(model.config, "observation_normalizer")
+                                    else enc_inputs_vis_raw
                                 )
-                                forward_panels.append(img)
-                            forward_m = stitch_montage(forward_panels, rows=2, cols=2)
-                            if forward_m is not None:
-                                tb.add_image(
-                                    f"forward/{city}/sample_{slot}",
-                                    torch.from_numpy(forward_m).permute(2, 0, 1),
-                                    int(step),
-                                )
-
-                            # Sampler-consistent denoise + viz.
-                            if tb_denoise_mode in ["sampler", "all"]:
-                                try:
-                                    current_states_norm = x0n_masked_1[:, :, 0, :]
-                                    P = int(current_states_norm.shape[1])
-                                    future_noise = torch.randn((1, P, Tf, 4), device=device, dtype=torch.float32) * 0.5
-                                    xT = torch.cat([current_states_norm[:, :, None, :], future_noise], dim=2).reshape(1, P, -1)
-
-                                    def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step_i: int):
-                                        xt2 = xt.reshape(1, P, Tf + 1, 4)
-                                        xt2[:, :, 0, :] = current_states_norm
-                                        return xt2.reshape(1, P, -1)
-
-                                    noise_schedule = dpm.NoiseScheduleVP(schedule="linear")
-                                    model_fn = dpm.model_wrapper(
-                                        model.decoder.decoder.dit,
-                                        noise_schedule,
-                                        model_type=model.decoder.decoder.dit.model_type,
-                                        model_kwargs={
-                                            "cross_c": enc_vis["encoding"],
-                                            "route_lanes": enc_inputs_vis.get("route_lanes", batch1["route_lanes"]),
-                                            "neighbor_current_mask": neighbor_current_mask_1,
-                                        },
-                                        guidance_type="uncond",
-                                    )
-                                    dpm_solver = dpm.DPM_Solver(
-                                        model_fn,
-                                        noise_schedule,
-                                        algorithm_type="dpmsolver++",
-                                        correcting_xt_fn=initial_state_constraint,
-                                    )
-
-                                    x0_flat, inter = dpm_solver.sample(
-                                        xT,
-                                        steps=tb_sampler_steps,
-                                        order=2,
-                                        skip_type="logSNR",
-                                        method="multistep",
-                                        denoise_to_zero=True,
-                                        return_intermediate=True,
-                                    )
-
-                                    t0 = 1.0 / float(noise_schedule.total_N)
-                                    timesteps = dpm_solver.get_time_steps(
-                                        skip_type="logSNR",
-                                        t_T=float(noise_schedule.T),
-                                        t_0=float(t0),
-                                        N=tb_sampler_steps,
-                                        device=device,
-                                    )
-                                    t_labels = [float(timesteps[0].item())]
-                                    for j in range(1, int(timesteps.shape[0])):
-                                        t_labels.append(float(timesteps[j].item()))
-                                    if len(inter) == len(t_labels) + 1:
-                                        t_labels.append(float(t0))
-
-                                    # Pick 4 snapshots close to t≈[1.0,0.5,0.1,t0].
-                                    targets = [1.0, 0.5, 0.1, float(t0)]
-                                    idxs = []
-                                    for tt in targets:
-                                        best_i, best_d = 0, 1e9
-                                        for i, t_i in enumerate(t_labels[: len(inter)]):
-                                            d = abs(float(t_i) - float(tt))
-                                            if d < best_d:
-                                                best_d = d
-                                                best_i = i
-                                        idxs.append(best_i)
-                                    uniq = []
-                                    for i in idxs:
-                                        if i not in uniq:
-                                            uniq.append(i)
-
-                                    denoise_panels: list[Any] = []
-                                    for i in uniq[:4]:
-                                        xt_view = inter[i].reshape(1, P, Tf + 1, 4)
-                                        xt_inv = model.config.state_normalizer.inverse(xt_view)
-                                        xt_xy = xt_inv[0, 0, 1:, :2]
-                                        t_i = t_labels[i] if i < len(t_labels) else float("nan")
-                                        img = render_xy_scatter_with_context(
-                                            batch1,
-                                            sample_idx=0,
-                                            xy=xt_xy,
-                                            title=f"denoise xt | t={t_i:.3f}",
-                                            image_size=tb_image_size,
-                                            marker="x",
-                                            alpha=0.9,
-                                            connect_line=False,
-                                        )
-                                        denoise_panels.append(img)
-                                    while len(denoise_panels) < 4:
-                                        denoise_panels.append(None)
-                                    denoise_m = stitch_montage(denoise_panels[:4], rows=2, cols=2)
-                                    if denoise_m is not None:
-                                        tb.add_image(
-                                            f"denoise/{city}/sample_{slot}",
-                                            torch.from_numpy(denoise_m).permute(2, 0, 1),
-                                            int(step),
-                                        )
-
-                                    x0_view = x0_flat.reshape(1, P, Tf + 1, 4)
-                                    x0_inv = model.config.state_normalizer.inverse(x0_view)
-                                    pred_xy = x0_inv[0, 0, 1:, :2]
-                                    scene_img = render_npz_style_scene(
+                                enc_vis = model.encoder(enc_inputs_vis)
+    
+                                neighbors_past_1 = batch1["neighbor_agents_past"]
+                                if neighbors_past_1.shape[1] == Pn + 1:
+                                    neighbors_current_1 = neighbors_past_1[:, 1 : 1 + Pn, -1, :4]
+                                else:
+                                    neighbors_current_1 = neighbors_past_1[:, :Pn, -1, :4]
+                                neighbor_current_mask_1 = torch.sum(torch.ne(neighbors_current_1[..., :4], 0), dim=-1) == 0
+    
+                                # Forward-noise montage (q(x_t|x0)).
+                                base_noise = torch.randn_like(x0n_masked_1[:, :, 1:, :])
+                                t_forward = [0.01, 0.1, 0.5, 1.0]
+                                forward_panels: list[Any] = []
+                                for t_val in t_forward:
+                                    t_vis = torch.full((1,), float(t_val), device=device, dtype=torch.float32)
+                                    mean, std = model.sde.marginal_prob(x0n_masked_1[:, :, 1:, :], t_vis)
+                                    xt_fut = mean + std * base_noise
+                                    xt_vis = torch.cat([x0n_masked_1[:, :, :1, :], xt_fut], dim=2)
+                                    xt_inv = model.config.state_normalizer.inverse(xt_vis)
+                                    xt_xy = xt_inv[0, 0, 1:, :2]
+                                    img = render_xy_scatter_with_context(
                                         batch1,
                                         sample_idx=0,
-                                        ego_future_xy=pred_xy,
-                                        title=f"viz | step={step} city={city} slot={slot}",
+                                        xy=xt_xy,
+                                        title=f"forward xt | t={t_val:.2f}",
                                         image_size=tb_image_size,
+                                        marker="x",
+                                        alpha=0.85,
+                                        connect_line=False,
                                     )
-                                    if scene_img is not None:
-                                        tb.add_image(
-                                            f"viz/{city}/sample_{slot}",
-                                            torch.from_numpy(scene_img).permute(2, 0, 1),
-                                            int(step),
+                                    forward_panels.append(img)
+                                forward_m = stitch_montage(forward_panels, rows=2, cols=2)
+                                if forward_m is not None:
+                                    tb.add_image(
+                                        f"forward/{city}/{maneuver}/sample_{slot}",
+                                        torch.from_numpy(forward_m).permute(2, 0, 1),
+                                        int(step),
+                                    )
+    
+                                # Sampler-consistent denoise + viz.
+                                if tb_denoise_mode in ["sampler", "all"]:
+                                    try:
+                                        current_states_norm = x0n_masked_1[:, :, 0, :]
+                                        P = int(current_states_norm.shape[1])
+                                        future_noise = torch.randn((1, P, Tf, 4), device=device, dtype=torch.float32) * 0.5
+                                        xT = torch.cat([current_states_norm[:, :, None, :], future_noise], dim=2).reshape(1, P, -1)
+    
+                                        def initial_state_constraint(xt: torch.Tensor, t: torch.Tensor, step_i: int):
+                                            xt2 = xt.reshape(1, P, Tf + 1, 4)
+                                            xt2[:, :, 0, :] = current_states_norm
+                                            return xt2.reshape(1, P, -1)
+    
+                                        noise_schedule = dpm.NoiseScheduleVP(schedule="linear")
+                                        model_fn = dpm.model_wrapper(
+                                            model.decoder.decoder.dit,
+                                            noise_schedule,
+                                            model_type=model.decoder.decoder.dit.model_type,
+                                            model_kwargs={
+                                                "cross_c": enc_vis["encoding"],
+                                                "route_lanes": enc_inputs_vis.get("route_lanes", batch1["route_lanes"]),
+                                                "neighbor_current_mask": neighbor_current_mask_1,
+                                            },
+                                            guidance_type="uncond",
                                         )
-                                except Exception as e:
-                                    print(f"[tb] sampler denoise logging failed: {e}", flush=True)
-
+                                        dpm_solver = dpm.DPM_Solver(
+                                            model_fn,
+                                            noise_schedule,
+                                            algorithm_type="dpmsolver++",
+                                            correcting_xt_fn=initial_state_constraint,
+                                        )
+    
+                                        x0_flat, inter = dpm_solver.sample(
+                                            xT,
+                                            steps=tb_sampler_steps,
+                                            order=2,
+                                            skip_type="logSNR",
+                                            method="multistep",
+                                            denoise_to_zero=True,
+                                            return_intermediate=True,
+                                        )
+    
+                                        t0 = 1.0 / float(noise_schedule.total_N)
+                                        timesteps = dpm_solver.get_time_steps(
+                                            skip_type="logSNR",
+                                            t_T=float(noise_schedule.T),
+                                            t_0=float(t0),
+                                            N=tb_sampler_steps,
+                                            device=device,
+                                        )
+                                        t_labels = [float(timesteps[0].item())]
+                                        for j in range(1, int(timesteps.shape[0])):
+                                            t_labels.append(float(timesteps[j].item()))
+                                        if len(inter) == len(t_labels) + 1:
+                                            t_labels.append(float(t0))
+    
+                                        # Pick 4 snapshots close to t≈[1.0,0.5,0.1,t0].
+                                        targets = [1.0, 0.5, 0.1, float(t0)]
+                                        idxs = []
+                                        for tt in targets:
+                                            best_i, best_d = 0, 1e9
+                                            for i, t_i in enumerate(t_labels[: len(inter)]):
+                                                d = abs(float(t_i) - float(tt))
+                                                if d < best_d:
+                                                    best_d = d
+                                                    best_i = i
+                                            idxs.append(best_i)
+                                        uniq = []
+                                        for i in idxs:
+                                            if i not in uniq:
+                                                uniq.append(i)
+    
+                                        denoise_panels: list[Any] = []
+                                        for i in uniq[:4]:
+                                            xt_view = inter[i].reshape(1, P, Tf + 1, 4)
+                                            xt_inv = model.config.state_normalizer.inverse(xt_view)
+                                            xt_xy = xt_inv[0, 0, 1:, :2]
+                                            t_i = t_labels[i] if i < len(t_labels) else float("nan")
+                                            img = render_xy_scatter_with_context(
+                                                batch1,
+                                                sample_idx=0,
+                                                xy=xt_xy,
+                                                title=f"denoise xt | t={t_i:.3f}",
+                                                image_size=tb_image_size,
+                                                marker="x",
+                                                alpha=0.9,
+                                                connect_line=False,
+                                            )
+                                            denoise_panels.append(img)
+                                        while len(denoise_panels) < 4:
+                                            denoise_panels.append(None)
+                                        denoise_m = stitch_montage(denoise_panels[:4], rows=2, cols=2)
+                                        if denoise_m is not None:
+                                            tb.add_image(
+                                                f"denoise/{city}/{maneuver}/sample_{slot}",
+                                                torch.from_numpy(denoise_m).permute(2, 0, 1),
+                                                int(step),
+                                            )
+    
+                                        # Final TB viz must use the same public inference entry point as
+                                        # fast-eval and closed-loop planner (`model(inputs)` / decoder path),
+                                        # not this hand-written intermediate sampler.  The manual DPM run above
+                                        # is kept only for denoise panels.
+                                        viz_inputs = {
+                                            "ego_current_state": batch1["ego_current_state"],
+                                            "neighbor_agents_past": batch1["neighbor_agents_past"],
+                                            "static_objects": batch1["static_objects"],
+                                            "lanes": batch1["lanes"],
+                                            "lanes_speed_limit": batch1["lanes_speed_limit"],
+                                            "lanes_has_speed_limit": batch1["lanes_has_speed_limit"],
+                                            "route_lanes": batch1["route_lanes"],
+                                            "route_lanes_speed_limit": batch1.get("route_lanes_speed_limit"),
+                                            "route_lanes_has_speed_limit": batch1.get("route_lanes_has_speed_limit"),
+                                            "diffusion_steps": int(tb_sampler_steps),
+                                        }
+                                        with autocast_ctx:
+                                            _, dec_vis = model(viz_inputs)
+                                        pred_xy = dec_vis["prediction"][0, 0, :, :2]
+                                        scene_img = render_npz_style_scene(
+                                            batch1,
+                                            sample_idx=0,
+                                            ego_future_xy=pred_xy,
+                                            title=f"viz(model) | step={step} city={city} maneuver={maneuver} slot={slot}",
+                                            image_size=tb_image_size,
+                                        )
+                                        if scene_img is not None:
+                                            tb.add_image(
+                                                f"viz/{city}/{maneuver}/sample_{slot}",
+                                                torch.from_numpy(scene_img).permute(2, 0, 1),
+                                                int(step),
+                                            )
+                                    except Exception as e:
+                                        print(f"[tb] sampler denoise logging failed: {e}", flush=True)
+    
                 tb.flush()
             except Exception as e:
                 if not tb_warned_disabled:
