@@ -87,20 +87,19 @@ def _discover_slices(prod_root: Path, slices: Optional[List[str]]) -> List[Path]
             out.append(p)
         return out
 
-    # auto-discover slices (dirs containing shards/)
+    # New stride16 v0.1 layout only: <prod_root>/<part>/shard_XXX.
     out = []
     for p in sorted(prod_root.iterdir()):
-        if p.is_dir() and (p / "shards").is_dir():
+        if p.is_dir() and any(d.is_dir() and d.name.startswith("shard_") for d in p.iterdir()):
             out.append(p)
     if not out:
-        raise FileNotFoundError(f"No slices found under {prod_root} (expected subdirs with shards/)")
+        raise FileNotFoundError(f"No stride16 parts found under {prod_root} (expected <part>/shard_*)")
     return out
 
 
 def _discover_shards(slice_dir: Path, shards: Optional[List[str]]) -> List[SourceFiles]:
-    shards_root = slice_dir / "shards"
-    if not shards_root.is_dir():
-        raise FileNotFoundError(f"Missing shards/ under slice: {slice_dir}")
+    # New stride16 v0.1 layout only: <part>/shard_XXX.
+    shards_root = slice_dir
 
     if shards:
         shard_dirs = [shards_root / s for s in shards]

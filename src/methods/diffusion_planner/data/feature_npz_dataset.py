@@ -211,43 +211,19 @@ class ShardedNpzFeatureDataset(Dataset):
              name collisions like shard_000 across partitions).
         """
 
-        # Cache-only shards: shard_dir already *is* the cache dir.
-        if (Path(spec.shard_dir) / "arrays").is_dir():
-            return Path(spec.shard_dir)
-
+        # New stride16 v0.1 layout only:
+        #   <source_root>/exports_stride16_v0.1/<part>/shard_XXX
+        # -> <cache_root>/exports_stride16_v0.1/<part>/shard_XXX
         parts = list(Path(spec.shard_dir).parts)
-
-        # Boston 50w prod slices
-        if "boston50w_prod" in parts:
-            i = parts.index("boston50w_prod")
-            slice_dir = parts[i + 1]
-            shard_name = parts[-1]
-            return self.cache_root / "boston50w_prod" / slice_dir / shard_name
-
-        # Boston 200k partitions (p0..p4)
-        if "boston200k_new" in parts:
-            i = parts.index("boston200k_new")
-            # expected: .../boston200k_new/p0/shard_000
-            part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
-            shard_name = parts[-1]
-            return self.cache_root / "train_data_boston150w" / part_dir / shard_name
-
-        # Pittsburgh 200k partitions (p0..p4)
-        if "pittsburgh_200k" in parts:
-            i = parts.index("pittsburgh_200k")
-            part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
-            shard_name = parts[-1]
-            return self.cache_root / "pittsburgh_200k" / part_dir / shard_name
-
-        # Vegas 200k partitions (p0..p4)
-        if "vegas_200k" in parts:
-            i = parts.index("vegas_200k")
-            part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
-            shard_name = parts[-1]
-            return self.cache_root / "vegas_200k" / part_dir / shard_name
-
-        # generic fallback: use shard dir name only
-        return self.cache_root / "unknown" / parts[-1]
+        if "exports_stride16_v0.1" not in parts:
+            raise RuntimeError(
+                f"Unsupported training source layout: {spec.shard_dir}. "
+                "This training path is intentionally new-export-only: expected exports_stride16_v0.1/<part>/shard_XXX."
+            )
+        i = parts.index("exports_stride16_v0.1")
+        part_dir = parts[i + 1] if i + 1 < len(parts) else "unknown_part"
+        shard_name = parts[-1]
+        return self.cache_root / "exports_stride16_v0.1" / part_dir / shard_name
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         shard_idx, row_idx, meta = self._index[idx]
