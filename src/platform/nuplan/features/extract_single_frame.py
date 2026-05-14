@@ -20,6 +20,7 @@ import os
 import sqlite3
 import time
 from collections import Counter
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -81,6 +82,11 @@ MAX_LANES = 70
 MAX_ROUTE_LANES = 25
 POLYLINE_LEN = 20
 LANE_DIM = 12
+ROUTE_CORRIDOR_CONNECT_THRESHOLD_M = 8.0
+ROUTE_CORRIDOR_EGO_SEED_DISTANCE_M = 20.0
+ROUTE_CORRIDOR_MIN_FORWARD_PROGRESS_M = 30.0
+ROUTE_CORRIDOR_REVERSE_DX_M = 5.0
+ROUTE_CORRIDOR_REVERSE_DOT = -0.2
 
 # Debug logging paths
 _DEBUG_LOG_DIR_DEFAULT = "/workspace/data_process/debug_log"
@@ -364,6 +370,243 @@ def _dedup_keep_order(seq: list[str]) -> list[str]:
     return out
 
 
+@dataclass
+class RouteRoadblockRepairResult:
+    route_ids: list[str]
+    reason: str
+    ego_roadblock_id: str | None
+    overlap_index: int | None
+    bridge_found: bool
+    bridge_len: int
+    bfs_called: bool
+
+
+def _lane_roadblock_id(lane_obj) -> str | None:
+    roadblock_id = None
+    try:
+        if hasattr(lane_obj, "get_roadblock_id"):
+            roadblock_id = lane_obj.get_roadblock_id()
+    except Exception:
+        roadblock_id = None
+    if roadblock_id is None:
+        try:
+            roadblock_id = getattr(lane_obj, "roadblock_id", None)
+        except Exception:
+            roadblock_id = None
+    if roadblock_id is None:
+        return None
+    return str(roadblock_id)
+
+
+def _lane_centroid_distance_to_point(lane_obj, ego_point: Point2D) -> float:
+    try:
+        centroid = lane_obj.polygon.centroid
+        return float(((centroid.x - ego_point.x) ** 2 + (centroid.y - ego_point.y) ** 2) ** 0.5)
+    except Exception:
+        return float("inf")
+
+
+def _proximal_roadblock_ids_and_nearest(map_api, ego_point: Point2D, radius: float):
+    try:
+        layers = map_api.get_proximal_map_objects(
+            ego_point,
+            radius,
+            [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR],
+        )
+    except Exception:
+        layers = {}
+
+    proximal_roadblock_ids: list[str] = []
+    proximal_distances: dict[str, float] = {}
+    nearest_roadblock_id = None
+    nearest_distance = float("inf")
+
+    for layer_type in [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]:
+        for lane_obj in (layers.get(layer_type, []) or []):
+            roadblock_id = _lane_roadblock_id(lane_obj)
+            if roadblock_id is None:
+                continue
+            proximal_roadblock_ids.append(roadblock_id)
+            distance = _lane_centroid_distance_to_point(lane_obj, ego_point)
+            if distance < proximal_distances.get(roadblock_id, float("inf")):
+                proximal_distances[roadblock_id] = distance
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_roadblock_id = roadblock_id
+
+    proximal_roadblock_ids = _dedup_keep_order(proximal_roadblock_ids)
+    if nearest_roadblock_id is None and proximal_roadblock_ids:
+        nearest_roadblock_id = proximal_roadblock_ids[0]
+
+    return proximal_roadblock_ids, nearest_roadblock_id, proximal_distances
+
+
+def _bfs_max_time_s_from_env() -> float:
+    try:
+        return float(os.environ.get("BFS_MAX_TIME_S", "8.0"))
+    except Exception:
+        return 8.0
+
+
+def _extract_bfs_bridge_ids(search_result) -> tuple[list[str], bool]:
+    try:
+        bridge_payload, found = search_result
+    except Exception:
+        return [], False
+
+    bridge_ids = bridge_payload
+    try:
+        if isinstance(bridge_payload, tuple) and len(bridge_payload) >= 2:
+            bridge_ids = bridge_payload[1]
+    except Exception:
+        bridge_ids = []
+
+    return [str(roadblock_id) for roadblock_id in (bridge_ids or [])], bool(found)
+
+
+def repair_route_roadblock_ids(
+    map_api,
+    ego_point: Point2D,
+    route_roadblock_ids,
+    *,
+    radius: float = 150.0,
+    mode: str = "auto",
+    bfs_max_depth: int = 80,
+    bfs_k_targets: int = 20,
+    overlap_max_distance_m: float = 30.0,
+) -> RouteRoadblockRepairResult:
+    route_ids = _dedup_keep_order(list(route_roadblock_ids or []))
+
+    if not route_ids:
+        return RouteRoadblockRepairResult(route_ids, "empty_route", None, None, False, 0, False)
+
+    mode_normalized = str(mode or "auto").strip().lower()
+    if mode_normalized == "nofix":
+        return RouteRoadblockRepairResult(route_ids, "nofix", None, None, False, 0, False)
+
+    proximal_ids, ego_roadblock_id, proximal_distances = _proximal_roadblock_ids_and_nearest(
+        map_api, ego_point, radius
+    )
+    route_index_by_id = {roadblock_id: route_index for route_index, roadblock_id in enumerate(route_ids)}
+
+    overlap_index = None
+    overlap_max_distance_m = float(overlap_max_distance_m)
+    if (
+        ego_roadblock_id in route_index_by_id
+        and proximal_distances.get(ego_roadblock_id, float("inf")) <= overlap_max_distance_m
+    ):
+        overlap_index = route_index_by_id[ego_roadblock_id]
+    else:
+        overlap_candidates = [
+            (
+                proximal_distances.get(roadblock_id, float("inf")),
+                route_index_by_id[roadblock_id],
+            )
+            for roadblock_id in proximal_ids
+            if roadblock_id in route_index_by_id
+            and proximal_distances.get(roadblock_id, float("inf")) <= overlap_max_distance_m
+        ]
+        if overlap_candidates:
+            _, overlap_index = min(overlap_candidates)
+
+    if overlap_index is not None:
+        if overlap_index > 0:
+            return RouteRoadblockRepairResult(
+                route_ids[overlap_index:],
+                f"realign_from_overlap_idx={overlap_index}",
+                ego_roadblock_id,
+                overlap_index,
+                False,
+                0,
+                False,
+            )
+        return RouteRoadblockRepairResult(
+            route_ids,
+            "no_realign_overlap_idx=0",
+            ego_roadblock_id,
+            overlap_index,
+            False,
+            0,
+            False,
+        )
+
+    if mode_normalized == "realign":
+        return RouteRoadblockRepairResult(
+            route_ids,
+            "no_overlap_realign_mode",
+            ego_roadblock_id,
+            None,
+            False,
+            0,
+            False,
+        )
+
+    if mode_normalized not in {"auto", "bfs"}:
+        return RouteRoadblockRepairResult(
+            route_ids,
+            f"unsupported_mode={mode_normalized}",
+            ego_roadblock_id,
+            None,
+            False,
+            0,
+            False,
+        )
+
+    if not ego_roadblock_id:
+        return RouteRoadblockRepairResult(route_ids, "no_ego_roadblock", None, None, False, 0, False)
+
+    try:
+        bfs = BreadthFirstSearchRoadBlock(ego_roadblock_id, map_api)
+        bridge_ids, found = _extract_bfs_bridge_ids(
+            bfs.search(
+                target_roadblock_id=route_ids[:bfs_k_targets],
+                max_depth=bfs_max_depth,
+                max_time_s=_bfs_max_time_s_from_env(),
+            )
+        )
+    except TimeoutError:
+        return RouteRoadblockRepairResult(
+            route_ids,
+            "bfs_exception: timeout",
+            ego_roadblock_id,
+            None,
+            False,
+            0,
+            True,
+        )
+    except Exception as exception:
+        return RouteRoadblockRepairResult(
+            route_ids,
+            f"bfs_exception: {exception}",
+            ego_roadblock_id,
+            None,
+            False,
+            0,
+            True,
+        )
+
+    if found and bridge_ids:
+        return RouteRoadblockRepairResult(
+            _dedup_keep_order(bridge_ids + route_ids),
+            "bfs_bridge_found",
+            ego_roadblock_id,
+            None,
+            True,
+            len(bridge_ids),
+            True,
+        )
+
+    return RouteRoadblockRepairResult(
+        route_ids,
+        "bfs_not_found",
+        ego_roadblock_id,
+        None,
+        False,
+        0,
+        True,
+    )
+
+
 def bfs_bridge_route_if_needed(
     map_api,
     ego_point: Point2D,
@@ -467,6 +710,7 @@ def get_target_frame(conn, scenario_token, frame_index):
     # Default to scene-local lidar_pc indexing for correctness.
     # Set EXPORT_FRAME_INDEX_MODE=ego_pose to recover legacy behavior.
     frame_mode = os.environ.get("EXPORT_FRAME_INDEX_MODE", "scene_lidar").strip().lower()
+    scene_lidar_corrupt_error = None
 
     try:
         scenario_token_bytes = bytes.fromhex(scenario_token)
@@ -477,39 +721,44 @@ def get_target_frame(conn, scenario_token, frame_index):
             if frame_mode in {"lidar", "scene_lidar", "lidar_pc"}:
                 # Interpret frame_index as an index into lidar_pc timestamps within this scene.
                 cursor.execute(
-                    "SELECT timestamp FROM lidar_pc WHERE scene_token=? ORDER BY timestamp LIMIT 1 OFFSET ?",
+                    """
+                    SELECT token, timestamp, ego_pose_token
+                    FROM lidar_pc
+                    WHERE scene_token=?
+                    ORDER BY timestamp
+                    LIMIT 1 OFFSET ?
+                    """,
                     (scenario_token_bytes, int(frame_index)),
                 )
-                lr = cursor.fetchone()
-                if lr is not None:
-                    lidar_ts = int(lr[0])
-                else:
+                lidar_row = cursor.fetchone()
+                if lidar_row is None:
                     # Out of range: clamp to last lidar_pc in scene.
                     cursor.execute(
-                        "SELECT timestamp FROM lidar_pc WHERE scene_token=? ORDER BY timestamp DESC LIMIT 1",
+                        """
+                        SELECT token, timestamp, ego_pose_token
+                        FROM lidar_pc
+                        WHERE scene_token=?
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                        """,
                         (scenario_token_bytes,),
                     )
-                    lr2 = cursor.fetchone()
-                    if lr2 is None:
-                        raise RuntimeError("scene has no lidar_pc")
-                    lidar_ts = int(lr2[0])
-
-                # Map the lidar timestamp to the closest ego_pose at-or-before it (same log_token).
-                cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
-                log_token = cursor.fetchone()[0]
-                cursor.execute(
-                    """
-                    SELECT ep.token, ep.timestamp
-                    FROM ego_pose ep
-                    WHERE ep.log_token = ? AND ep.timestamp <= ?
-                    ORDER BY ep.timestamp DESC
-                    LIMIT 1
-                    """,
-                    (log_token, lidar_ts),
-                )
-                er = cursor.fetchone()
-                if er is not None:
-                    return er[0], er[1], er[0]
+                    lidar_row = cursor.fetchone()
+                if lidar_row is not None:
+                    _, lidar_ts, ego_pose_token = lidar_row
+                    cursor.execute(
+                        "SELECT token FROM ego_pose WHERE token = ?",
+                        (ego_pose_token,),
+                    )
+                    er = cursor.fetchone()
+                    if er is not None:
+                        return er[0], lidar_ts, er[0]
+                    scene_lidar_corrupt_error = RuntimeError(
+                        "scene_lidar target lidar_pc references missing ego_pose"
+                    )
+                    raise scene_lidar_corrupt_error
+                else:
+                    raise RuntimeError("scene has no lidar_pc")
 
             # First get log_token from scene (matching extract_ego_data approach)
             cursor.execute("SELECT log_token FROM scene WHERE token = ?", (scenario_token_bytes,))
@@ -530,6 +779,8 @@ def get_target_frame(conn, scenario_token, frame_index):
                 target_frame = frames[frame_index]
                 return target_frame[0], target_frame[1], target_frame[0]
     except Exception:
+        if scene_lidar_corrupt_error is not None:
+            raise scene_lidar_corrupt_error
         pass
 
     cursor.execute("SELECT token, timestamp FROM ego_pose ORDER BY timestamp")
@@ -1170,6 +1421,134 @@ def extract_lanes(point, map_api, radius=100, max_lanes=70, ego_heading=0, traff
     return lanes, lanes_avails, speed_limits, has_speed_limits
 
 
+def _candidate_centerline_array(lane_data: dict) -> np.ndarray:
+    try:
+        centerline_raw = lane_data.get("centerline")
+        if centerline_raw is None:
+            return np.zeros((0, 2), dtype=np.float64)
+        centerline = np.asarray(centerline_raw, dtype=np.float64)
+    except Exception:
+        return np.zeros((0, 2), dtype=np.float64)
+    if centerline.ndim != 2 or centerline.shape[1] < 2:
+        return np.zeros((0, 2), dtype=np.float64)
+    return centerline[:, :2]
+
+
+def _min_distance_between_candidate_centerlines(left_lane_data: dict, right_lane_data: dict) -> float:
+    left_centerline = _candidate_centerline_array(left_lane_data)
+    right_centerline = _candidate_centerline_array(right_lane_data)
+    if len(left_centerline) == 0 or len(right_centerline) == 0:
+        return float("inf")
+    distances = np.linalg.norm(left_centerline[:, None, :] - right_centerline[None, :, :], axis=2)
+    return float(np.min(distances))
+
+
+def _min_distance_from_candidate_to_point(lane_data: dict, point) -> float:
+    centerline = _candidate_centerline_array(lane_data)
+    if len(centerline) == 0:
+        return float("inf")
+    point_xy = np.asarray([float(point.x), float(point.y)], dtype=np.float64)
+    return float(np.min(np.linalg.norm(centerline - point_xy[None, :], axis=1)))
+
+
+def _filter_route_lanes_to_ego_connected_corridor(
+    route_lane_candidates: list[dict],
+    point,
+    *,
+    connect_threshold_m: float = ROUTE_CORRIDOR_CONNECT_THRESHOLD_M,
+    ego_seed_distance_m: float = ROUTE_CORRIDOR_EGO_SEED_DISTANCE_M,
+) -> list[dict]:
+    if len(route_lane_candidates) <= 1:
+        return route_lane_candidates
+
+    parent = list(range(len(route_lane_candidates)))
+
+    def find(candidate_index: int) -> int:
+        while parent[candidate_index] != candidate_index:
+            parent[candidate_index] = parent[parent[candidate_index]]
+            candidate_index = parent[candidate_index]
+        return candidate_index
+
+    def union(left_index: int, right_index: int) -> None:
+        left_root = find(left_index)
+        right_root = find(right_index)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_index in range(len(route_lane_candidates)):
+        for right_index in range(left_index + 1, len(route_lane_candidates)):
+            if (
+                _min_distance_between_candidate_centerlines(
+                    route_lane_candidates[left_index],
+                    route_lane_candidates[right_index],
+                )
+                <= connect_threshold_m
+            ):
+                union(left_index, right_index)
+
+    seed_roots: set[int] = set()
+    for candidate_index, lane_data in enumerate(route_lane_candidates):
+        if _min_distance_from_candidate_to_point(lane_data, point) <= ego_seed_distance_m:
+            seed_roots.add(find(candidate_index))
+
+    if not seed_roots:
+        return route_lane_candidates
+
+    return [
+        lane_data
+        for candidate_index, lane_data in enumerate(route_lane_candidates)
+        if find(candidate_index) in seed_roots
+    ]
+
+
+def _candidate_local_x_stats(lane_data: dict, point, ego_heading: float) -> tuple[float, float, float]:
+    centerline = _candidate_centerline_array(lane_data)
+    if len(centerline) == 0:
+        return 0.0, 0.0, 0.0
+
+    c = float(np.cos(-ego_heading))
+    s = float(np.sin(-ego_heading))
+    dx = centerline[:, 0] - float(point.x)
+    dy = centerline[:, 1] - float(point.y)
+    local_x = dx * c - dy * s
+
+    start_x = float(local_x[0])
+    end_x = float(local_x[-1])
+    centroid_x = float(np.mean(local_x))
+    return start_x, end_x, centroid_x
+
+
+def _filter_route_lanes_to_forward_progress(
+    route_lane_candidates: list[dict],
+    point,
+    ego_heading: float,
+    *,
+    min_forward_progress_m: float = ROUTE_CORRIDOR_MIN_FORWARD_PROGRESS_M,
+    reverse_dx_m: float = ROUTE_CORRIDOR_REVERSE_DX_M,
+    reverse_dot: float = ROUTE_CORRIDOR_REVERSE_DOT,
+) -> list[dict]:
+    if len(route_lane_candidates) <= 1:
+        return route_lane_candidates
+
+    kept: list[dict] = []
+    max_centroid_x = float("-inf")
+
+    for lane_data in route_lane_candidates:
+        start_x, end_x, centroid_x = _candidate_local_x_stats(lane_data, point, ego_heading)
+        lane_dx = end_x - start_x
+        lane_len = abs(lane_dx)
+        forward_progress_seen = max_centroid_x >= min_forward_progress_m
+        reverse_lane = lane_len >= reverse_dx_m and lane_dx / max(lane_len, 1e-6) <= reverse_dot
+
+        if forward_progress_seen and reverse_lane:
+            break
+
+        kept.append(lane_data)
+        max_centroid_x = max(max_centroid_x, centroid_x)
+
+    return kept or route_lane_candidates
+
+
 def extract_route_lanes(
     point,
     map_api,
@@ -1190,7 +1569,10 @@ def extract_route_lanes(
     route_speed_limits = np.zeros(max_route_lanes, dtype=np.float32)
     route_has_speed_limits = np.zeros(max_route_lanes, dtype=np.float32)
 
-    route_roadblock_id_set = set(route_roadblock_ids) if route_roadblock_ids else None
+    route_filter_enabled = route_roadblock_ids is not None
+    route_roadblock_id_order = _dedup_keep_order(list(route_roadblock_ids or []))
+    route_roadblock_id_set = set(route_roadblock_id_order) if route_filter_enabled else None
+    route_roadblock_id_index = {rb_id: idx for idx, rb_id in enumerate(route_roadblock_id_order)}
 
     traffic_light_lookup = {}
     if traffic_light_data:
@@ -1213,16 +1595,9 @@ def extract_route_lanes(
 
         for lane_obj in layers[layer_type]:
             try:
-                if route_roadblock_id_set is not None:
-                    rb_id = None
-                    try:
-                        if hasattr(lane_obj, "get_roadblock_id"):
-                            rb_id = lane_obj.get_roadblock_id()
-                        elif hasattr(lane_obj, "roadblock_id"):
-                            rb_id = lane_obj.roadblock_id
-                    except Exception:
-                        rb_id = None
+                rb_id = _lane_roadblock_id(lane_obj)
 
+                if route_roadblock_id_set is not None:
                     if rb_id is None or str(rb_id) not in route_roadblock_id_set:
                         continue
 
@@ -1252,12 +1627,18 @@ def extract_route_lanes(
                         "left": left_boundary_coords,
                         "right": right_boundary_coords,
                         "dist": dist,
+                        "route_order": route_roadblock_id_index.get(str(rb_id), 0),
                     }
                 )
             except Exception:
                 continue
 
-    all_lanes.sort(key=lambda x: x["dist"])
+    if route_roadblock_id_set is not None:
+        all_lanes.sort(key=lambda x: (x["route_order"], x["dist"]))
+        all_lanes = _filter_route_lanes_to_ego_connected_corridor(all_lanes[:max_route_lanes], point)
+        all_lanes = _filter_route_lanes_to_forward_progress(all_lanes, point, ego_heading)
+    else:
+        all_lanes.sort(key=lambda x: x["dist"])
 
     route_idx = 0
     # Debug counters (optionally surfaced via extract_features manifest).
@@ -1423,14 +1804,7 @@ def extract_features(
         except Exception:
             route_roadblock_ids_raw = []
 
-    if routing_mode == "auto":
-        with _timing_ctx(timing, "get_pruned_route_roadblock_ids"):
-            try:
-                route_roadblock_ids = get_pruned_route_roadblock_ids(conn, db_path, scenario_token_hex, map_api, map_name)
-            except Exception:
-                route_roadblock_ids = None
-    else:
-        route_roadblock_ids = list(route_roadblock_ids_raw)
+    route_roadblock_ids = list(route_roadblock_ids_raw)
 
     with _timing_ctx(timing, "extract_lanes"):
         lanes, lanes_avails, lanes_speed_limit, lanes_has_speed_limit = extract_lanes(
@@ -1491,11 +1865,7 @@ def extract_features(
 
     rmin_old_m = _min_dist_m(route_lanes_old, route_lanes_avails_old)
 
-    new_route_ids = route_roadblock_ids or []
-    bridge_found = False
-    bridge_len = 0
-
-    ego_rb = None
+    ego_rb_from_prox = None
     try:
         nearest_obj = None
         nearest_dist = float("inf")
@@ -1513,19 +1883,37 @@ def extract_features(
                 except Exception:
                     continue
         if nearest_obj is not None and hasattr(nearest_obj, "get_roadblock_id"):
-            ego_rb = str(nearest_obj.get_roadblock_id())
+            ego_rb_from_prox = str(nearest_obj.get_roadblock_id())
     except Exception:
-        ego_rb = None
-
-    bridge_reason = "skip"
-
-    bfs_called = False
-    realign_from_overlap = False
-    overlap_idx: int | None = None
-    bfs_triggered_by = "none"
+        ego_rb_from_prox = None
 
     route_list = [str(x) for x in (route_roadblock_ids or [])]
     route_set = set(route_list)
+    repair_mode = routing_mode if routing_mode in {"auto", "nofix", "realign", "bfs"} else "auto"
+
+    with _timing_ctx(timing, "repair_route_roadblock_ids"):
+        route_repair = repair_route_roadblock_ids(
+            map_api,
+            point,
+            route_list,
+            radius=150.0,
+            mode=repair_mode,
+            bfs_max_depth=80,
+            bfs_k_targets=20,
+        )
+
+    new_route_ids = list(route_repair.route_ids)
+    bfs_bridge_found = bool(route_repair.bridge_found and route_repair.bfs_called)
+    bridge_len = int(route_repair.bridge_len)
+    bridge_reason = str(route_repair.reason)
+    bfs_called = bool(route_repair.bfs_called)
+    overlap_idx: int | None = route_repair.overlap_index
+    realign_from_overlap = bool(
+        overlap_idx is not None and overlap_idx > 0 and new_route_ids != route_list
+    )
+    bridge_found = bool(bfs_bridge_found or realign_from_overlap)
+    ego_rb = route_repair.ego_roadblock_id or ego_rb_from_prox
+
     ego_rb_in_route = bool(ego_rb) and (ego_rb in route_set)
 
     off_route = not ego_rb_in_route
@@ -1533,110 +1921,18 @@ def extract_features(
         off_route = True
 
     bad_route_geom = (avails_sum_old == 0) or (rmin_old_m is None) or (float(rmin_old_m) > 30.0)
+    need_bridge = bool(bfs_called)
 
-    if routing_mode == "nofix":
-        need_bridge = False
+    if repair_mode in {"nofix", "realign"}:
         bfs_triggered_by = "disabled"
-        bridge_reason = "nofix"
-        new_route_ids = list(route_list)
-
-    elif routing_mode == "realign":
-        need_bridge = False
-        bfs_triggered_by = "disabled"
-        try:
-            inter = proximal_rb_ids.intersection(route_set)
-            if inter:
-                pos = {v: i for i, v in enumerate(route_list)}
-                idx_min = min(pos[x] for x in inter if x in pos)
-                if idx_min is not None and idx_min > 0:
-                    overlap_idx = int(idx_min)
-                    realign_from_overlap = True
-                    new_route_ids = route_list[idx_min:]
-                    bridge_found = True
-                    bridge_len = 0
-                    bridge_reason = f"realign_from_overlap_idx={idx_min}"
-                else:
-                    bridge_reason = "overlap_idx=0 (no_realign)"
-                    new_route_ids = list(route_list)
-            else:
-                bridge_reason = "no_overlap_for_realign"
-                new_route_ids = list(route_list)
-        except Exception:
-            bridge_reason = "overlap_realign_exception"
-            new_route_ids = list(route_list)
-
-    elif routing_mode == "bfs":
-        need_bridge = bool(route_list) and off_route
-        if need_bridge and (intersection_pruned == 0):
-            bfs_called = True
-            bfs_triggered_by = "off_route"
-            with _timing_ctx(timing, "bfs_bridge_route_if_needed"):
-                new_route_ids, bridge_len, bridge_found, ego_rb_bfs, bridge_reason = bfs_bridge_route_if_needed(
-                    map_api,
-                    point,
-                    list(route_list),
-                    intersection_pruned=intersection_pruned,
-                    radius=150,
-                    k_targets=10,
-                    max_depth=80,
-                )
-            if not ego_rb:
-                ego_rb = ego_rb_bfs
-            ego_rb_in_route = bool(ego_rb) and (ego_rb in set([str(x) for x in (route_roadblock_ids or [])]))
-        elif need_bridge and (intersection_pruned != 0):
-            bfs_triggered_by = f"skip_intersection_pruned={intersection_pruned}"
-            bridge_reason = "bfs_skipped_intersection_pruned"
-            new_route_ids = list(route_list)
-        else:
-            bfs_triggered_by = "gate_not_met"
-            bridge_reason = "bfs_gate_not_met"
-            new_route_ids = list(route_list)
-
+    elif bfs_called:
+        bfs_triggered_by = "helper_bfs_no_overlap"
+    elif realign_from_overlap:
+        bfs_triggered_by = "realign_succeeded"
+    elif route_list:
+        bfs_triggered_by = "helper_no_bfs"
     else:
-        if bad_route_geom and route_list:
-            try:
-                inter = proximal_rb_ids.intersection(route_set)
-                if inter:
-                    pos = {v: i for i, v in enumerate(route_list)}
-                    idx_min = min(pos[x] for x in inter if x in pos)
-                    if idx_min is not None and idx_min > 0:
-                        overlap_idx = int(idx_min)
-                        realign_from_overlap = True
-                        new_route_ids = route_list[idx_min:]
-                        bridge_found = True
-                        bridge_len = 0
-                        bridge_reason = f"realign_from_overlap_idx={idx_min} (bad_route_geom)"
-                    else:
-                        bridge_reason = "overlap_idx=0 (no_realign)"
-                else:
-                    bridge_reason = "no_overlap_for_realign"
-            except Exception:
-                bridge_reason = "overlap_realign_exception"
-
-        need_bridge = bool(route_list) and off_route and bad_route_geom and (not realign_from_overlap)
-        if need_bridge and (intersection_pruned == 0):
-            bfs_called = True
-            bfs_triggered_by = "off_route_and_bad_route_geom"
-            with _timing_ctx(timing, "bfs_bridge_route_if_needed"):
-                new_route_ids, bridge_len, bridge_found, ego_rb_bfs, bridge_reason = bfs_bridge_route_if_needed(
-                    map_api,
-                    point,
-                    list(route_list),
-                    intersection_pruned=intersection_pruned,
-                    radius=150,
-                    k_targets=10,
-                    max_depth=80,
-                )
-            if not ego_rb:
-                ego_rb = ego_rb_bfs
-            ego_rb_in_route = bool(ego_rb) and (ego_rb in set([str(x) for x in (route_roadblock_ids or [])]))
-        elif need_bridge and (intersection_pruned != 0):
-            bfs_triggered_by = f"skip_intersection_pruned={intersection_pruned}"
-        elif need_bridge and realign_from_overlap:
-            bfs_triggered_by = "realign_succeeded"
-        else:
-            if not need_bridge:
-                bfs_triggered_by = "gate_not_met"
+        bfs_triggered_by = "gate_not_met"
 
     with _timing_ctx(timing, "extract_route_lanes_new"):
         route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
@@ -1688,6 +1984,7 @@ def extract_features(
                         "intersection_pruned": int(intersection_pruned),
                         "ego_rb": ego_rb,
                         "bridge_found": bool(bridge_found),
+                        "bfs_bridge_found": bool(bfs_bridge_found),
                         "bridge_len": int(bridge_len),
                         "bridge_reason": bridge_reason,
                         "route_len_old": int(len(route_roadblock_ids) if route_roadblock_ids else 0),
@@ -1732,6 +2029,7 @@ def extract_features(
             "bfs_called": bool(bfs_called),
             "bfs_triggered_by": str(bfs_triggered_by),
             "bridge_found": bool(bridge_found),
+            "bfs_bridge_found": bool(bfs_bridge_found),
             "bridge_len": int(bridge_len),
             "bridge_reason": str(bridge_reason),
             "intersection_pruned": int(intersection_pruned),

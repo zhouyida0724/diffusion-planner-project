@@ -50,6 +50,7 @@ from src.platform.nuplan.features.extract_single_frame import (
     extract_route_lanes,
     extract_static_objects,
     get_traffic_lights_at_timestamp,
+    repair_route_roadblock_ids,
 )
 
 from src.platform.nuplan.features.feature_contract import maybe_check_feature_contract
@@ -786,6 +787,16 @@ class DiffusionPlannerCkpt(AbstractPlanner):
             ego_heading=cur_ego.heading,
             traffic_light_data=traffic_light_data,
         )
+        route_repair = repair_route_roadblock_ids(
+            self._map_api,
+            point,
+            route_ids,
+            radius=150.0,
+            mode="auto",
+            bfs_max_depth=80,
+            bfs_k_targets=20,
+        )
+        route_ids = list(route_repair.route_ids)
         route_lanes, route_lanes_avails, route_lanes_speed_limit, route_lanes_has_speed_limit = extract_route_lanes(
             point,
             self._map_api,
